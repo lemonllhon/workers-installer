@@ -9,7 +9,8 @@ readonly DEFAULT_SERVICE_NAME="nodejs-argo-no-docker"
 readonly DEFAULT_SOURCE_BASE_URL="__WORKER_SOURCE_BASE_URL__"
 readonly DEFAULT_INDEX_SHA256="B7A204F42B177878011D65BCD116F0D78B51A8898F07BE895930A09EA8816EC3"
 
-readonly DEFAULT_CLOUDFLARED_VERSION="2026.7.2"
+readonly DEFAULT_CLOUDFLARED_VERSION="latest"
+readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
 readonly DEFAULT_XRAY_VERSION="v26.3.27"
 readonly DEFAULT_NEZHA_VERSION="v1.14.1"
 
@@ -130,6 +131,8 @@ download_verified() {
     --output "${temporary}" "${url}"
 
   if [[ -n "${expected_sha256}" ]]; then
+    expected_sha256="${expected_sha256,,}"
+    [[ "${expected_sha256}" =~ ^[0-9a-f]{64}$ ]] || die "${label} SHA256 格式无效"
     local actual_sha256
     actual_sha256="$(sha256sum "${temporary}" | awk '{print $1}')"
     [[ "${actual_sha256}" = "${expected_sha256}" ]] || die "${label} SHA256 校验失败：${actual_sha256}"
@@ -146,21 +149,56 @@ install_cloudflared() {
   local arch="$1"
   local asset
   local expected
+  local release_url
+  local release_final_url
+  local release_html="${TMP_DIR}/cloudflared-release.html"
+  local release_tag
   case "${arch}" in
     amd64)
       asset="cloudflared-linux-amd64"
-      expected="EC905EA7B7E327FF8ABDDE8CB64697A2152DE74DBCDBF6AEC9DB8364EB3886CD"
       ;;
     arm64)
       asset="cloudflared-linux-arm64"
-      expected="AD641A81E21D443C73C4414AE6F02C66E331EDEB28830B09D738FC1E7C3224B5"
       ;;
     *) die "不支持的架构：${arch}" ;;
   esac
-  expected="${CLOUDFLARED_SHA256:-${expected}}"
+
+  if [[ "${CLOUDFLARED_VERSION}" = "latest" ]]; then
+    release_url="${CLOUDFLARED_RELEASE_PAGE}/latest"
+  else
+    local requested_version="${CLOUDFLARED_VERSION#v}"
+    [[ "${requested_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "CLOUDFLARED_VERSION 必须是 latest 或类似 2026.7.3 的版本号"
+    release_url="${CLOUDFLARED_RELEASE_PAGE}/tag/${requested_version}"
+  fi
+
+  log "获取 Cloudflare Tunnel 官方 release 信息"
+  release_final_url="$(curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 \
+    --output /dev/null --write-out '%{url_effective}' "${release_url}")" || die "无法定位 Cloudflare Tunnel release"
+  [[ "${release_final_url}" =~ ^https://github\.com/cloudflare/cloudflared/releases/tag/[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Cloudflare release 地址格式异常"
+  release_tag="${release_final_url##*/}"
+
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 60 \
+    --user-agent "${SCRIPT_NAME}" \
+    --output "${release_html}" "${release_final_url}"
+
+  if [[ -n "${CLOUDFLARED_SHA256:-}" ]]; then
+    expected="${CLOUDFLARED_SHA256}"
+  else
+    expected="$(node -e '
+      const fs = require("fs");
+      const html = fs.readFileSync(process.argv[1], "utf8");
+      const asset = process.argv[2];
+      const match = html.match(new RegExp(asset + ":\\s*([a-f0-9]{64})\\b", "i"));
+      if (!match) process.exit(1);
+      process.stdout.write(match[1]);
+    ' "${release_html}" "${asset}")" || die "无法从 Cloudflare 官方 release 获取 ${asset} 的 SHA256"
+  fi
+
   download_verified \
-    "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/${asset}" \
-    "${BIN_PATH}/cloudflared" "${expected}" "cloudflared ${CLOUDFLARED_VERSION}"
+    "https://github.com/cloudflare/cloudflared/releases/download/${release_tag}/${asset}" \
+    "${BIN_PATH}/cloudflared" "${expected}" "cloudflared ${release_tag}"
   chmod 0755 "${BIN_PATH}/cloudflared"
 }
 

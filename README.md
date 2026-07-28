@@ -63,7 +63,7 @@ export TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT=false
 ## 3. 安全特性
 
 - Worker 内置当前 `index.js` 副本，并校验 `index.js` SHA256；
-- Xray、cloudflared、哪吒固定版本，并校验默认架构对应的 SHA256；
+- Xray、哪吒使用固定版本并校验 SHA256；cloudflared 每次安装时从 Cloudflare 官方最新 release 下载，并校验官方 release 中的 SHA256；
 - 不使用第三方 `curl | bash`；
 - npm 安装使用固定版本、`--ignore-scripts`、关闭 audit/fund；
 - 配置文件权限为 `600`；
@@ -71,7 +71,9 @@ export TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT=false
 - systemd 使用 `NoNewPrivileges`、`PrivateTmp` 和受限写目录；
 - Worker 和安装器都不包含真实密钥。
 
-如果需要升级源码或二进制版本，请先更新 `public/agent/index.js`，再更新 `public/install.sh` 中的校验值，并重新部署 Worker。
+cloudflared 默认使用 Cloudflare 官方最新版本；运行时会每 24 小时自动检查更新。若需要固定版本，可在安装时设置 `CLOUDFLARED_VERSION=2026.7.3`；安装器会从对应官方 release 自动读取并校验 SHA256。
+
+如果需要升级源码、Xray 或哪吒版本，请先更新 `public/agent/index.js` 或 `public/install.sh`，再重新部署 Worker。
 
 ## 4. 卸载
 
