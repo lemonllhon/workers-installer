@@ -313,7 +313,7 @@ function heartbeatTimeMarkup(node, value) {
     ? `${local.day} ${local.clock}`
     : sameYear ? `${local.month}-${local.day} ${local.clock}` : `${local.year}-${local.month}-${local.day} ${local.clock}`;
   const sharedMarkup = sharedPrefix ? `<span class="node-time-shared">${htmlEscape(sharedPrefix)}</span>` : "";
-  return `<span>最后心跳</span><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：${htmlEscape(localZone)}">${sharedMarkup}<span><b>中国</b> ${htmlEscape(chinaText)}</span><span><b>当地</b> ${htmlEscape(localText)} <small>${htmlEscape(localZone)}</small></span></div>`;
+  return `<span>最后心跳</span><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：${htmlEscape(localZone)}">${sharedMarkup}<span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small></small></span><span><b>当地</b><strong>${htmlEscape(localText)}</strong><small>${htmlEscape(localZone)}</small></span></div>`;
 }
 
 function heartbeatHistoryValues(node) {
@@ -486,10 +486,12 @@ async function dashboardPageResponse(request, env) {
     .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
     .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 11px; line-height: 1.45; text-align: right; }
     .node-last-seen > span { display: block; }
-    .node-time-pair { display: grid; gap: 1px; margin-top: 2px; color: var(--ink); font-size: 11px; font-weight: 600; }
-    .node-time-pair b { margin-right: 3px; color: var(--muted); font-size: 10px; font-weight: 700; }
-    .node-time-pair small { margin-left: 2px; color: var(--muted); font-size: 9px; font-weight: 500; }
-    .node-time-shared { color: var(--muted); font-size: 10px; font-weight: 600; }
+    .node-time-pair { display: grid; width: max-content; gap: 1px; margin: 2px 0 0 auto; color: var(--ink); font-size: 11px; font-weight: 600; text-align: left; }
+    .node-time-pair > span:not(.node-time-shared) { display: grid; grid-template-columns: 32px auto 1fr; align-items: baseline; column-gap: 5px; }
+    .node-time-pair b { color: var(--muted); font-size: 10px; font-weight: 700; }
+    .node-time-pair strong { color: var(--ink); font-size: 11px; font-weight: 600; white-space: nowrap; }
+    .node-time-pair small { color: var(--muted); font-size: 9px; font-weight: 500; white-space: nowrap; }
+    .node-time-shared { grid-column: 1 / -1; color: var(--muted); font-size: 10px; font-weight: 600; text-align: right; }
     .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
     .heartbeat-strip { position: relative; display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; overflow: hidden; isolation: isolate; }
     .heartbeat-strip.heartbeat-active::after { position: absolute; z-index: 2; top: -5px; bottom: -5px; left: -24%; width: 22%; content: ""; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(239, 255, 246, .14) 28%, rgba(255, 255, 255, .78) 50%, rgba(239, 255, 246, .14) 72%, transparent); filter: blur(2px); animation: heartbeat-charge 3.8s linear infinite; }
@@ -685,8 +687,8 @@ async function dashboardPageResponse(request, env) {
         const localLabel = requestedZone ? "当地" : "本地";
         return "<span>最后心跳</span><div class=\"node-time-pair\" title=\"中国时区：Asia/Shanghai；当地时区：" + escapeHtml(localZone) + "\">"
           + sharedMarkup
-          + "<span><b>中国</b> " + escapeHtml(chinaText) + "</span>"
-          + "<span><b>" + localLabel + "</b> " + escapeHtml(localText) + " <small>" + escapeHtml(localZone) + "</small></span>"
+          + "<span><b>中国</b><strong>" + escapeHtml(chinaText) + "</strong><small></small></span>"
+          + "<span><b>" + localLabel + "</b><strong>" + escapeHtml(localText) + "</strong><small>" + escapeHtml(localZone) + "</small></span>"
           + "</div>";
       }
 
@@ -726,8 +728,31 @@ async function dashboardPageResponse(request, env) {
           info.platform,
           info.arch,
           info.osType,
-          info.osRelease
+          info.osRelease,
+          node?.timezone
         ].filter(Boolean).join(" ").toLowerCase();
+      }
+
+      function normalizeSearchValue(value) {
+        return String(value || "")
+          .toLocaleLowerCase("zh-CN")
+          .replace(/[\s_./:-]+/g, "");
+      }
+
+      function fuzzySearchMatch(text, query) {
+        const normalizedText = normalizeSearchValue(text);
+        const normalizedQuery = normalizeSearchValue(query);
+        if (!normalizedQuery) return true;
+        if (normalizedText.includes(normalizedQuery)) return true;
+
+        let queryIndex = 0;
+        for (const character of normalizedText) {
+          if (character === normalizedQuery[queryIndex]) {
+            queryIndex += 1;
+            if (queryIndex === normalizedQuery.length) return true;
+          }
+        }
+        return false;
       }
 
       function setStatusFilter(status) {
@@ -742,7 +767,7 @@ async function dashboardPageResponse(request, env) {
         return currentNodes.filter((node) => {
           if (selectedStatus === "online" && !node.online) return false;
           if (selectedStatus === "timedOut" && !node.timedOut) return false;
-          return !query || nodeSearchText(node).includes(query);
+          return fuzzySearchMatch(nodeSearchText(node), query);
         });
       }
 
@@ -837,11 +862,11 @@ async function dashboardPageResponse(request, env) {
       }
 
       filterSearchElement.addEventListener("input", renderFilteredNodes);
-      filterStatusElement.addEventListener("click", (event) => {
-        const button = event.target.closest("[data-status]");
-        if (!button) return;
-        setStatusFilter(button.dataset.status);
-        renderFilteredNodes();
+      filterStatusElement.querySelectorAll("[data-status]").forEach((button) => {
+        button.addEventListener("click", () => {
+          setStatusFilter(button.getAttribute("data-status"));
+          renderFilteredNodes();
+        });
       });
       filterClearElement.addEventListener("click", () => {
         filterSearchElement.value = "";
