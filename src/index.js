@@ -442,9 +442,9 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .hero { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 13px; padding: 11px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
-    .hero-copy { display: grid; min-width: 0; gap: 2px; align-content: center; }
-    .hero-main { display: flex; align-items: baseline; justify-content: center; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; text-align: center; }
+    .system-status-overview { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 13px; min-width: 0; padding: 0 2px; }
+    .system-status-overview-copy { display: grid; min-width: 0; gap: 2px; align-content: center; }
+    .system-status-summary { display: flex; align-items: baseline; justify-content: flex-start; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; text-align: left; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
     .hero-icon.waiting { color: var(--muted); background: #f0f2f4; }
@@ -453,12 +453,15 @@ async function dashboardPageResponse(request, env) {
     .hero-detail { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
     .section { margin-top: 30px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
-    .system-status-layout { display: grid; grid-template-columns: 145px minmax(0, 1fr); align-items: stretch; gap: 18px; padding: 0; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
-    .system-status-heading { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+    .system-status-layout { display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr); align-items: stretch; gap: 18px; padding: 14px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
+    .system-status-heading { display: flex; flex-direction: column; justify-content: center; gap: 12px; min-width: 0; padding: 0 2px; }
     .section-title { display: flex; align-items: baseline; gap: 10px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
     .count { color: var(--muted); font-size: 13px; }
-    .node-toolbar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 10px 12px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
+    .node-section-head { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: end; gap: 16px; margin-bottom: 12px; padding: 10px 12px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
+    .node-section-title { min-width: 0; }
+    .node-section-title .eyebrow { margin-bottom: 3px; }
+    .node-toolbar { display: flex; align-items: center; gap: 10px; min-width: 0; }
     .filter-search { display: flex; align-items: center; flex: 0 1 620px; width: min(100%, 620px); gap: 8px; min-width: 0; margin-right: auto; padding: 9px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
     .filter-search span { font-size: 16px; line-height: 1; }
     .filter-search input { min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
@@ -533,9 +536,10 @@ async function dashboardPageResponse(request, env) {
       .topbar { align-items: flex-start; padding-bottom: 26px; }
       .brand-context { display: block; margin: 3px 0 0; }
       .live-meta { padding-top: 7px; }
-      .hero { align-items: flex-start; padding: 12px 14px; }
-      .hero-copy { gap: 3px; }
-      .hero-main { display: block; text-align: center; }
+      .system-status-layout { padding: 14px; }
+      .system-status-overview { padding: 0; }
+      .system-status-overview-copy { gap: 3px; }
+      .system-status-summary { display: block; text-align: left; }
       .hero-detail { margin-top: 4px; }
       .section { margin-top: 26px; }
       .system-status-layout { grid-template-columns: 1fr; gap: 14px; }
@@ -547,7 +551,8 @@ async function dashboardPageResponse(request, env) {
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .heartbeat-strip { gap: 2px; }
       .node-list.node-cards { grid-template-columns: 1fr; padding: 10px; }
-      .node-toolbar { align-items: stretch; flex-wrap: wrap; padding: 10px; }
+      .node-section-head { grid-template-columns: 1fr; align-items: stretch; gap: 10px; padding: 12px 10px; }
+      .node-toolbar { align-items: stretch; flex-wrap: wrap; }
       .filter-search { flex-basis: 100%; width: 100%; max-width: none; margin-right: 0; }
       .filter-status { flex: 1 1 auto; }
       .node-view-toggle { flex: 0 0 auto; }
@@ -569,58 +574,60 @@ async function dashboardPageResponse(request, env) {
       <div class="live-meta"><span class="live-dot"></span><span>实时监控</span><span id="last-updated">刚刚更新</span></div>
     </header>
 
-    <section class="hero" aria-live="polite">
-      <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
-      <div class="hero-copy">
-        <div class="hero-main">
-          <h1 id="overview-label">${overviewLabel}</h1>
-          <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
-        </div>
-      </div>
-    </section>
-
     <section class="section">
       <div class="system-status-layout">
         <div class="system-status-heading">
           <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
+          <div class="system-status-overview" aria-live="polite">
+            <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
+            <div class="system-status-overview-copy">
+              <div class="system-status-summary">
+                <h1 id="overview-label">${overviewLabel}</h1>
+                <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
+              </div>
+            </div>
+          </div>
         </div>
         <div class="service-list">
-        <div class="service-row">
-          <div class="service-main"><span id="heartbeat-state" class="service-state ${heartbeatStateClass}">${heartbeatState}</span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${heartbeatDescription}</span></span></div>
-        </div>
-        <div class="service-row">
-          <div class="service-main"><span id="node-state" class="service-state ${nodeStateClass}">${nodeState}</span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
-        </div>
-        <div class="service-row">
-          <div class="service-main"><span class="service-state operational">正常</span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
-        </div>
+          <div class="service-row">
+            <div class="service-main"><span id="heartbeat-state" class="service-state ${heartbeatStateClass}">${heartbeatState}</span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${heartbeatDescription}</span></span></div>
+          </div>
+          <div class="service-row">
+            <div class="service-main"><span id="node-state" class="service-state ${nodeStateClass}">${nodeState}</span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
+          </div>
+          <div class="service-row">
+            <div class="service-main"><span class="service-state operational">正常</span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
+          </div>
         </div>
       </div>
     </section>
 
     <section class="section">
-      <div class="section-heading">
-        <div><p class="eyebrow">Online nodes</p><div class="section-title"><h2>在线机器</h2><span id="node-count" class="count">${visibleCount} 台</span></div></div>
-      </div>
-      <div class="node-toolbar" role="search" aria-label="筛选在线机器">
-        <label class="filter-search">
-          <span aria-hidden="true">⌕</span>
-          <input id="node-filter-search" type="search" placeholder="搜索名称、IP、域名、系统或架构" autocomplete="off">
-        </label>
-        <div id="node-filter-status" class="filter-status" role="group" aria-label="状态筛选">
-          <button class="filter-status-option" type="button" data-status="all" aria-pressed="true">全部</button>
-          <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
-          <button class="filter-status-option" type="button" data-status="timedOut" aria-pressed="false">超时</button>
+      <div class="node-section-head">
+        <div class="node-section-title">
+          <p class="eyebrow">Online nodes</p>
+          <div class="section-title"><h2>在线机器</h2><span id="node-count" class="count">${visibleCount} 台</span></div>
         </div>
-        <div id="node-filter-view" class="filter-status node-view-toggle" role="group" aria-label="节点视图">
-          <button class="node-view-option" type="button" data-view="list" aria-pressed="true" aria-label="列表视图" title="列表视图">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12"></path><path d="M4 6h.01M4 12h.01M4 18h.01"></path></svg>
-          </button>
-          <button class="node-view-option" type="button" data-view="cards" aria-pressed="false" aria-label="卡片视图" title="卡片视图">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="4" width="6" height="6" rx="1"></rect><rect x="4" y="14" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect></svg>
-          </button>
+        <div class="node-toolbar" role="search" aria-label="筛选在线机器">
+          <label class="filter-search">
+            <span aria-hidden="true">⌕</span>
+            <input id="node-filter-search" type="search" placeholder="搜索名称、IP、域名、系统或架构" autocomplete="off">
+          </label>
+          <div id="node-filter-status" class="filter-status" role="group" aria-label="状态筛选">
+            <button class="filter-status-option" type="button" data-status="all" aria-pressed="true">全部</button>
+            <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
+            <button class="filter-status-option" type="button" data-status="timedOut" aria-pressed="false">超时</button>
+          </div>
+          <div id="node-filter-view" class="filter-status node-view-toggle" role="group" aria-label="节点视图">
+            <button class="node-view-option" type="button" data-view="list" aria-pressed="true" aria-label="列表视图" title="列表视图">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12"></path><path d="M4 6h.01M4 12h.01M4 18h.01"></path></svg>
+            </button>
+            <button class="node-view-option" type="button" data-view="cards" aria-pressed="false" aria-label="卡片视图" title="卡片视图">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="4" width="6" height="6" rx="1"></rect><rect x="4" y="14" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect></svg>
+            </button>
+          </div>
+          <span id="node-filter-result" class="filter-result"></span>
         </div>
-        <span id="node-filter-result" class="filter-result"></span>
       </div>
       <div class="node-card">
         <div id="node-rows" class="node-list">${rows}</div>
