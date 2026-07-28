@@ -6,6 +6,10 @@
   "workers_dev": true,
   "assets": {
     "directory": "./public",
-    "binding": "ASSETS"
+    "binding": "ASSETS",
+    "run_worker_first": [
+      "/install.sh",
+      "/inatall.sh"
+    ]
   }
 }
