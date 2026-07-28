@@ -458,24 +458,21 @@ async function dashboardPageResponse(request, env) {
     .section-title { display: flex; align-items: baseline; gap: 10px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
     .count { color: var(--muted); font-size: 13px; }
-    .node-toolbar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+    .node-toolbar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; padding: 10px 12px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
     .filter-search { display: flex; align-items: center; flex: 0 1 620px; width: min(100%, 620px); gap: 8px; min-width: 0; margin-right: auto; padding: 9px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
     .filter-search span { font-size: 16px; line-height: 1; }
     .filter-search input { min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
     .filter-search input { width: 100%; }
     .filter-status { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; padding: 3px; background: #f5f6f7; border: 1px solid var(--line); border-radius: 9px; }
-    .filter-status-option { padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .filter-status-option { height: 30px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; white-space: nowrap; }
     .filter-status-option:hover { color: var(--ink); }
-    .filter-status-option[aria-pressed="true"] { background: var(--surface); box-shadow: 0 1px 3px rgba(32, 33, 36, .12); color: var(--ink); }
-    .filter-status-option[data-status="online"][aria-pressed="true"] { color: var(--green); }
-    .filter-status-option[data-status="timedOut"][aria-pressed="true"] { color: var(--amber); }
+    .filter-status-option[aria-pressed="true"], .node-view-option[aria-pressed="true"] { background: var(--accent); box-shadow: 0 2px 7px rgba(20, 120, 200, .25); color: #fff; }
+    .filter-status-option[data-status="online"][aria-pressed="true"], .filter-status-option[data-status="timedOut"][aria-pressed="true"] { color: #fff; }
     .node-view-toggle { padding: 3px; }
     .node-view-option { display: grid; place-items: center; width: 34px; height: 30px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
     .node-view-option:hover { color: var(--ink); }
-    .node-view-option[aria-pressed="true"] { background: var(--accent); box-shadow: 0 2px 7px rgba(20, 120, 200, .25); color: #fff; }
     .node-view-option svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
-    .filter-clear { padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
-    .filter-clear:hover { color: var(--ink); border-color: #c5cad1; }
+    .filter-status-option:focus-visible, .node-view-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .filter-result { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .service-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; min-width: 0; padding: 18px; border-right: 1px solid var(--line); }
@@ -550,7 +547,7 @@ async function dashboardPageResponse(request, env) {
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .heartbeat-strip { gap: 2px; }
       .node-list.node-cards { grid-template-columns: 1fr; padding: 10px; }
-      .node-toolbar { align-items: stretch; flex-wrap: wrap; }
+      .node-toolbar { align-items: stretch; flex-wrap: wrap; padding: 10px; }
       .filter-search { flex-basis: 100%; width: 100%; max-width: none; margin-right: 0; }
       .filter-status { flex: 1 1 auto; }
       .node-view-toggle { flex: 0 0 auto; }
@@ -623,7 +620,6 @@ async function dashboardPageResponse(request, env) {
             <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="4" width="6" height="6" rx="1"></rect><rect x="4" y="14" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect></svg>
           </button>
         </div>
-        <button id="node-filter-clear" class="filter-clear" type="button" hidden>清除</button>
         <span id="node-filter-result" class="filter-result"></span>
       </div>
       <div class="node-card">
@@ -642,7 +638,6 @@ async function dashboardPageResponse(request, env) {
       const filterSearchElement = document.getElementById("node-filter-search");
       const filterStatusElement = document.getElementById("node-filter-status");
       const filterViewElement = document.getElementById("node-filter-view");
-      const filterClearElement = document.getElementById("node-filter-clear");
       const filterResultElement = document.getElementById("node-filter-result");
       const heartbeatDescriptionElement = document.getElementById("heartbeat-description");
       const heartbeatStateElement = document.getElementById("heartbeat-state");
@@ -813,10 +808,9 @@ async function dashboardPageResponse(request, env) {
 
       function renderFilteredNodes() {
         const nodes = filteredNodes();
-        const hasFilter = Boolean(filterSearchElement.value.trim()) || selectedStatus !== "all";
         rowsElement.className = selectedView === "cards" ? "node-list node-cards" : "node-list";
         rowsElement.innerHTML = renderRows(nodes);
-        filterClearElement.hidden = !hasFilter;
+        const hasFilter = Boolean(filterSearchElement.value.trim()) || selectedStatus !== "all";
         filterResultElement.textContent = hasFilter
           ? "显示 " + nodes.length + " / " + currentNodes.length + " 台"
           : currentNodes.length + " 台";
@@ -931,13 +925,6 @@ async function dashboardPageResponse(request, env) {
           renderFilteredNodes();
         });
       });
-      filterClearElement.addEventListener("click", () => {
-        filterSearchElement.value = "";
-        setStatusFilter("all");
-        renderFilteredNodes();
-        filterSearchElement.focus();
-      });
-
       refreshNodes();
       window.setInterval(refreshNodes, 30000);
     })();
