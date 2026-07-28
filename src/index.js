@@ -622,6 +622,7 @@ async function dashboardPageResponse(request, env) {
       let refreshing = false;
       let currentNodes = [];
       let selectedStatus = "all";
+      let searchTimer = null;
 
       function escapeHtml(value) {
         const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -781,6 +782,18 @@ async function dashboardPageResponse(request, env) {
           : currentNodes.length + " 台";
       }
 
+      function scheduleFilteredNodes() {
+        if (searchTimer !== null) window.clearTimeout(searchTimer);
+        if (!filterSearchElement.value.trim()) {
+          renderFilteredNodes();
+          return;
+        }
+        searchTimer = window.setTimeout(() => {
+          searchTimer = null;
+          renderFilteredNodes();
+        }, 250);
+      }
+
       function renderRows(nodes) {
         if (!nodes.length) {
           return '<div class="empty">暂无在线机器</div>';
@@ -861,7 +874,8 @@ async function dashboardPageResponse(request, env) {
         }
       }
 
-      filterSearchElement.addEventListener("input", renderFilteredNodes);
+      filterSearchElement.addEventListener("input", scheduleFilteredNodes);
+      filterSearchElement.addEventListener("search", renderFilteredNodes);
       filterStatusElement.querySelectorAll("[data-status]").forEach((button) => {
         button.addEventListener("click", () => {
           setStatusFilter(button.getAttribute("data-status"));
