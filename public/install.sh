@@ -13,7 +13,6 @@ readonly DEFAULT_TEAMNODE_SYNC_BASE_URL="__WORKER_SYNC_BASE_URL__"
 readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
 readonly DEFAULT_XRAY_VERSION="v26.3.27"
-readonly DEFAULT_NEZHA_VERSION="v1.14.1"
 readonly DEFAULT_PM2_VERSION="5.4.3"
 
 APP_DIR="${APP_DIR:-${DEFAULT_APP_DIR}}"
@@ -28,7 +27,6 @@ SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256-}"
 
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-${DEFAULT_CLOUDFLARED_VERSION}}"
 XRAY_VERSION="${XRAY_VERSION:-${DEFAULT_XRAY_VERSION}}"
-NEZHA_VERSION="${NEZHA_VERSION:-${DEFAULT_NEZHA_VERSION}}"
 PM2_VERSION="${PM2_VERSION:-${DEFAULT_PM2_VERSION}}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
 FORCE_KILL_PORTS="${FORCE_KILL_PORTS:-false}"
@@ -497,31 +495,6 @@ install_xray() {
   chmod 0755 "${BIN_PATH}/xray"
 }
 
-install_nezha() {
-  local arch="$1"
-  local asset
-  local expected
-  case "${arch}" in
-    amd64)
-      asset="nezha-agent_linux_amd64.zip"
-      expected="47A67447F8A1A64F95B4FE93193ECBCB56457A0357101ED58071293675C0FA1F"
-      ;;
-    arm64)
-      asset="nezha-agent_linux_arm64.zip"
-      expected="8B1AB80D4B21AD5DBF087D78CF84334DE15C80AB9D2596A8235D90BF8116473F"
-      ;;
-    *) die "不支持的架构：${arch}" ;;
-  esac
-  expected="${NEZHA_SHA256:-${expected}}"
-  local archive="${TMP_DIR}/${asset}"
-  download_verified \
-    "https://github.com/nezhahq/agent/releases/download/${NEZHA_VERSION}/${asset}" \
-    "${archive}" "${expected}" "哪吒 agent ${NEZHA_VERSION}"
-  unzip -j -o "${archive}" nezha-agent -d "${BIN_PATH}" >/dev/null
-  cp "${BIN_PATH}/nezha-agent" "${BIN_PATH}/nezha-agent-legacy"
-  chmod 0755 "${BIN_PATH}/nezha-agent" "${BIN_PATH}/nezha-agent-legacy"
-}
-
 write_env_value() {
   local key="$1"
   local value="${2-}"
@@ -656,9 +629,6 @@ write_env_file() {
   write_env_value "CFPORT" "${CFPORT}"
   write_env_value "NAME" "${NAME:-}"
   write_env_value "UUID" "${UUID}"
-  write_env_value "NEZHA_SERVER" "${NEZHA_SERVER:-}"
-  write_env_value "NEZHA_PORT" "${NEZHA_PORT:-}"
-  write_env_value "NEZHA_KEY" "${NEZHA_KEY:-}"
   write_env_value "UPLOAD_URL" "${UPLOAD_URL:-}"
   write_env_value "PROJECT_URL" "${PROJECT_URL:-}"
   write_env_value "SUB_PATH" "${SUB_PATH:-sub}"
@@ -1278,7 +1248,6 @@ main() {
 
   install_cloudflared "${machine_arch}"
   install_xray "${machine_arch}"
-  install_nezha "${machine_arch}"
   write_runtime_files
   write_env_file
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"

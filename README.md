@@ -265,7 +265,7 @@ env \
 2. 提示输入 Worker 兑换密码；
 3. Worker 校验密码，并根据 UUID 签发专属中继令牌；
 4. 将中继令牌写入目标机器的 `.env`；
-5. 下载并校验 cloudflared、Xray、哪吒和节点源码；
+5. 下载并校验 cloudflared、Xray 和节点源码；
 6. 启动节点及 Cloudflare Tunnel。
 
 兑换密码不会写入 `.env`，也不会打印到日志。

@@ -32,9 +32,6 @@ const CLOUDFLARED_PROTOCOL = process.env.CLOUDFLARED_PROTOCOL || "http2";
 const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
 const DIRECT_NGINX_ACCESS_LOG_ENABLED = parseBoolean(process.env.DIRECT_NGINX_ACCESS_LOG_ENABLED, false);
 const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
-const NEZHA_SERVER = process.env.NEZHA_SERVER || ""; // 哪吒 v1 格式：nz.abc.com:8008；v0 格式：nz.abc.com
-const NEZHA_PORT = process.env.NEZHA_PORT || ""; // 使用哪吒 v1 时留空，使用 v0 时填写
-const NEZHA_KEY = process.env.NEZHA_KEY || ""; // 哪吒 v1 的 NZ_CLIENT_SECRET 或 v0 的 agent 密钥
 const ARGO_DOMAIN = process.env.ARGO_DOMAIN || (PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_DOMAIN : ""); // 平台模式可由平台域名环境变量自动提供
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
@@ -77,8 +74,6 @@ const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
 const XRAY_BIN = process.env.XRAY_BIN || path.join(BIN_PATH, "xray");
 const CLOUDFLARED_BIN = process.env.CLOUDFLARED_BIN || path.join(BIN_PATH, "cloudflared");
-const NEZHA_AGENT_BIN = process.env.NEZHA_AGENT_BIN || path.join(BIN_PATH, "nezha-agent");
-const NEZHA_AGENT_LEGACY_BIN = process.env.NEZHA_AGENT_LEGACY_BIN || path.join(BIN_PATH, "nezha-agent-legacy");
 
 const ARGO_WS_TARGETS = Object.freeze({
   "/vless-argo": 3002,
@@ -96,20 +91,15 @@ if (!fs.existsSync(FILE_PATH)) {
 }
 
 // 全局路径常量
-const npmPath = NEZHA_AGENT_LEGACY_BIN;
-const phpPath = NEZHA_AGENT_BIN;
 const webPath = XRAY_BIN;
 const botPath = CLOUDFLARED_BIN;
-const npmName = path.basename(npmPath, path.extname(npmPath));
 const webName = path.basename(webPath, path.extname(webPath));
 const botName = path.basename(botPath, path.extname(botPath));
-const phpName = path.basename(phpPath, path.extname(phpPath));
 const subPath = path.join(FILE_PATH, "sub.txt");
 const listPath = path.join(FILE_PATH, "list.txt");
 const bootLogPath = path.join(FILE_PATH, "boot.log");
 const configPath = path.join(FILE_PATH, "config.json");
 const nginxBootLogPath = path.join(FILE_PATH, "nginx-boot.log");
-const nezhaBootLogPath = path.join(FILE_PATH, "nezha-boot.log");
 const xrayBootLogPath = path.join(FILE_PATH, "xray-boot.log");
 const cloudflaredBootLogPath = path.join(FILE_PATH, "cloudflared-boot.log");
 const xrayAccessLogPath = path.join(FILE_PATH, "xray-access.log");
@@ -120,7 +110,6 @@ const directNginxAccessLogPath = path.join(FILE_PATH, "nginx-access.log");
 const directNginxErrorLogPath = path.join(FILE_PATH, "nginx-error.log");
 const directNginxPidPath = path.join(FILE_PATH, "nginx.pid");
 const directAcmePath = path.join(FILE_PATH, "acme");
-const nezhaConfigPath = path.join(FILE_PATH, "config.yaml");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
 const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
@@ -1319,7 +1308,7 @@ function buildCloudflaredArgs() {
   return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile ${shellQuote(bootLogPath)} --loglevel info --url ${shellQuote(`http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`)}`;
 }
 
-// 启动镜像内置的哪吒、Xray、cloudflared
+// 启动 Xray、cloudflared
 async function startProcesses() {
   try {
     ensureBinaryExists(webPath, "xray");
@@ -1330,65 +1319,6 @@ async function startProcesses() {
   } catch (error) {
     console.error(`二进制检查失败：${error.message}`);
     throw error;
-  }
-
-  if (NEZHA_SERVER && NEZHA_KEY) {
-    if (!NEZHA_PORT) {
-      try {
-        ensureBinaryExists(phpPath, "nezha-agent");
-        authorizeFiles([phpPath]);
-
-        const port = NEZHA_SERVER.includes(":") ? NEZHA_SERVER.split(":").pop() : "";
-        const tlsPorts = new Set(["443", "8443", "2096", "2087", "2083", "2053"]);
-        const nezhatls = tlsPorts.has(port) ? "true" : "false";
-        const configYaml = `
-client_secret: ${NEZHA_KEY}
-debug: false
-disable_auto_update: true
-disable_command_execute: false
-disable_force_update: true
-disable_nat: false
-disable_send_query: false
-gpu: false
-insecure_tls: true
-ip_report_period: 1800
-report_delay: 4
-server: ${NEZHA_SERVER}
-skip_connection_count: true
-skip_procs_count: true
-temperature: false
-tls: ${nezhatls}
-use_gitee_to_upgrade: false
-use_ipv6_country_code: false
-uuid: ${UUID}`;
-
-        fs.writeFileSync(nezhaConfigPath, configYaml);
-        await exec(`nohup ${shellQuote(phpPath)} -c ${shellQuote(nezhaConfigPath)} >>${shellQuote(nezhaBootLogPath)} 2>&1 &`);
-        console.log(`${phpName} 已启动`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`哪吒 v1 启动失败：${error}`);
-      }
-    } else {
-      try {
-        ensureBinaryExists(npmPath, "nezha-agent-legacy");
-        authorizeFiles([npmPath]);
-
-        let NEZHA_TLS = "";
-        const tlsPorts = ["443", "8443", "2096", "2087", "2083", "2053"];
-        if (tlsPorts.includes(NEZHA_PORT)) {
-          NEZHA_TLS = "--tls";
-        }
-
-        await exec(`nohup ${shellQuote(npmPath)} -s ${shellQuote(`${NEZHA_SERVER}:${NEZHA_PORT}`)} -p ${shellQuote(NEZHA_KEY)} ${NEZHA_TLS} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >>${shellQuote(nezhaBootLogPath)} 2>&1 &`);
-        console.log(`${npmName} 已启动`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error(`哪吒 v0 启动失败：${error}`);
-      }
-    }
-  } else {
-    console.log("未配置哪吒参数，跳过启动");
   }
 
   try {
