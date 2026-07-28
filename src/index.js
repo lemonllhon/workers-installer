@@ -256,7 +256,8 @@ async function dashboardPageResponse(request, env) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="30">
-  <title>nodejs-argo 在线节点</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <title>lemon-监控面板</title>
   <style>
     :root { color-scheme: light dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; padding: 24px; background: #f4f7fb; color: #172033; }
@@ -285,7 +286,7 @@ async function dashboardPageResponse(request, env) {
 </head>
 <body>
   <main>
-    <h1>nodejs-argo 在线节点</h1>
+    <h1>lemon-监控面板</h1>
     <p class="summary">在线 ${onlineCount} 台；每 30 秒自动刷新；超过 ${Math.round(onlineTtlMs(env) / 60000)} 分钟未收到心跳会从列表删除。</p>
     <div class="card">
       <table>

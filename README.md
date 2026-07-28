@@ -121,7 +121,7 @@ https://install.lemon.vin/install.sh
 
 每次请求 `install.sh` 时，Worker 会重新计算当前 `agent/index.js` 的 SHA256，并注入源码地址和校验值。因此不要直接使用 GitHub 原始文件中的 `public/install.sh`。
 
-### 在线机器面板
+### lemon-监控面板
 
 部署后直接打开：
 
