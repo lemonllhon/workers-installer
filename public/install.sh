@@ -88,7 +88,7 @@ ARGO_AUTH、ARGO_DOMAIN 通过环境变量传入，不写入脚本。
 默认使用 Worker 代理 TeamNode；客户端不保存 TEAMNODE_SYNC_SECRET。可直接设置 TEAMNODE_SYNC_RELAY_TOKEN，或安装时输入兑换密码自动获取。
 如果未设置 TEAMNODE_SYNC_RELAY_TOKEN，安装时会交互式询问兑换密码，从 Worker 获取中继令牌；兑换密码不会写入 .env。
 如明确直连 TeamNode，才设置 TEAMNODE_SYNC_BASE_URL 和 TEAMNODE_SYNC_SECRET。
-UUID 可选；未设置时安装器会随机生成并保存到 .env。
+UUID 可选；新机器未设置时会随机生成。覆盖已有安装且未设置 UUID 时，会优先复用旧 `.env` 中的 UUID。
 
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、supervisor、rc.local、cron、none。
 auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
@@ -136,6 +136,30 @@ require_config() {
 
 validate_uuid() {
   [[ "${UUID}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式无效：${UUID}"
+}
+
+restore_existing_uuid_if_missing() {
+  # Preserve the node identity during an in-place upgrade. A new machine has
+  # no .env yet, so it continues to receive a newly generated UUID below.
+  if [[ -n "${UUID:-}" ]]; then
+    return 0
+  fi
+
+  local previous_env="${APP_DIR}/.env"
+  [[ -r "${previous_env}" ]] || return 0
+
+  local previous_uuid
+  previous_uuid="$(sed -n 's/^UUID=//p' "${previous_env}" 2>/dev/null | head -n 1 || true)"
+  if [[ -z "${previous_uuid}" ]]; then
+    return 0
+  fi
+
+  if [[ "${previous_uuid}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
+    UUID="${previous_uuid}"
+    log "未指定 UUID，已从旧安装 .env 复用 UUID：${UUID}"
+  else
+    warn "旧安装 .env 中的 UUID 格式无效，将生成新的 UUID"
+  fi
 }
 
 resolve_source_checksum() {
@@ -1214,6 +1238,7 @@ main() {
   check_dependencies
   NODE_BIN="$(command -v node)"
   NPM_BIN="$(command -v npm)"
+  restore_existing_uuid_if_missing
   generate_uuid_if_missing
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
