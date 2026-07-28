@@ -24,6 +24,8 @@ npx wrangler deploy
 https://你的-worker.workers.dev/install.sh
 ```
 
+同时兼容旧地址拼写：`/inatall.sh`；新部署建议使用 `/install.sh`。
+
 Worker 只返回静态脚本，不保存 `ARGO_AUTH` 或 `TEAMNODE_SYNC_SECRET`。
 
 ## 2. 在无 Docker 的 Linux 机器安装

@@ -1,4 +1,5 @@
 const INSTALL_PATH = "/install.sh";
+const INSTALL_ALIASES = new Set([INSTALL_PATH, "/inatall.sh"]);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -18,7 +19,7 @@ export default {
       return json({ ok: true, service: "nodejs-argo-installer" });
     }
 
-    if (url.pathname === INSTALL_PATH) {
+    if (INSTALL_ALIASES.has(url.pathname)) {
       if (request.method !== "GET") {
         return json({ error: "method_not_allowed" }, 405);
       }
