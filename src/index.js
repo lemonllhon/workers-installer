@@ -263,12 +263,12 @@ function dashboardTime(value) {
 
 function validTimeZone(value) {
   const candidate = String(value || "").trim();
-  if (!candidate) return "UTC";
+  if (!candidate) return null;
   try {
     new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format();
     return candidate;
   } catch {
-    return "UTC";
+    return null;
   }
 }
 
@@ -298,9 +298,15 @@ function timeParts(value, timeZone) {
 function heartbeatTimeMarkup(node, value) {
   const china = timeParts(value, "Asia/Shanghai");
   const localZone = validTimeZone(node?.timezone);
-  const local = timeParts(value, localZone);
-  if (!china || !local) {
+  const local = localZone ? timeParts(value, localZone) : null;
+  if (!china) {
     return `<span>最后心跳</span><strong>${htmlEscape(dashboardTime(value))}</strong>`;
+  }
+
+  if (!localZone || !local) {
+    const sharedPrefix = `${china.year}-${china.month}`;
+    const chinaText = `${china.day} ${china.clock}`;
+    return `<div class="node-time-heading"><span>最后心跳</span><span class="node-time-shared">${htmlEscape(sharedPrefix)}</span></div><div class="node-time-pair" title="节点未上报时区，无法计算节点时间"><span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small>Asia/Shanghai</small></span><span><b>节点</b><strong>-</strong><small>未上报时区</small></span></div>`;
   }
 
   const sameYear = china.year === local.year;
@@ -313,7 +319,7 @@ function heartbeatTimeMarkup(node, value) {
     ? `${local.day} ${local.clock}`
     : sameYear ? `${local.month}-${local.day} ${local.clock}` : `${local.year}-${local.month}-${local.day} ${local.clock}`;
   const sharedMarkup = sharedPrefix ? `<span class="node-time-shared">${htmlEscape(sharedPrefix)}</span>` : "";
-  return `<div class="node-time-heading"><span>最后心跳</span>${sharedMarkup}</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：${htmlEscape(localZone)}"><span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small></small></span><span><b>当地</b><strong>${htmlEscape(localText)}</strong><small>${htmlEscape(localZone)}</small></span></div>`;
+  return `<div class="node-time-heading"><span>最后心跳</span>${sharedMarkup}</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；节点时区：${htmlEscape(localZone)}"><span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small>Asia/Shanghai</small></span><span><b>节点</b><strong>${htmlEscape(localText)}</strong><small>${htmlEscape(localZone)}</small></span></div>`;
 }
 
 function heartbeatHistoryValues(node) {
@@ -442,15 +448,15 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .system-status-overview { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 13px; min-width: 0; padding: 0 2px; }
-    .system-status-overview-copy { display: grid; min-width: 0; gap: 2px; align-content: center; }
-    .system-status-summary { display: flex; align-items: baseline; justify-content: flex-start; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; text-align: left; }
+    .system-status-overview { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; justify-content: center; gap: 13px; min-width: 0; padding: 0 2px; }
+    .system-status-overview-copy { display: grid; min-width: 0; gap: 2px; align-content: center; text-align: center; }
+    .system-status-summary { display: flex; align-items: baseline; justify-content: center; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; text-align: center; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
     .hero-icon.waiting { color: var(--muted); background: #f0f2f4; }
     .eyebrow { margin: 0 0 2px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    h1 { margin: 0; font-size: clamp(20px, 3vw, 25px); letter-spacing: -.035em; line-height: 1.15; }
-    .hero-detail { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
+    h1 { margin: 0; font-size: clamp(16px, 2vw, 20px); letter-spacing: -.025em; line-height: 1.25; }
+    .hero-detail { max-width: 260px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
     .section { margin-top: 30px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
     .system-status-layout { display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr); align-items: stretch; gap: 18px; padding: 14px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
@@ -476,15 +482,15 @@ async function dashboardPageResponse(request, env) {
     .node-view-option:hover { color: var(--ink); }
     .node-view-option svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
     .filter-status-option:focus-visible, .node-view-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-    .filter-result { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .filter-result { flex: 0 0 72px; min-width: 72px; color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
     .service-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-    .service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; min-width: 0; padding: 18px; border-right: 1px solid var(--line); }
+    .service-row { display: flex; align-items: center; justify-content: center; gap: 14px; min-width: 0; padding: 16px; border-right: 1px solid var(--line); }
     .service-row:last-child { border-right: 0; }
-    .service-main { display: flex; flex: 1; align-items: center; gap: 12px; min-width: 0; }
-    .service-copy { flex: 1; min-width: 0; text-align: center; }
-    .service-name { display: block; font-size: 14px; font-weight: 650; }
-    .service-description { display: block; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-    .service-state { flex: 0 0 auto; min-width: 42px; color: var(--muted); font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .service-main { display: flex; flex: 1; align-items: center; justify-content: center; gap: 10px; min-width: 0; text-align: center; }
+    .service-copy { flex: 0 1 210px; min-width: 0; text-align: center; }
+    .service-name { display: block; font-size: 13px; font-weight: 650; line-height: 1.35; overflow-wrap: anywhere; }
+    .service-description { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; white-space: normal; }
+    .service-state { flex: 0 0 auto; min-width: 0; color: var(--muted); font-size: 12px; font-weight: 700; line-height: 1.3; white-space: nowrap; }
     .service-state.operational { color: var(--green); }
     .service-state.attention { color: var(--amber); }
     .service-state.waiting { color: var(--muted); }
@@ -506,7 +512,7 @@ async function dashboardPageResponse(request, env) {
     .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 11px; line-height: 1.45; text-align: right; }
     .node-time-heading { display: grid; grid-template-columns: max-content 1fr; align-items: baseline; column-gap: 6px; width: 100%; text-align: left; }
     .node-time-pair { display: grid; width: max-content; gap: 1px; margin: 2px 0 0 auto; color: var(--ink); font-size: 11px; font-weight: 600; text-align: left; }
-    .node-time-pair > span { display: grid; grid-template-columns: 32px auto 1fr; align-items: baseline; column-gap: 5px; }
+    .node-time-pair > span { display: grid; grid-template-columns: 52px auto 1fr; align-items: baseline; column-gap: 5px; }
     .node-time-pair b { color: var(--muted); font-size: 10px; font-weight: 700; }
     .node-time-pair strong { color: var(--ink); font-size: 11px; font-weight: 600; white-space: nowrap; }
     .node-time-pair small { color: var(--muted); font-size: 9px; font-weight: 500; white-space: nowrap; }
@@ -539,7 +545,7 @@ async function dashboardPageResponse(request, env) {
       .system-status-layout { padding: 14px; }
       .system-status-overview { padding: 0; }
       .system-status-overview-copy { gap: 3px; }
-      .system-status-summary { display: block; text-align: left; }
+      .system-status-summary { display: block; text-align: center; }
       .hero-detail { margin-top: 4px; }
       .section { margin-top: 26px; }
       .system-status-layout { grid-template-columns: 1fr; gap: 14px; }
@@ -613,6 +619,7 @@ async function dashboardPageResponse(request, env) {
             <span aria-hidden="true">⌕</span>
             <input id="node-filter-search" type="search" placeholder="搜索名称、IP、域名、系统或架构" autocomplete="off">
           </label>
+          <span id="node-filter-result" class="filter-result"></span>
           <div id="node-filter-status" class="filter-status" role="group" aria-label="状态筛选">
             <button class="filter-status-option" type="button" data-status="all" aria-pressed="true">全部</button>
             <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
@@ -626,7 +633,6 @@ async function dashboardPageResponse(request, env) {
               <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="4" width="6" height="6" rx="1"></rect><rect x="4" y="14" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect></svg>
             </button>
           </div>
-          <span id="node-filter-result" class="filter-result"></span>
         </div>
       </div>
       <div class="node-card">
@@ -698,15 +704,20 @@ async function dashboardPageResponse(request, env) {
 
       function renderNodeTimePair(node, value) {
         const china = formatTimeParts(value, "Asia/Shanghai");
-        const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
         const requestedZone = String(node?.timezone || "").trim();
-        let localZone = browserZone;
-        if (requestedZone && formatTimeParts(value, requestedZone)) {
-          localZone = requestedZone;
-        }
-        const local = formatTimeParts(value, localZone);
-        if (!china || !local) {
+        const localZone = requestedZone && formatTimeParts(value, requestedZone) ? requestedZone : "";
+        const local = localZone ? formatTimeParts(value, localZone) : null;
+        if (!china) {
           return "<span>最后心跳</span><strong>" + escapeHtml(formatTime(value)) + "</strong>";
+        }
+
+        if (!localZone || !local) {
+          const sharedPrefix = china.year + "-" + china.month;
+          const chinaText = china.day + " " + china.clock;
+          return '<div class="node-time-heading"><span>最后心跳</span><span class="node-time-shared">' + escapeHtml(sharedPrefix) + '</span></div><div class="node-time-pair" title="节点未上报时区，无法计算节点时间">'
+            + '<span><b>中国</b><strong>' + escapeHtml(chinaText) + '</strong><small>Asia/Shanghai</small></span>'
+            + '<span><b>节点</b><strong>-</strong><small>未上报时区</small></span>'
+            + '</div>';
         }
 
         const sameYear = china.year === local.year;
@@ -719,10 +730,9 @@ async function dashboardPageResponse(request, env) {
           ? local.day + " " + local.clock
           : sameYear ? local.month + "-" + local.day + " " + local.clock : local.year + "-" + local.month + "-" + local.day + " " + local.clock;
         const sharedMarkup = sharedPrefix ? '<span class="node-time-shared">' + escapeHtml(sharedPrefix) + "</span>" : "";
-        const localLabel = requestedZone ? "当地" : "本地";
-        return '<div class="node-time-heading"><span>最后心跳</span>' + sharedMarkup + '</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：' + escapeHtml(localZone) + '">'
-          + '<span><b>中国</b><strong>' + escapeHtml(chinaText) + '</strong><small></small></span>'
-          + '<span><b>' + localLabel + '</b><strong>' + escapeHtml(localText) + '</strong><small>' + escapeHtml(localZone) + '</small></span>'
+        return '<div class="node-time-heading"><span>最后心跳</span>' + sharedMarkup + '</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；节点时区：' + escapeHtml(localZone) + '">'
+          + '<span><b>中国</b><strong>' + escapeHtml(chinaText) + '</strong><small>Asia/Shanghai</small></span>'
+          + '<span><b>节点</b><strong>' + escapeHtml(localText) + '</strong><small>' + escapeHtml(localZone) + '</small></span>'
           + '</div>';
       }
 
