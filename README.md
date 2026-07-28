@@ -26,7 +26,7 @@ https://你的-worker.workers.dev/install.sh
 
 同时兼容旧地址拼写：`/inatall.sh`；新部署建议使用 `/install.sh`。
 
-Worker 只返回静态脚本，不保存 `ARGO_AUTH` 或 `TEAMNODE_SYNC_SECRET`。
+Worker 只负责提供安装脚本，不保存 `ARGO_AUTH` 或 `TEAMNODE_SYNC_SECRET`。
 
 Worker 返回 `install.sh` 时会根据当前 `/agent/index.js` 的实际字节动态计算并注入 `DEFAULT_INDEX_SHA256`，因此源码更新或换行格式变化后不需要手工修改 SHA256。请始终从 Worker 地址下载安装器；直接使用 GitHub 原始 `public/install.sh` 时，源码地址和 SHA 占位符不会被注入。
 
@@ -44,6 +44,20 @@ export NAME='lemon'
 export UUID='你的 UUID'
 
 bash <(curl -fsSL https://你的-worker.workers.dev/install.sh)
+```
+
+也可以使用当前 Worker 的一键安装命令。`FORCE_KILL_PORTS=true` 会在清理旧安装时强制终止占用相关端口的其他程序，请确认目标机器上的 `3000`、`8001`、`3001-3004` 没有其他业务：
+
+```bash
+env \
+  FORCE_KILL_PORTS='true' \
+  TEAMNODE_SYNC_SECRET='你的密钥' \
+  ARGO_AUTH='你的 Tunnel Token' \
+  ARGO_DOMAIN='你的域名' \
+  UUID='你的 UUID' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash <(curl -fsSL https://install.lemon.vin/install.sh)
 ```
 
 默认会安装到 `/opt/nodejs-argo-no-docker`，并按系统检测结果创建对应的开机启动配置。
