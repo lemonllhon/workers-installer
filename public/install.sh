@@ -13,6 +13,7 @@ readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
 readonly DEFAULT_XRAY_VERSION="v26.3.27"
 readonly DEFAULT_NEZHA_VERSION="v1.14.1"
+readonly DEFAULT_PM2_VERSION="5.4.3"
 
 APP_DIR="${APP_DIR:-${DEFAULT_APP_DIR}}"
 SERVICE_NAME="${SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
@@ -24,6 +25,7 @@ SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256:-${DEFAULT_INDEX_SHA256}}"
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-${DEFAULT_CLOUDFLARED_VERSION}}"
 XRAY_VERSION="${XRAY_VERSION:-${DEFAULT_XRAY_VERSION}}"
 NEZHA_VERSION="${NEZHA_VERSION:-${DEFAULT_NEZHA_VERSION}}"
+PM2_VERSION="${PM2_VERSION:-${DEFAULT_PM2_VERSION}}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
 
 TEAMNODE_SYNC_BASE_URL="${TEAMNODE_SYNC_BASE_URL:-https://teamnode.lemon.vin}"
@@ -50,6 +52,10 @@ ENV_FILE=""
 SERVICE_FILE=""
 RUNNER_SCRIPT=""
 PID_FILE=""
+PM2_DIR=""
+PM2_HOME_DIR=""
+PM2_BIN=""
+RUN_AS_ROOT=false
 TMP_DIR=""
 
 UNINSTALL=false
@@ -72,6 +78,7 @@ usage() {
   TEAMNODE_SYNC_SECRET、ARGO_AUTH、ARGO_DOMAIN、UUID
 
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、rc.local、cron、none。
+auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
 USAGE
 }
 
@@ -142,15 +149,24 @@ prepare_user_switch() {
   elif has_command su; then
     SU_BIN="$(command -v su)"
   else
-    die "未找到 runuser 或 su，无法以独立用户运行节点"
+    if [[ "${EUID}" -eq 0 ]]; then
+      RUN_AS_ROOT=true
+      warn "未找到 runuser 或 su；PM2/Node 将由 root 运行"
+    else
+      die "未找到 runuser 或 su，无法运行节点"
+    fi
   fi
 }
 
 run_as_service_user() {
   if [[ -n "${RUNUSER_BIN}" ]]; then
     "${RUNUSER_BIN}" -u "${SERVICE_USER}" -- "$@"
-  else
+  elif [[ -n "${SU_BIN}" ]]; then
     "${SU_BIN}" -s "${BASH_BIN}" -c 'exec "$@"' "${SERVICE_USER}" -- "$@"
+  elif [[ "${RUN_AS_ROOT}" == true && "${EUID}" -eq 0 ]]; then
+    "$@"
+  else
+    die "没有可用的 runuser、su 或 root 权限"
   fi
 }
 
@@ -180,8 +196,6 @@ check_dependencies() {
   has_command npm || die "未找到 npm"
   has_command sha256sum || die "未找到 sha256sum"
   has_command unzip || die "未找到 unzip"
-  has_command nohup || die "未找到 nohup，无法在无 init 系统时保持后台运行"
-  can_run_as_service_user || die "未找到 runuser 或 su"
   prepare_user_switch
 
   local node_major
@@ -231,7 +245,7 @@ detect_service_backend() {
       has_command crontab && (has_command cron || has_command crond) && has_command runuser && has_command nohup || die "未找到 crontab、cron/crond、runuser 或 nohup"
       ;;
     none)
-      warn "系统没有可用的开机自启机制，将只启动后台守护进程；重启后需要重新执行安装命令"
+      warn "系统没有可用的开机自启机制，将使用 PM2 保持节点运行；重启后仍需要 init/cron 才能自动启动"
       ;;
   esac
 
@@ -612,6 +626,72 @@ stop_background_runner() {
   fi
 }
 
+prepare_pm2_paths() {
+  PM2_DIR="${APP_DIR}/pm2"
+  PM2_HOME_DIR="${APP_DIR}/pm2-home"
+  PM2_BIN="${PM2_DIR}/node_modules/.bin/pm2"
+}
+
+validate_pm2_version() {
+  local version="${PM2_VERSION#v}"
+  [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "PM2_VERSION 必须是三段版本号，例如 5.4.3"
+  PM2_VERSION="${version}"
+}
+
+stop_pm2_service() {
+  prepare_pm2_paths
+  if [[ ! -x "${PM2_BIN}" ]]; then
+    return 0
+  fi
+
+  run_as_service_user env \
+    HOME="${APP_DIR}/home" \
+    PM2_HOME="${PM2_HOME_DIR}" \
+    "${PM2_BIN}" delete "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  run_as_service_user env \
+    HOME="${APP_DIR}/home" \
+    PM2_HOME="${PM2_HOME_DIR}" \
+    "${PM2_BIN}" kill >/dev/null 2>&1 || true
+}
+
+start_pm2_service() {
+  validate_pm2_version
+  prepare_pm2_paths
+  install -d -m 0700 "${PM2_DIR}" "${PM2_HOME_DIR}"
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${PM2_DIR}" "${PM2_HOME_DIR}"
+
+  log "未检测到可用 init/cron，安装 PM2 ${PM2_VERSION} 作为最后的进程守护"
+  run_as_service_user env \
+    HOME="${APP_DIR}/home" \
+    PM2_HOME="${PM2_HOME_DIR}" \
+    NPM_CONFIG_CACHE="${APP_DIR}/npm-cache" \
+    "${NPM_BIN}" --prefix "${PM2_DIR}" install "pm2@${PM2_VERSION}" \
+      --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false
+
+  [[ -x "${PM2_BIN}" ]] || die "PM2 安装完成但未找到可执行文件：${PM2_BIN}"
+
+  set -a
+  . "${ENV_FILE}"
+  set +a
+  run_as_service_user env \
+    HOME="${APP_DIR}/home" \
+    PM2_HOME="${PM2_HOME_DIR}" \
+    "${PM2_BIN}" start "${APP_DIR}/app/index.js" \
+      --name "${SERVICE_NAME}" \
+      --cwd "${APP_DIR}/app" \
+      --instances 1 \
+      --restart-delay 10000 \
+      --time \
+      --update-env
+  run_as_service_user env \
+    HOME="${APP_DIR}/home" \
+    PM2_HOME="${PM2_HOME_DIR}" \
+    "${PM2_BIN}" save --force
+
+  log "PM2 已启动单实例 Node 服务；ARGO 网关端口保持 ${ARGO_PORT}，HTTP 端口保持 ${SERVER_PORT}"
+  log "当前无可靠开机自启机制，重启后仍需通过 init/cron 或手动启动 PM2"
+}
+
 write_rc_local_service() {
   local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
   local line="${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} >/dev/null 2>&1 & ${marker}"
@@ -643,6 +723,9 @@ write_cron_service() {
 }
 
 start_service() {
+  stop_background_runner
+  stop_pm2_service
+
   case "${SERVICE_BACKEND}" in
     systemd)
       SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -674,8 +757,7 @@ start_service() {
       start_background_runner
       ;;
     none)
-      start_background_runner
-      log "未启用开机自启，但节点已在后台运行；PID 文件：${PID_FILE}"
+      start_pm2_service
       ;;
   esac
 }
@@ -683,6 +765,7 @@ start_service() {
 uninstall() {
   require_root
   validate_app_dir
+  prepare_user_switch
 
   if has_command systemctl; then
     systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
@@ -703,6 +786,7 @@ uninstall() {
   fi
 
   stop_background_runner
+  stop_pm2_service
 
   if has_command crontab; then
     local current_cron
@@ -759,6 +843,7 @@ main() {
   ENV_FILE="${APP_DIR}/.env"
   RUNNER_SCRIPT="${APP_DIR}/run.sh"
   PID_FILE="${APP_DIR}/service.pid"
+  prepare_pm2_paths
   detect_service_backend
 
   if is_true "${DRY_RUN}"; then
@@ -794,7 +879,8 @@ main() {
   case "${SERVICE_BACKEND}" in
     systemd) log "查看日志：journalctl -u ${SERVICE_NAME}.service -f" ;;
     openrc|sysv) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
-    rc.local|cron|none) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
+    rc.local|cron) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
+    none) log "查看 PM2：${PM2_BIN} status；查看日志：${PM2_BIN} logs ${SERVICE_NAME}" ;;
   esac
   log "TeamNode：${TEAMNODE_SYNC_BASE_URL}"
 }

@@ -53,6 +53,8 @@ export SERVICE_MODE=auto       # auto、systemd、openrc、sysv、rc.local、cro
 bash /tmp/install-lemon.sh
 ```
 
+当前版本在 `SERVICE_MODE=auto` 检测不到 init/cron 时，会自动安装固定版本 PM2（默认 `5.4.3`）并以单实例运行 Node；这可以保证程序退出后自动重启，但没有 init/cron 时仍不能保证机器重启后自动启动。可以通过 `PM2_VERSION` 覆盖版本。PM2 只管理 Node 主进程，端口仍由应用负责：`ARGO_PORT=8001` 是 HTTP/WebSocket 网关，协议路径再转发到 Xray 的 `3002/3003/3004`，不会启用多实例，避免端口冲突。
+
 无 systemd 的常见系统：Alpine 通常使用 OpenRC；Debian/Ubuntu/CentOS 的完整安装通常使用 systemd。容器或精简沙盒如果没有 init/cron，只能保证当前运行，不能保证容器重启后自动启动。
 
 默认 TeamNode 参数与主项目一致：
