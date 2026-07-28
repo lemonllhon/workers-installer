@@ -1,6 +1,6 @@
-# nodejs-argo 无 Docker 安装器
+# workers-installer
 
-这个目录是一个独立的小项目，适合复制到另一个 GitHub 仓库，然后部署为 Cloudflare Worker。
+这个目录是一个独立的小项目，适合使用GitHub 仓库，部署为 Cloudflare Worker。
 
 它不会在 Worker 中运行节点，也不会把任何密钥写进 Worker 代码。Worker 只负责安全地提供 `install.sh`；真正的节点进程在目标 Linux 机器上运行，并复用主项目已有的：
 
