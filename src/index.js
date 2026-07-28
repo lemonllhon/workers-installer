@@ -342,7 +342,6 @@ async function dashboardPageResponse(request, env) {
             <div><span>来源 IP</span><strong>${htmlEscape(node.sourceIp || "-")}</strong></div>
             <div><span>地区</span><strong>${htmlEscape(node.country || node.countryName || "-")}</strong></div>
             <div><span>Provider</span><strong>${htmlEscape(node.provider || "-")}</strong></div>
-            <div><span>连接域名</span><strong>${htmlEscape(node.argoDomain || "-")}</strong></div>
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
             <div><span>系统架构</span><strong>${htmlEscape(runtime.arch)}</strong></div>
             <div><span>CPU / 内存</span><strong>${htmlEscape(runtime.resources)}</strong></div>
@@ -405,7 +404,7 @@ async function dashboardPageResponse(request, env) {
     .service-state { color: var(--green); font-size: 13px; font-weight: 650; white-space: nowrap; }
     .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .node-list { display: grid; }
-    .node-row { min-width: 0; padding: 20px 22px; border-bottom: 1px solid var(--line); }
+    .node-row { min-width: 0; padding: 14px 18px; border-bottom: 1px solid var(--line); }
     .node-row:last-child { border-bottom: 0; }
     .node-row-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
     .node-identity { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
@@ -414,13 +413,13 @@ async function dashboardPageResponse(request, env) {
     .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
     .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: right; }
     .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
-    .heartbeat-strip { display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 28px; margin-top: 18px; }
+    .heartbeat-strip { display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; }
     .pulse { display: block; min-width: 0; height: 18px; border-radius: 3px; background: #dff4e6; }
     .pulse-ok { height: 24px; background: #44d483; }
     .pulse-timeout { height: 24px; background: #e05252; }
     .pulse-empty { background: #eef0f2; }
-    .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 5px; color: var(--muted); font-size: 11px; }
-    .node-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #f0f1f2; }
+    .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 3px; color: var(--muted); font-size: 10px; }
+    .node-fields { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid #f0f1f2; }
     .node-fields div { display: grid; min-width: 0; gap: 5px; }
     .node-fields span { color: var(--muted); font-size: 11px; }
     .node-fields strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 600; }
@@ -445,7 +444,7 @@ async function dashboardPageResponse(request, env) {
       .service-row { border-right: 0; border-bottom: 1px solid var(--line); }
       .service-row:last-child { border-bottom: 0; }
       .service-state { padding-top: 1px; }
-      .node-row { padding: 18px 16px; }
+      .node-row { padding: 14px 16px; }
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .heartbeat-strip { gap: 2px; }
     }
@@ -577,7 +576,6 @@ async function dashboardPageResponse(request, env) {
             + "<div><span>来源 IP</span><strong>" + escapeHtml(node.sourceIp || "-") + "</strong></div>"
             + "<div><span>地区</span><strong>" + escapeHtml(node.country || node.countryName || "-") + "</strong></div>"
             + "<div><span>Provider</span><strong>" + escapeHtml(node.provider || "-") + "</strong></div>"
-            + "<div><span>连接域名</span><strong>" + escapeHtml(node.argoDomain || "-") + "</strong></div>"
             + "<div><span>操作系统</span><strong>" + escapeHtml(runtime.system) + "</strong></div>"
             + "<div><span>系统架构</span><strong>" + escapeHtml(runtime.arch) + "</strong></div>"
             + "<div><span>CPU / 内存</span><strong>" + escapeHtml(runtime.resources) + "</strong></div>"
