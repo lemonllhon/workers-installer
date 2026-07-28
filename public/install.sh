@@ -198,7 +198,7 @@ detect_service_backend() {
         SERVICE_BACKEND="systemd"
       elif has_command rc-service && has_command rc-update && [[ -x /sbin/openrc-run || -x /usr/sbin/openrc-run || -n "$(command -v openrc-run 2>/dev/null || true)" ]]; then
         SERVICE_BACKEND="openrc"
-      elif [[ -d /etc/init.d ]] && has_command update-rc.d && has_command runuser && has_command nohup; then
+      elif [[ -d /etc/init.d ]] && (has_command update-rc.d || has_command chkconfig) && has_command runuser && has_command nohup; then
         SERVICE_BACKEND="sysv"
       elif [[ -x /etc/rc.local ]] && has_command runuser && has_command nohup; then
         SERVICE_BACKEND="rc.local"
@@ -222,7 +222,7 @@ detect_service_backend() {
       has_command rc-service && has_command rc-update || die "未找到 OpenRC 的 rc-service/rc-update"
       ;;
     sysv)
-      [[ -d /etc/init.d ]] && has_command update-rc.d && has_command runuser && has_command nohup || die "未找到 SysV init 所需的 /etc/init.d、update-rc.d、runuser 或 nohup"
+      [[ -d /etc/init.d ]] && (has_command update-rc.d || has_command chkconfig) && has_command runuser && has_command nohup || die "未找到 SysV init 所需的 /etc/init.d、update-rc.d/chkconfig、runuser 或 nohup"
       ;;
     rc.local)
       [[ -x /etc/rc.local ]] && has_command runuser && has_command nohup || die "未找到可执行的 /etc/rc.local、runuser 或 nohup"
@@ -657,7 +657,12 @@ start_service() {
       ;;
     sysv)
       write_sysv_service
-      update-rc.d "${SERVICE_NAME}" defaults >/dev/null 2>&1 || true
+      if has_command update-rc.d; then
+        update-rc.d "${SERVICE_NAME}" defaults >/dev/null 2>&1 || true
+      elif has_command chkconfig; then
+        chkconfig --add "${SERVICE_NAME}" >/dev/null 2>&1 || true
+        chkconfig "${SERVICE_NAME}" on >/dev/null 2>&1 || true
+      fi
       "${SERVICE_FILE}" start
       ;;
     rc.local)
@@ -692,6 +697,7 @@ uninstall() {
     else
       "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1 || true
       has_command update-rc.d && update-rc.d -f "${SERVICE_NAME}" remove >/dev/null 2>&1 || true
+      has_command chkconfig && chkconfig --del "${SERVICE_NAME}" >/dev/null 2>&1 || true
     fi
     rm -f -- "/etc/init.d/${SERVICE_NAME}"
   fi
