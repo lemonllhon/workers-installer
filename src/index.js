@@ -451,6 +451,9 @@ async function dashboardPageResponse(request, env) {
     .hero-detail { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
     .section { margin-top: 30px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
+    .system-status-layout { display: grid; grid-template-columns: 145px minmax(0, 1fr); align-items: stretch; gap: 18px; }
+    .system-status-heading { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+    .section-title { display: flex; align-items: baseline; gap: 10px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
     .count { color: var(--muted); font-size: 13px; }
     .node-toolbar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
@@ -525,6 +528,7 @@ async function dashboardPageResponse(request, env) {
       .hero .eyebrow { margin-bottom: 3px; }
       .hero-detail { margin-top: 4px; }
       .section { margin-top: 26px; }
+      .system-status-layout { grid-template-columns: 1fr; gap: 14px; }
       .service-list { grid-template-columns: 1fr; }
       .service-row { align-items: flex-start; padding: 16px; }
       .service-row { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -566,11 +570,11 @@ async function dashboardPageResponse(request, env) {
     </section>
 
     <section class="section">
-      <div class="section-heading">
-        <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
-        <span id="dashboard-count" class="count">${onlineCount} 台在线${timedOutCount > 0 ? "，" + timedOutCount + " 台超时" : ""}</span>
-      </div>
-      <div class="service-list">
+      <div class="system-status-layout">
+        <div class="system-status-heading">
+          <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
+        </div>
+        <div class="service-list">
         <div class="service-row">
           <div class="service-main"><span id="heartbeat-state" class="service-state ${heartbeatStateClass}">${heartbeatState}</span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${heartbeatDescription}</span></span></div>
         </div>
@@ -580,13 +584,13 @@ async function dashboardPageResponse(request, env) {
         <div class="service-row">
           <div class="service-main"><span class="service-state operational">正常</span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
         </div>
+        </div>
       </div>
     </section>
 
     <section class="section">
       <div class="section-heading">
-        <div><p class="eyebrow">Online nodes</p><h2>在线机器</h2></div>
-        <span id="node-count" class="count">${visibleCount} 台</span>
+        <div><p class="eyebrow">Online nodes</p><div class="section-title"><h2>在线机器</h2><span id="node-count" class="count">${visibleCount} 台</span></div></div>
       </div>
       <div class="node-toolbar" role="search" aria-label="筛选在线机器">
         <label class="filter-search">
@@ -613,7 +617,6 @@ async function dashboardPageResponse(request, env) {
       const overviewIconElement = document.getElementById("overview-icon");
       const overviewLabelElement = document.getElementById("overview-label");
       const overviewDetailElement = document.getElementById("overview-detail");
-      const dashboardCountElement = document.getElementById("dashboard-count");
       const nodeCountElement = document.getElementById("node-count");
       const filterSearchElement = document.getElementById("node-filter-search");
       const filterStatusElement = document.getElementById("node-filter-status");
@@ -860,7 +863,6 @@ async function dashboardPageResponse(request, env) {
             : operational
               ? onlineNodes.length + " 台机器正在发送心跳，最近 " + ttlMinutes + " 分钟内保持在线。"
               : "等待机器发送心跳；超过 " + ttlMinutes + " 分钟未收到心跳的机器会自动移出列表。";
-          dashboardCountElement.textContent = onlineNodes.length + " 台在线" + (timedOutNodes.length > 0 ? "，" + timedOutNodes.length + " 台超时" : "");
           nodeCountElement.textContent = visibleNodes.length + " 台";
           heartbeatDescriptionElement.textContent = timedOutNodes.length > 0
             ? timedOutNodes.length + " 台机器心跳超时，恢复后会自动变绿"
