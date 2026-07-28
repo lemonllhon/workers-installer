@@ -159,6 +159,33 @@ https://你的-worker.workers.dev/
 安装器地址提供的是当前已部署到 Worker 的版本。修改本地文件后，必须先执行
 `npx wrangler deploy`，或提交到已连接的 Workers Builds 分支并等待部署完成，目标机器才会下载到新版本。
 
+### 推荐的一键安装命令
+
+新机器建议使用下面的命令。它不使用 `<(...)`，因此从 `sh`、`bash` 或其他只支持 POSIX 命令的环境执行都可以；兑换密码会在安装过程中交互式输入，不会写入命令历史或目标机器的 `.env`：
+
+```bash
+env \
+  ARGO_AUTH='你的 Tunnel Token' \
+  ARGO_DOMAIN='你的域名' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" https://install.lemon.vin/install.sh | bash'
+```
+
+通常不需要填写 `ARGO_PORT`（默认 `8001`），也不需要填写 `UUID`（新机器会自动生成）。如果是自动化、没有交互终端的环境，再额外设置 `TEAMNODE_SYNC_ENROLL_PASSWORD`：
+
+```bash
+env \
+  TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码' \
+  ARGO_AUTH='你的 Tunnel Token' \
+  ARGO_DOMAIN='你的域名' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" https://install.lemon.vin/install.sh | bash'
+```
+
+请将 `https://install.lemon.vin/install.sh` 替换为你自己的 Worker 域名。`FORCE_KILL_PORTS=true` 只建议在覆盖旧安装且确认需要清理占用端口时使用。
+
 ### 新机器首次安装
 
 先下载 Worker 动态生成的安装脚本。不要直接下载 GitHub 中的
