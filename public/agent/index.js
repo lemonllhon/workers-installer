@@ -1490,13 +1490,13 @@ async function generateLinks(argoDomain) {
         fp: "firefox"
       };
 
-      const subTxt = `
-vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}
-
-vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}
-
-trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}
-      `;
+      const protocolNodes = [
+        `vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}`,
+        `vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}`,
+        `trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}`
+      ];
+      const subTxt = `\n${protocolNodes.join("\n\n")}\n`;
+      console.log("已生成 3 种协议节点：VLESS、VMess、Trojan");
 
       const contentBase64 = Buffer.from(subTxt).toString("base64");
       console.log(contentBase64);
@@ -1626,6 +1626,8 @@ async function AddVisitTask() {
 // 主启动流程
 async function startserver() {
   try {
+    console.log(`启动配置：ARGO_DOMAIN=${ARGO_DOMAIN || "(empty)"}，ARGO_PORT=${ARGO_PORT}，SERVER_PORT=${PORT}`);
+    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，密钥${TEAMNODE_SYNC_SECRET ? "已配置" : "未配置"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();

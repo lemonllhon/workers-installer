@@ -7,7 +7,7 @@ readonly SCRIPT_NAME="nodejs-argo-no-docker-installer"
 readonly DEFAULT_APP_DIR="/opt/nodejs-argo-no-docker"
 readonly DEFAULT_SERVICE_NAME="nodejs-argo-no-docker"
 readonly DEFAULT_SOURCE_BASE_URL="__WORKER_SOURCE_BASE_URL__"
-readonly DEFAULT_INDEX_SHA256="CE590B2167C7C1FF32773BA2DE706AEAC87381541E4DD6B5A1EA173942E0409C"
+readonly DEFAULT_INDEX_SHA256="486CC365E0870B9B3AF423CA0CE09F9A27516E350BB6CAEE2AD9DF840E29AA96"
 
 readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
@@ -401,7 +401,7 @@ JSON
   install -d -m 0700 "${APP_DIR}/home" "${APP_DIR}/npm-cache"
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   log "安装固定 npm 依赖（禁止 install scripts）"
-  runuser -u "${SERVICE_USER}" -- env HOME="${APP_DIR}/home" NPM_CONFIG_CACHE="${APP_DIR}/npm-cache" \
+  run_as_service_user env HOME="${APP_DIR}/home" NPM_CONFIG_CACHE="${APP_DIR}/npm-cache" \
     "${NPM_BIN}" --prefix "${APP_DIR}/app" install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false
 }
 
