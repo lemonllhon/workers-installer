@@ -76,7 +76,8 @@ usage() {
   install.sh --service-mode auto      自动选择 systemd/OpenRC/SysV/cron
 
 所有密钥通过环境变量传入，不写入脚本：
-  TEAMNODE_SYNC_SECRET、ARGO_AUTH、ARGO_DOMAIN、UUID
+  TEAMNODE_SYNC_SECRET、ARGO_AUTH、ARGO_DOMAIN
+UUID 可选；未设置时安装器会随机生成并保存到 .env。
 
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、rc.local、cron、none。
 auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
@@ -113,7 +114,29 @@ require_config() {
   [[ -n "${TEAMNODE_SYNC_SECRET:-}" ]] || die "必须设置 TEAMNODE_SYNC_SECRET"
   [[ -n "${ARGO_DOMAIN:-}" ]] || die "必须设置 ARGO_DOMAIN"
   [[ -n "${ARGO_AUTH:-}" ]] || die "必须设置 ARGO_AUTH"
-  [[ -n "${UUID:-}" ]] || die "必须设置 UUID"
+}
+
+validate_uuid() {
+  [[ "${UUID}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式无效：${UUID}"
+}
+
+generate_uuid_if_missing() {
+  if [[ -n "${UUID:-}" ]]; then
+    validate_uuid
+    return 0
+  fi
+
+  UUID="$("${NODE_BIN}" -e '
+    const crypto = require("crypto");
+    const bytes = crypto.randomBytes(16);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = bytes.toString("hex");
+    process.stdout.write(`${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`);
+  ' 2>/dev/null)" || die "无法随机生成 UUID"
+  [[ -n "${UUID}" ]] || die "无法随机生成 UUID"
+  validate_uuid
+  log "未设置 UUID，已随机生成：${UUID}（将保存到 .env）"
 }
 
 validate_worker_placeholders() {
@@ -919,6 +942,7 @@ main() {
   check_dependencies
   NODE_BIN="$(command -v node)"
   NPM_BIN="$(command -v npm)"
+  generate_uuid_if_missing
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
   validate_local_port "SERVER_PORT" "${SERVER_PORT}"

@@ -41,7 +41,7 @@ export ARGO_DOMAIN='你的固定 Tunnel 域名'
 export ARGO_PORT='8001'
 export CFIP='你的优选域名或 IP'
 export NAME='lemon'
-export UUID='你的 UUID'
+# UUID 可选；不设置时安装器会随机生成并写入 .env
 
 bash <(curl -fsSL https://你的-worker.workers.dev/install.sh)
 ```
@@ -54,7 +54,6 @@ env \
   TEAMNODE_SYNC_SECRET='你的密钥' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  UUID='你的 UUID' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
   bash <(curl -fsSL https://install.lemon.vin/install.sh)
