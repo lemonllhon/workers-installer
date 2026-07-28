@@ -17,6 +17,7 @@ readonly DEFAULT_NEZHA_VERSION="v1.14.1"
 APP_DIR="${APP_DIR:-${DEFAULT_APP_DIR}}"
 SERVICE_NAME="${SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
 SERVICE_USER="${SERVICE_USER:-nodejs-argo}"
+SERVICE_MODE="${SERVICE_MODE:-auto}"
 SOURCE_BASE_URL="${SOURCE_BASE_URL:-${DEFAULT_SOURCE_BASE_URL}}"
 SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256:-${DEFAULT_INDEX_SHA256}}"
 
@@ -39,6 +40,18 @@ SERVER_PORT="${SERVER_PORT:-3000}"
 FILE_PATH="${FILE_PATH:-}"
 BIN_PATH="${BIN_PATH:-}"
 
+SERVICE_BACKEND=""
+NODE_BIN=""
+NPM_BIN=""
+BASH_BIN=""
+RUNUSER_BIN=""
+SU_BIN=""
+ENV_FILE=""
+SERVICE_FILE=""
+RUNNER_SCRIPT=""
+PID_FILE=""
+TMP_DIR=""
+
 UNINSTALL=false
 DRY_RUN=false
 
@@ -53,9 +66,12 @@ usage() {
   install.sh --uninstall              卸载本安装器创建的服务和目录
   install.sh --dry-run                只检查环境，不写入系统
   install.sh --app-dir /opt/example   覆盖安装目录
+  install.sh --service-mode auto      自动选择 systemd/OpenRC/SysV/cron
 
 所有密钥通过环境变量传入，不写入脚本：
   TEAMNODE_SYNC_SECRET、ARGO_AUTH、ARGO_DOMAIN、UUID
+
+SERVICE_MODE 可选：auto、systemd、openrc、sysv、rc.local、cron、none。
 USAGE
 }
 
@@ -94,28 +110,136 @@ require_config() {
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
 
-install_debian_dependencies() {
-  has_command apt-get || die "缺少依赖，且当前系统不是 Debian/Ubuntu（没有 apt-get）"
-  log "安装基础依赖：curl、ca-certificates、unzip、Node.js、npm"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq ca-certificates curl coreutils unzip util-linux nodejs npm >/dev/null
+install_os_dependencies() {
+  log "安装基础依赖：bash、curl、ca-certificates、unzip、Node.js、npm"
+  if has_command apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq bash ca-certificates curl coreutils passwd unzip util-linux nodejs npm >/dev/null
+  elif has_command apk; then
+    apk add --no-cache bash ca-certificates curl coreutils unzip util-linux nodejs npm >/dev/null
+  elif has_command dnf; then
+    dnf install -y bash ca-certificates curl coreutils unzip util-linux nodejs npm shadow-utils >/dev/null
+  elif has_command yum; then
+    yum install -y bash ca-certificates curl coreutils unzip util-linux nodejs npm shadow-utils >/dev/null
+  elif has_command zypper; then
+    zypper --non-interactive install bash ca-certificates curl coreutils unzip util-linux nodejs npm >/dev/null
+  else
+    die "缺少依赖，且未找到 apt-get、apk、dnf、yum 或 zypper"
+  fi
+}
+
+can_run_as_service_user() {
+  has_command runuser || has_command su
+}
+
+prepare_user_switch() {
+  BASH_BIN="$(command -v bash 2>/dev/null || true)"
+  [[ -n "${BASH_BIN}" ]] || die "未找到 bash"
+
+  if has_command runuser; then
+    RUNUSER_BIN="$(command -v runuser)"
+  elif has_command su; then
+    SU_BIN="$(command -v su)"
+  else
+    die "未找到 runuser 或 su，无法以独立用户运行节点"
+  fi
+}
+
+run_as_service_user() {
+  if [[ -n "${RUNUSER_BIN}" ]]; then
+    "${RUNUSER_BIN}" -u "${SERVICE_USER}" -- "$@"
+  else
+    "${SU_BIN}" -s "${BASH_BIN}" -c 'exec "$@"' "${SERVICE_USER}" -- "$@"
+  fi
+}
+
+create_service_user() {
+  if id "${SERVICE_USER}" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if has_command useradd; then
+    useradd --system --home-dir "${APP_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
+  elif has_command adduser; then
+    adduser -S -D -H -s /sbin/nologin "${SERVICE_USER}" 2>/dev/null || \
+      adduser --system --home "${APP_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
+  else
+    die "未找到 useradd 或 adduser，无法创建服务用户"
+  fi
 }
 
 check_dependencies() {
-  if ! has_command curl || ! has_command sha256sum || ! has_command unzip || ! has_command systemctl || ! has_command node || ! has_command npm; then
+  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command unzip || ! has_command nohup || ! has_command node || ! has_command npm || ! can_run_as_service_user; then
     is_true "${DRY_RUN}" && die "缺少依赖（dry-run 不会安装依赖）"
-    install_debian_dependencies
+    install_os_dependencies
   fi
 
-  has_command systemctl || die "当前系统没有 systemd，无法创建开机服务"
+  has_command bash || die "未找到 bash"
   has_command node || die "未找到 node"
   has_command npm || die "未找到 npm"
+  has_command sha256sum || die "未找到 sha256sum"
+  has_command unzip || die "未找到 unzip"
+  has_command nohup || die "未找到 nohup，无法在无 init 系统时保持后台运行"
+  can_run_as_service_user || die "未找到 runuser 或 su"
+  prepare_user_switch
 
   local node_major
   node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
   [[ "${node_major}" =~ ^[0-9]+$ ]] || die "无法读取 Node.js 版本"
   (( node_major >= 14 )) || die "Node.js 版本过低：${node_major}，需要 >= 14"
+}
+
+detect_service_backend() {
+  local requested="${SERVICE_MODE,,}"
+  case "${requested}" in
+    auto)
+      if has_command systemctl && [[ -d /run/systemd/system ]]; then
+        SERVICE_BACKEND="systemd"
+      elif has_command rc-service && has_command rc-update && [[ -x /sbin/openrc-run || -x /usr/sbin/openrc-run || -n "$(command -v openrc-run 2>/dev/null || true)" ]]; then
+        SERVICE_BACKEND="openrc"
+      elif [[ -d /etc/init.d ]] && has_command update-rc.d && has_command runuser && has_command nohup; then
+        SERVICE_BACKEND="sysv"
+      elif [[ -x /etc/rc.local ]] && has_command runuser && has_command nohup; then
+        SERVICE_BACKEND="rc.local"
+      elif has_command crontab && (has_command cron || has_command crond) && has_command runuser && has_command nohup; then
+        SERVICE_BACKEND="cron"
+      else
+        SERVICE_BACKEND="none"
+      fi
+      ;;
+    systemd|openrc|sysv|rc.local|cron|none)
+      SERVICE_BACKEND="${requested}"
+      ;;
+    *) die "SERVICE_MODE 无效：${SERVICE_MODE}（可选 auto、systemd、openrc、sysv、rc.local、cron、none）" ;;
+  esac
+
+  case "${SERVICE_BACKEND}" in
+    systemd)
+      has_command systemctl && [[ -d /run/systemd/system ]] || die "当前系统不是 systemd；请使用 SERVICE_MODE=auto 或选择其他模式"
+      ;;
+    openrc)
+      has_command rc-service && has_command rc-update || die "未找到 OpenRC 的 rc-service/rc-update"
+      ;;
+    sysv)
+      [[ -d /etc/init.d ]] && has_command update-rc.d && has_command runuser && has_command nohup || die "未找到 SysV init 所需的 /etc/init.d、update-rc.d、runuser 或 nohup"
+      ;;
+    rc.local)
+      [[ -x /etc/rc.local ]] && has_command runuser && has_command nohup || die "未找到可执行的 /etc/rc.local、runuser 或 nohup"
+      ;;
+    cron)
+      has_command crontab && (has_command cron || has_command crond) && has_command runuser && has_command nohup || die "未找到 crontab、cron/crond、runuser 或 nohup"
+      ;;
+    none)
+      warn "系统没有可用的开机自启机制，将只启动后台守护进程；重启后需要重新执行安装命令"
+      ;;
+  esac
+
+  if [[ "${SERVICE_BACKEND}" = "none" ]]; then
+    warn "未配置开机自启；安装完成后会立即后台运行，日志写入 ${FILE_PATH}/nodejs-argo.log"
+  else
+    log "启动方式：${SERVICE_BACKEND}"
+  fi
 }
 
 download_verified() {
@@ -323,6 +447,44 @@ write_env_file() {
   chown "${SERVICE_USER}:${SERVICE_USER}" "${ENV_FILE}"
 }
 
+write_runner_script() {
+  cat > "${RUNNER_SCRIPT}" <<EOF
+#!${BASH_BIN}
+set -u
+
+ENV_FILE="${ENV_FILE}"
+NODE_BIN="${NODE_BIN}"
+APP_DIR="${APP_DIR}"
+LOG_FILE="${FILE_PATH}/nodejs-argo.log"
+child_pid=""
+
+stop_runner() {
+  if [[ -n "\${child_pid}" ]] && kill -0 "\${child_pid}" >/dev/null 2>&1; then
+    kill -TERM "\${child_pid}" >/dev/null 2>&1 || true
+    wait "\${child_pid}" >/dev/null 2>&1 || true
+  fi
+  exit 143
+}
+
+trap stop_runner TERM INT
+set -a
+. "\${ENV_FILE}"
+set +a
+
+while true; do
+  "\${NODE_BIN}" "\${APP_DIR}/app/index.js" >>"\${LOG_FILE}" 2>&1 &
+  child_pid="\$!"
+  wait "\${child_pid}"
+  status="\$?"
+  child_pid=""
+  printf '[runner] node exited with code %s; restarting in 10 seconds\\n' "\${status}" >>"\${LOG_FILE}"
+  sleep 10
+done
+EOF
+  chown "${SERVICE_USER}:${SERVICE_USER}" "${RUNNER_SCRIPT}"
+  chmod 0750 "${RUNNER_SCRIPT}"
+}
+
 write_systemd_unit() {
   cat > "${SERVICE_FILE}" <<EOF
 [Unit]
@@ -343,7 +505,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=${FILE_PATH} ${APP_DIR}/home ${APP_DIR}/npm-cache
+ReadWritePaths=${FILE_PATH} ${BIN_PATH} ${APP_DIR}/home ${APP_DIR}/npm-cache
 UMask=0077
 TimeoutStopSec=15
 
@@ -353,16 +515,207 @@ EOF
   chmod 0644 "${SERVICE_FILE}"
 }
 
+write_openrc_service() {
+  SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
+  cat > "${SERVICE_FILE}" <<EOF
+#!/sbin/openrc-run
+name="nodejs-argo no-Docker node"
+description="nodejs-argo no-Docker node"
+command="${RUNNER_SCRIPT}"
+command_user="${SERVICE_USER}:${SERVICE_USER}"
+command_background=true
+pidfile="/run/${SERVICE_NAME}.pid"
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+  chmod 0755 "${SERVICE_FILE}"
+}
+
+write_sysv_service() {
+  SERVICE_FILE="/etc/init.d/${SERVICE_NAME}"
+  cat > "${SERVICE_FILE}" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          ${SERVICE_NAME}
+# Required-Start:    \$remote_fs \$network
+# Required-Stop:     \$remote_fs \$network
+# Should-Start:      \$named
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+### END INIT INFO
+
+DAEMON="${RUNNER_SCRIPT}"
+RUNUSER="${RUNUSER_BIN}"
+SERVICE_USER="${SERVICE_USER}"
+PIDFILE="/run/${SERVICE_NAME}.pid"
+
+is_running() {
+  [ -f "\${PIDFILE}" ] || return 1
+  pid="\$(cat "\${PIDFILE}" 2>/dev/null || true)"
+  [ "\${pid}" -gt 1 ] 2>/dev/null || return 1
+  kill -0 "\${pid}" 2>/dev/null
+}
+
+start() {
+  is_running && return 0
+  nohup "\${RUNUSER}" -u "\${SERVICE_USER}" -- "\${DAEMON}" >/dev/null 2>&1 &
+  echo "\$!" >"\${PIDFILE}"
+}
+
+stop() {
+  if is_running; then
+    kill "\$(cat "\${PIDFILE}")" 2>/dev/null || true
+  fi
+  rm -f "\${PIDFILE}"
+}
+
+status() {
+  if is_running; then
+    echo "${SERVICE_NAME} is running"
+    return 0
+  fi
+  echo "${SERVICE_NAME} is not running"
+  return 3
+}
+
+case "\$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) status ;;
+  *) echo "Usage: \$0 {start|stop|restart|status}"; exit 2 ;;
+esac
+EOF
+  chmod 0755 "${SERVICE_FILE}"
+}
+
+start_background_runner() {
+  if [[ -n "${RUNUSER_BIN}" ]]; then
+    nohup "${RUNUSER_BIN}" -u "${SERVICE_USER}" -- "${RUNNER_SCRIPT}" >/dev/null 2>&1 &
+  else
+    nohup "${SU_BIN}" -s "${BASH_BIN}" -c 'exec "$@"' "${SERVICE_USER}" -- "${RUNNER_SCRIPT}" >/dev/null 2>&1 &
+  fi
+  printf '%s\n' "$!" >"${PID_FILE}"
+}
+
+stop_background_runner() {
+  if [[ -f "${PID_FILE}" ]]; then
+    local pid
+    pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+    if [[ "${pid}" =~ ^[0-9]+$ ]] && (( pid > 1 )); then
+      kill "${pid}" >/dev/null 2>&1 || true
+    fi
+    rm -f -- "${PID_FILE}"
+  fi
+}
+
+write_rc_local_service() {
+  local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
+  local line="${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} >/dev/null 2>&1 & ${marker}"
+  if ! grep -Fq "${marker}" /etc/rc.local 2>/dev/null; then
+    local rc_local_tmp="${APP_DIR}.rc.local.tmp"
+    awk -v line="${line}" -v marker="${marker}" '
+      index($0, marker) { found=1 }
+      !found && $0 ~ /^[[:space:]]*exit[[:space:]]+0[[:space:]]*$/ { print line; found=1 }
+      { print }
+      END { if (!found) print line }
+    ' /etc/rc.local >"${rc_local_tmp}"
+    install -m 0755 "${rc_local_tmp}" /etc/rc.local
+    rm -f -- "${rc_local_tmp}"
+  fi
+  chmod 0755 /etc/rc.local
+}
+
+write_cron_service() {
+  local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
+  local line="@reboot ${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} ${marker}"
+  local current_cron
+  current_cron="$(crontab -l 2>/dev/null || true)"
+  if [[ "${current_cron}" != *"${marker}"* ]]; then
+    {
+      [[ -n "${current_cron}" ]] && printf '%s\n' "${current_cron}"
+      printf '%s\n' "${line}"
+    } | crontab -
+  fi
+}
+
+start_service() {
+  case "${SERVICE_BACKEND}" in
+    systemd)
+      SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+      write_systemd_unit
+      systemctl daemon-reload
+      systemctl enable --now "${SERVICE_NAME}.service"
+      ;;
+    openrc)
+      write_openrc_service
+      rc-update add "${SERVICE_NAME}" default >/dev/null 2>&1 || true
+      rc-service "${SERVICE_NAME}" start
+      ;;
+    sysv)
+      write_sysv_service
+      update-rc.d "${SERVICE_NAME}" defaults >/dev/null 2>&1 || true
+      "${SERVICE_FILE}" start
+      ;;
+    rc.local)
+      write_rc_local_service
+      start_background_runner
+      ;;
+    cron)
+      write_cron_service
+      start_background_runner
+      ;;
+    none)
+      start_background_runner
+      log "未启用开机自启，但节点已在后台运行；PID 文件：${PID_FILE}"
+      ;;
+  esac
+}
+
 uninstall() {
   require_root
   validate_app_dir
+
   if has_command systemctl; then
     systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
   fi
   rm -f -- "/etc/systemd/system/${SERVICE_NAME}.service"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ -x "/etc/init.d/${SERVICE_NAME}" ]]; then
+    if has_command rc-service; then
+      rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
+      has_command rc-update && rc-update del "${SERVICE_NAME}" default >/dev/null 2>&1 || true
+    else
+      "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1 || true
+      has_command update-rc.d && update-rc.d -f "${SERVICE_NAME}" remove >/dev/null 2>&1 || true
+    fi
+    rm -f -- "/etc/init.d/${SERVICE_NAME}"
+  fi
+
+  stop_background_runner
+
+  if has_command crontab; then
+    local current_cron
+    local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
+    current_cron="$(crontab -l 2>/dev/null || true)"
+    if [[ "${current_cron}" == *"${marker}"* ]]; then
+      printf '%s\n' "${current_cron}" | grep -vF -- "${marker}" | crontab - || true
+    fi
+  fi
+
+  if [[ -f /etc/rc.local ]]; then
+    local rc_local_tmp="${APP_DIR}.rc.local.tmp"
+    grep -vF -- "# nodejs-argo-no-docker: ${SERVICE_NAME}" /etc/rc.local >"${rc_local_tmp}" || true
+    install -m 0755 "${rc_local_tmp}" /etc/rc.local
+    rm -f -- "${rc_local_tmp}"
+  fi
+
   rm -rf -- "${APP_DIR}"
-  log "已卸载：${APP_DIR} 和 ${SERVICE_NAME}.service"
+  log "已卸载：${APP_DIR} 和 ${SERVICE_NAME} 的启动配置"
 }
 
 parse_args() {
@@ -372,6 +725,7 @@ parse_args() {
       --dry-run) DRY_RUN=true ;;
       --app-dir) [[ $# -ge 2 ]] || die "--app-dir 缺少值"; APP_DIR="$2"; shift ;;
       --service-name) [[ $# -ge 2 ]] || die "--service-name 缺少值"; SERVICE_NAME="$2"; shift ;;
+      --service-mode) [[ $# -ge 2 ]] || die "--service-mode 缺少值"; SERVICE_MODE="$2"; shift ;;
       --source-base-url) [[ $# -ge 2 ]] || die "--source-base-url 缺少值"; SOURCE_BASE_URL="$2"; shift ;;
       --help|-h) usage; exit 0 ;;
       *) die "未知参数：$1（使用 --help 查看用法）" ;;
@@ -391,25 +745,26 @@ main() {
   require_root
   require_config
   check_dependencies
-  if is_true "${DRY_RUN}"; then
-    log "dry-run 检查通过：Node.js $(node --version)"
-    return 0
-  fi
-
   NODE_BIN="$(command -v node)"
   NPM_BIN="$(command -v npm)"
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
   validate_runtime_paths
   ENV_FILE="${APP_DIR}/.env"
-  SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+  RUNNER_SCRIPT="${APP_DIR}/run.sh"
+  PID_FILE="${APP_DIR}/service.pid"
+  detect_service_backend
+
+  if is_true "${DRY_RUN}"; then
+    log "dry-run 检查通过：Node.js $(node --version)，启动方式：${SERVICE_BACKEND}"
+    return 0
+  fi
+
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf -- "${TMP_DIR}"' EXIT
 
   install -d -m 0750 "${APP_DIR}" "${APP_DIR}/app" "${BIN_PATH}" "${FILE_PATH}"
-  if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
-    useradd --system --home-dir "${APP_DIR}" --shell /usr/sbin/nologin "${SERVICE_USER}"
-  fi
+  create_service_user
 
   local machine_arch
   case "$(uname -m)" in
@@ -426,13 +781,15 @@ main() {
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"
   chmod 0600 "${ENV_FILE}"
-  write_systemd_unit
-  systemctl daemon-reload
-  systemctl enable --now "${SERVICE_NAME}.service"
+  write_runner_script
+  start_service
 
   log "安装完成"
-  log "服务：${SERVICE_NAME}.service"
-  log "查看日志：journalctl -u ${SERVICE_NAME}.service -f"
+  case "${SERVICE_BACKEND}" in
+    systemd) log "查看日志：journalctl -u ${SERVICE_NAME}.service -f" ;;
+    openrc|sysv) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
+    rc.local|cron|none) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
+  esac
   log "TeamNode：${TEAMNODE_SYNC_BASE_URL}"
 }
 

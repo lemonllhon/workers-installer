@@ -44,7 +44,16 @@ export UUID='你的 UUID'
 bash <(curl -fsSL https://你的-worker.workers.dev/install.sh)
 ```
 
-默认会安装到 `/opt/nodejs-argo-no-docker`，创建 `nodejs-argo-no-docker.service`，并设置开机启动。
+默认会安装到 `/opt/nodejs-argo-no-docker`，并按系统检测结果创建对应的开机启动配置。
+
+安装器会自动选择启动方式：systemd → OpenRC → SysV/init.d → cron/crond `@reboot`。如果系统完全没有可用的 init 或 cron，仍会使用后台守护脚本立即运行节点，但重启后需要重新执行安装命令。也可以手动指定：
+
+```bash
+export SERVICE_MODE=auto       # auto、systemd、openrc、sysv、rc.local、cron、none
+bash /tmp/install-lemon.sh
+```
+
+无 systemd 的常见系统：Alpine 通常使用 OpenRC；Debian/Ubuntu/CentOS 的完整安装通常使用 systemd。容器或精简沙盒如果没有 init/cron，只能保证当前运行，不能保证容器重启后自动启动。
 
 默认 TeamNode 参数与主项目一致：
 
