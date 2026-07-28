@@ -285,10 +285,9 @@ function runtimeSummary(node) {
 
 function heartbeatSegments(node) {
   const history = heartbeatHistoryValues(node);
-  const emptyCount = Math.max(0, HEARTBEAT_HISTORY_LIMIT - history.length);
   const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
   return Array.from({ length: HEARTBEAT_HISTORY_LIMIT }, (_, index) => {
-    const timestamp = history[index - emptyCount];
+    const timestamp = history[index];
     if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
     return `<span class="pulse ${pulseClass}" title="${htmlEscape(dashboardTime(timestamp))}" aria-label="心跳 ${htmlEscape(dashboardTime(timestamp))}"></span>`;
   }).join("");
@@ -320,10 +319,12 @@ async function dashboardPageResponse(request, env) {
       ? String(timedOutCount) + " 台机器心跳超时，恢复后会自动变绿"
       : onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
     const heartbeatState = timedOutCount > 0 ? "有超时" : onlineCount > 0 ? "正常" : "等待中";
+    const heartbeatStateClass = heartbeatState === "正常" ? "operational" : heartbeatState === "等待中" ? "waiting" : "attention";
     const nodeDescription = timedOutCount > 0
       ? String(timedOutCount) + " 台节点暂时不可用，仍保留 5 分钟"
       : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
     const nodeState = timedOutCount > 0 ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
+    const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
     const rows = nodes.length > 0
       ? nodes.map((node) => {
         const runtime = runtimeSummary(node);
@@ -336,8 +337,8 @@ async function dashboardPageResponse(request, env) {
             </div>
             <div class="node-last-seen">最后心跳<br><strong>${htmlEscape(dashboardTime(node.lastSeen || node.lastEventAt))}</strong></div>
           </div>
-          <div class="heartbeat-strip" aria-label="最近心跳记录">${heartbeatSegments(node)}</div>
-          <div class="heartbeat-scale"><span>最近 ${ttlMinutes} 分钟</span><span>现在</span></div>
+          <div class="heartbeat-strip${node.online ? " heartbeat-active" : ""}" aria-label="最近心跳记录">${heartbeatSegments(node)}</div>
+          <div class="heartbeat-scale"><span>现在</span><span>${ttlMinutes} 分钟前</span></div>
           <div class="node-fields">
             <div><span>来源 IP</span><strong>${htmlEscape(node.sourceIp || "-")}</strong></div>
             <div><span>地区</span><strong>${htmlEscape(node.country || node.countryName || "-")}</strong></div>
@@ -380,8 +381,7 @@ async function dashboardPageResponse(request, env) {
     .brand-name { font-size: 18px; font-weight: 700; letter-spacing: -.02em; }
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
-    .live-dot, .service-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .service-dot.attention { background: #d18b00; box-shadow: 0 0 0 4px #d18b001c; }
+    .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
     .hero { display: flex; align-items: center; gap: 13px; padding: 11px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
     .hero > div:last-child { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
@@ -394,14 +394,26 @@ async function dashboardPageResponse(request, env) {
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
     .count { color: var(--muted); font-size: 13px; }
+    .node-toolbar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+    .filter-search { display: flex; align-items: center; flex: 1 1 320px; gap: 8px; min-width: 0; padding: 9px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
+    .filter-search span { font-size: 16px; line-height: 1; }
+    .filter-search input, .node-toolbar select { min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
+    .filter-search input { width: 100%; }
+    .node-toolbar select { flex: 0 0 110px; padding: 9px 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+    .filter-clear { padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
+    .filter-clear:hover { color: var(--ink); border-color: #c5cad1; }
+    .filter-result { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .service-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; min-width: 0; padding: 18px; border-right: 1px solid var(--line); }
     .service-row:last-child { border-right: 0; }
-    .service-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .service-main { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
     .service-copy { min-width: 0; }
     .service-name { display: block; font-size: 14px; font-weight: 650; }
     .service-description { display: block; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
-    .service-state { color: var(--green); font-size: 13px; font-weight: 650; white-space: nowrap; }
+    .service-state { flex: 0 0 auto; min-width: 42px; padding-top: 1px; color: var(--muted); font-size: 13px; font-weight: 700; white-space: nowrap; }
+    .service-state.operational { color: var(--green); }
+    .service-state.attention { color: var(--amber); }
+    .service-state.waiting { color: var(--muted); }
     .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .node-list { display: grid; }
     .node-row { min-width: 0; padding: 14px 18px; border-bottom: 1px solid var(--line); }
@@ -413,11 +425,13 @@ async function dashboardPageResponse(request, env) {
     .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
     .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: right; }
     .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
-    .heartbeat-strip { display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; }
-    .pulse { display: block; min-width: 0; height: 18px; border-radius: 3px; background: #dff4e6; }
+    .heartbeat-strip { position: relative; display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; overflow: hidden; isolation: isolate; }
+    .heartbeat-strip.heartbeat-active::after { position: absolute; z-index: 2; top: -5px; bottom: -5px; left: -24%; width: 22%; content: ""; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(239, 255, 246, .14) 28%, rgba(255, 255, 255, .78) 50%, rgba(239, 255, 246, .14) 72%, transparent); filter: blur(2px); animation: heartbeat-charge 3.8s linear infinite; }
+    .pulse { position: relative; z-index: 1; display: block; min-width: 0; height: 18px; border-radius: 3px; background: #dff4e6; }
     .pulse-ok { height: 24px; background: #44d483; }
     .pulse-timeout { height: 24px; background: #e05252; }
     .pulse-empty { background: #eef0f2; }
+    @keyframes heartbeat-charge { 0% { opacity: 0; transform: translateX(0); } 12% { opacity: .45; } 82% { opacity: .45; } 100% { opacity: 0; transform: translateX(565%); } }
     .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 3px; color: var(--muted); font-size: 10px; }
     .node-fields { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid #f0f1f2; }
     .node-fields div { display: grid; min-width: 0; gap: 5px; }
@@ -447,6 +461,13 @@ async function dashboardPageResponse(request, env) {
       .node-row { padding: 14px 16px; }
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .heartbeat-strip { gap: 2px; }
+      .node-toolbar { align-items: stretch; flex-wrap: wrap; }
+      .filter-search { flex-basis: 100%; }
+      .node-toolbar select { flex: 1 1 0; }
+      .filter-result { align-self: center; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .heartbeat-strip.heartbeat-active::after { animation: none; opacity: 0; }
     }
   </style>
 </head>
@@ -476,16 +497,13 @@ async function dashboardPageResponse(request, env) {
       </div>
       <div class="service-list">
         <div class="service-row">
-          <div class="service-main"><span id="heartbeat-dot" class="service-dot ${timedOutCount > 0 ? "attention" : isOperational ? "operational" : "attention"}"></span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${heartbeatDescription}</span></span></div>
-          <span id="heartbeat-state" class="service-state">${heartbeatState}</span>
+          <div class="service-main"><span id="heartbeat-state" class="service-state ${heartbeatStateClass}">${heartbeatState}</span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${heartbeatDescription}</span></span></div>
         </div>
         <div class="service-row">
-          <div class="service-main"><span id="node-dot" class="service-dot ${timedOutCount > 0 ? "attention" : isOperational ? "operational" : "attention"}"></span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
-          <span id="node-state" class="service-state">${nodeState}</span>
+          <div class="service-main"><span id="node-state" class="service-state ${nodeStateClass}">${nodeState}</span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
         </div>
         <div class="service-row">
-          <div class="service-main"><span class="service-dot"></span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
-          <span class="service-state">正常</span>
+          <div class="service-main"><span class="service-state operational">正常</span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
         </div>
       </div>
     </section>
@@ -494,6 +512,19 @@ async function dashboardPageResponse(request, env) {
       <div class="section-heading">
         <div><p class="eyebrow">Online nodes</p><h2>在线机器</h2></div>
         <span id="node-count" class="count">${visibleCount} 台</span>
+      </div>
+      <div class="node-toolbar" role="search" aria-label="筛选在线机器">
+        <label class="filter-search">
+          <span aria-hidden="true">⌕</span>
+          <input id="node-filter-search" type="search" placeholder="搜索名称、IP、域名、系统或架构" autocomplete="off">
+        </label>
+        <select id="node-filter-status" aria-label="状态筛选">
+          <option value="all">全部状态</option>
+          <option value="online">在线</option>
+          <option value="timedOut">超时</option>
+        </select>
+        <button id="node-filter-clear" class="filter-clear" type="button" hidden>清除</button>
+        <span id="node-filter-result" class="filter-result"></span>
       </div>
       <div class="node-card">
         <div id="node-rows" class="node-list">${rows}</div>
@@ -509,15 +540,18 @@ async function dashboardPageResponse(request, env) {
       const overviewDetailElement = document.getElementById("overview-detail");
       const dashboardCountElement = document.getElementById("dashboard-count");
       const nodeCountElement = document.getElementById("node-count");
+      const filterSearchElement = document.getElementById("node-filter-search");
+      const filterStatusElement = document.getElementById("node-filter-status");
+      const filterClearElement = document.getElementById("node-filter-clear");
+      const filterResultElement = document.getElementById("node-filter-result");
       const heartbeatDescriptionElement = document.getElementById("heartbeat-description");
       const heartbeatStateElement = document.getElementById("heartbeat-state");
-      const heartbeatDotElement = document.getElementById("heartbeat-dot");
       const nodeDescriptionElement = document.getElementById("node-description");
       const nodeStateElement = document.getElementById("node-state");
-      const nodeDotElement = document.getElementById("node-dot");
       const lastUpdatedElement = document.getElementById("last-updated");
       const statusElement = document.getElementById("dashboard-status");
       let refreshing = false;
+      let currentNodes = [];
 
       function escapeHtml(value) {
         const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -535,10 +569,9 @@ async function dashboardPageResponse(request, env) {
           .map((value) => Number(value))
           .filter((value) => Number.isFinite(value) && value > 0)
           .slice(-72);
-        const emptyCount = Math.max(0, 72 - history.length);
         const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
         return Array.from({ length: 72 }, (_, index) => {
-          const timestamp = history[index - emptyCount];
+          const timestamp = history[index];
           if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
           const formatted = escapeHtml(formatTime(timestamp));
           return '<span class="pulse ' + pulseClass + '" title="心跳 ' + formatted + '" aria-label="心跳 ' + formatted + '"></span>';
@@ -553,6 +586,42 @@ async function dashboardPageResponse(request, env) {
           Number.isFinite(Number(info.memoryMb)) ? info.memoryMb + " MB" : ""
         ].filter(Boolean).join(" / ") || "-";
         return { system, arch: info.arch || "-", resources };
+      }
+
+      function nodeSearchText(node) {
+        const info = node?.runtimeInfo || {};
+        return [
+          node?.label,
+          node?.sourceIp,
+          node?.argoDomain,
+          node?.country,
+          node?.countryName,
+          node?.provider,
+          info.platform,
+          info.arch,
+          info.osType,
+          info.osRelease
+        ].filter(Boolean).join(" ").toLowerCase();
+      }
+
+      function filteredNodes() {
+        const query = filterSearchElement.value.trim().toLowerCase();
+        const status = filterStatusElement.value;
+        return currentNodes.filter((node) => {
+          if (status === "online" && !node.online) return false;
+          if (status === "timedOut" && !node.timedOut) return false;
+          return !query || nodeSearchText(node).includes(query);
+        });
+      }
+
+      function renderFilteredNodes() {
+        const nodes = filteredNodes();
+        const hasFilter = Boolean(filterSearchElement.value.trim()) || filterStatusElement.value !== "all";
+        rowsElement.innerHTML = renderRows(nodes);
+        filterClearElement.hidden = !hasFilter;
+        filterResultElement.textContent = hasFilter
+          ? "显示 " + nodes.length + " / " + currentNodes.length + " 台"
+          : currentNodes.length + " 台";
       }
 
       function renderRows(nodes) {
@@ -570,8 +639,8 @@ async function dashboardPageResponse(request, env) {
             + "<span class=\"badge " + statusClass + "\">" + status + "</span>"
             + "<div class=\"node-title\"><strong>" + escapeHtml(node.label || "未命名节点") + "</strong><span>" + escapeHtml(node.argoDomain || "-") + "</span></div>"
             + "</div><div class=\"node-last-seen\">最后心跳<br><strong>" + heartbeatTime + "</strong></div></div>"
-            + "<div class=\"heartbeat-strip\" aria-label=\"最近心跳记录\">" + renderHeartbeatSegments(node) + "</div>"
-            + "<div class=\"heartbeat-scale\"><span>最近 " + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + " 分钟</span><span>现在</span></div>"
+            + "<div class=\"heartbeat-strip" + (node.online ? " heartbeat-active" : "") + "\" aria-label=\"最近心跳记录\">" + renderHeartbeatSegments(node) + "</div>"
+            + "<div class=\"heartbeat-scale\"><span>现在</span><span>" + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + " 分钟前</span></div>"
             + "<div class=\"node-fields\">"
             + "<div><span>来源 IP</span><strong>" + escapeHtml(node.sourceIp || "-") + "</strong></div>"
             + "<div><span>地区</span><strong>" + escapeHtml(node.country || node.countryName || "-") + "</strong></div>"
@@ -603,7 +672,8 @@ async function dashboardPageResponse(request, env) {
           const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
           const operational = onlineNodes.length > 0 && timedOutNodes.length === 0;
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
-          rowsElement.innerHTML = renderRows(visibleNodes);
+          currentNodes = visibleNodes;
+          renderFilteredNodes();
           overviewIconElement.className = "hero-icon " + (operational ? "operational" : "attention");
           overviewIconElement.textContent = operational ? "✓" : "!";
           overviewLabelElement.textContent = timedOutNodes.length > 0
@@ -620,12 +690,12 @@ async function dashboardPageResponse(request, env) {
             ? timedOutNodes.length + " 台机器心跳超时，恢复后会自动变绿"
             : onlineNodes.length > 0 ? onlineNodes.length + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
           heartbeatStateElement.textContent = timedOutNodes.length > 0 ? "有超时" : onlineNodes.length > 0 ? "正常" : "等待中";
-          heartbeatDotElement.className = "service-dot " + (operational ? "operational" : "attention");
+          heartbeatStateElement.className = "service-state " + (timedOutNodes.length > 0 ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
           nodeDescriptionElement.textContent = timedOutNodes.length > 0
             ? timedOutNodes.length + " 台节点暂时不可用，仍保留 5 分钟"
             : onlineNodes.length > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
           nodeStateElement.textContent = timedOutNodes.length > 0 ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
-          nodeDotElement.className = "service-dot " + (operational ? "operational" : "attention");
+          nodeStateElement.className = "service-state " + (timedOutNodes.length > 0 ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
           lastUpdatedElement.textContent = "刚刚更新";
           statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP，如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。";
         } catch (error) {
@@ -635,6 +705,16 @@ async function dashboardPageResponse(request, env) {
         }
       }
 
+      filterSearchElement.addEventListener("input", renderFilteredNodes);
+      filterStatusElement.addEventListener("change", renderFilteredNodes);
+      filterClearElement.addEventListener("click", () => {
+        filterSearchElement.value = "";
+        filterStatusElement.value = "all";
+        renderFilteredNodes();
+        filterSearchElement.focus();
+      });
+
+      refreshNodes();
       window.setInterval(refreshNodes, 30000);
     })();
   </script>
