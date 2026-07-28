@@ -1306,7 +1306,7 @@ function buildCloudflaredArgs() {
     return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run`;
   }
 
-  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://localhost:${ARGO_PORT}`;
+  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`;
 }
 
 // 启动镜像内置的哪吒、Xray、cloudflared
@@ -1448,7 +1448,7 @@ function argoType() {
   
   ingress:
     - hostname: ${ARGO_DOMAIN}
-      service: http://localhost:${ARGO_PORT}
+      service: http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}
       originRequest:
         noTLSVerify: true
     - service: http_status:404

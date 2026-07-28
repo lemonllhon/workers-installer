@@ -86,6 +86,14 @@ cloudflared 默认使用 Cloudflare 官方最新版本；运行时会每 24 小�
 
 如果需要升级源码、Xray 或哪吒版本，请先更新 `public/agent/index.js` 或 `public/install.sh`，再重新部署 Worker。
 
+固定 Cloudflare Tunnel 的 Public Hostname 必须指向 `http://127.0.0.1:8001`（或安装时设置的 `ARGO_PORT`）。安装器会在该端口启动内置 HTTP/WebSocket 网关，再将 `/vless-argo`、`/vmess-argo`、`/trojan-argo` 分别转发给 Xray；如果 Tunnel 仍指向旧的 Xray TCP 端口，会出现 502/400 和客户端延迟 `-1`。
+
+安装完成后可检查三种协议是否都已生成：
+
+```bash
+base64 -d /opt/nodejs-argo-no-docker/data/sub.txt | grep -E '^(vless|vmess|trojan)://'
+```
+
 ## 4. 卸载
 
 ```bash
