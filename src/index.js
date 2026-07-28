@@ -65,6 +65,21 @@ function htmlEscape(value) {
     .replaceAll("'", "&#39;");
 }
 
+function normalizeRuntimeInfo(value) {
+  if (!value || typeof value !== "object") return null;
+
+  const cpuCores = Number.parseInt(String(value.cpuCores || ""), 10);
+  const memoryMb = Number.parseInt(String(value.memoryMb || ""), 10);
+  return {
+    platform: String(value.platform || "").slice(0, 32),
+    arch: String(value.arch || "").slice(0, 32),
+    osType: String(value.osType || "").slice(0, 64),
+    osRelease: String(value.osRelease || "").slice(0, 128),
+    cpuCores: Number.isFinite(cpuCores) && cpuCores > 0 ? Math.min(cpuCores, 4096) : null,
+    memoryMb: Number.isFinite(memoryMb) && memoryMb > 0 ? Math.min(memoryMb, 16 * 1024 * 1024) : null
+  };
+}
+
 async function hmacSha256Hex(secret, value) {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -129,6 +144,7 @@ async function recordNodeEvent(request, env, payload, eventPath) {
     countryCode: String(payload?.countryCode || "").slice(0, 16),
     countryName: String(payload?.countryName || "").slice(0, 128),
     runtimeStatus: String(payload?.runtimeStatus || "").slice(0, 32),
+    runtimeInfo: normalizeRuntimeInfo(payload?.runtimeInfo),
     contentIncluded: Boolean(payload?.contentBase64),
     updatedAt: Date.now()
   };
@@ -251,6 +267,22 @@ function heartbeatHistoryValues(node) {
     .slice(-HEARTBEAT_HISTORY_LIMIT);
 }
 
+function runtimeSummary(node) {
+  const info = node?.runtimeInfo || {};
+  const system = [info.osType || info.platform, info.osRelease]
+    .filter(Boolean)
+    .join(" ") || "-";
+  const resources = [
+    Number.isFinite(Number(info.cpuCores)) ? `${info.cpuCores} 核` : "",
+    Number.isFinite(Number(info.memoryMb)) ? `${info.memoryMb} MB` : ""
+  ].filter(Boolean).join(" / ") || "-";
+  return {
+    system,
+    arch: info.arch || "-",
+    resources
+  };
+}
+
 function heartbeatSegments(node) {
   const history = heartbeatHistoryValues(node);
   const emptyCount = Math.max(0, HEARTBEAT_HISTORY_LIMIT - history.length);
@@ -293,7 +325,9 @@ async function dashboardPageResponse(request, env) {
       : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
     const nodeState = timedOutCount > 0 ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
     const rows = nodes.length > 0
-      ? nodes.map((node) => `
+      ? nodes.map((node) => {
+        const runtime = runtimeSummary(node);
+        return `
         <article class="node-row">
           <div class="node-row-header">
             <div class="node-identity">
@@ -309,8 +343,12 @@ async function dashboardPageResponse(request, env) {
             <div><span>地区</span><strong>${htmlEscape(node.country || node.countryName || "-")}</strong></div>
             <div><span>Provider</span><strong>${htmlEscape(node.provider || "-")}</strong></div>
             <div><span>连接域名</span><strong>${htmlEscape(node.argoDomain || "-")}</strong></div>
+            <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
+            <div><span>系统架构</span><strong>${htmlEscape(runtime.arch)}</strong></div>
+            <div><span>CPU / 内存</span><strong>${htmlEscape(runtime.resources)}</strong></div>
           </div>
-        </article>`).join("")
+        </article>`;
+      }).join("")
       : '<div class="empty">暂无在线机器</div>';
 
     const html = `<!doctype html>
@@ -345,12 +383,14 @@ async function dashboardPageResponse(request, env) {
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot, .service-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
     .service-dot.attention { background: #d18b00; box-shadow: 0 0 0 4px #d18b001c; }
-    .hero { display: flex; align-items: center; gap: 16px; padding: 18px 22px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-    .hero-icon { display: grid; flex: 0 0 42px; place-items: center; width: 42px; height: 42px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 24px; font-weight: 800; }
+    .hero { display: flex; align-items: center; gap: 13px; padding: 11px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+    .hero > div:last-child { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; }
+    .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
-    .eyebrow { margin: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    h1 { margin: 0; font-size: clamp(25px, 4vw, 34px); letter-spacing: -.035em; line-height: 1.15; }
-    .hero-detail { margin: 10px 0 0; color: var(--muted); font-size: 15px; line-height: 1.6; }
+    .eyebrow { margin: 0 0 2px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .hero .eyebrow { flex: 0 0 100%; }
+    h1 { margin: 0; font-size: clamp(20px, 3vw, 25px); letter-spacing: -.035em; line-height: 1.15; }
+    .hero-detail { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
     .section { margin-top: 30px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
@@ -395,7 +435,10 @@ async function dashboardPageResponse(request, env) {
       .topbar { align-items: flex-start; padding-bottom: 26px; }
       .brand-context { display: block; margin: 3px 0 0; }
       .live-meta { padding-top: 7px; }
-      .hero { padding: 16px; }
+      .hero { align-items: flex-start; padding: 12px 14px; }
+      .hero > div:last-child { display: block; }
+      .hero .eyebrow { margin-bottom: 3px; }
+      .hero-detail { margin-top: 4px; }
       .section { margin-top: 26px; }
       .service-list { grid-template-columns: 1fr; }
       .service-row { align-items: flex-start; padding: 16px; }
@@ -503,6 +546,16 @@ async function dashboardPageResponse(request, env) {
         }).join("");
       }
 
+      function runtimeSummary(node) {
+        const info = node?.runtimeInfo || {};
+        const system = [info.osType || info.platform, info.osRelease].filter(Boolean).join(" ") || "-";
+        const resources = [
+          Number.isFinite(Number(info.cpuCores)) ? info.cpuCores + " 核" : "",
+          Number.isFinite(Number(info.memoryMb)) ? info.memoryMb + " MB" : ""
+        ].filter(Boolean).join(" / ") || "-";
+        return { system, arch: info.arch || "-", resources };
+      }
+
       function renderRows(nodes) {
         if (!nodes.length) {
           return '<div class="empty">暂无在线机器</div>';
@@ -512,6 +565,7 @@ async function dashboardPageResponse(request, env) {
           const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
           const statusClass = node.online ? "online" : "offline";
           const heartbeatTime = escapeHtml(formatTime(node.lastSeen || node.lastEventAt));
+          const runtime = runtimeSummary(node);
           return "<article class=\"node-row\">"
             + "<div class=\"node-row-header\"><div class=\"node-identity\">"
             + "<span class=\"badge " + statusClass + "\">" + status + "</span>"
@@ -524,6 +578,9 @@ async function dashboardPageResponse(request, env) {
             + "<div><span>地区</span><strong>" + escapeHtml(node.country || node.countryName || "-") + "</strong></div>"
             + "<div><span>Provider</span><strong>" + escapeHtml(node.provider || "-") + "</strong></div>"
             + "<div><span>连接域名</span><strong>" + escapeHtml(node.argoDomain || "-") + "</strong></div>"
+            + "<div><span>操作系统</span><strong>" + escapeHtml(runtime.system) + "</strong></div>"
+            + "<div><span>系统架构</span><strong>" + escapeHtml(runtime.arch) + "</strong></div>"
+            + "<div><span>CPU / 内存</span><strong>" + escapeHtml(runtime.resources) + "</strong></div>"
             + "</div></article>";
         }).join("");
       }

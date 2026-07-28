@@ -131,7 +131,7 @@ https://install.lemon.vin/install.sh
 https://你的-worker.workers.dev/
 ```
 
-未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider 和最后心跳时间，不显示 UUID。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；收到下线请求会立即删除。默认超过 5 分钟没有新心跳时，节点会变成灰色、心跳条变红；继续超过 5 分钟（总计 10 分钟）仍无心跳后，才会从 Durable Object 和前端列表中删除。机器恢复心跳后会自动恢复为绿色在线状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整超时阈值，最长不会超过自动删除阈值。
+未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，不显示 UUID 或其他敏感配置。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；收到下线请求会立即删除。默认超过 5 分钟没有新心跳时，节点会变成灰色、心跳条变红；继续超过 5 分钟（总计 10 分钟）仍无心跳后，才会从 Durable Object 和前端列表中删除。机器恢复心跳后会自动恢复为绿色在线状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整超时阈值，最长不会超过自动删除阈值。
 
 如果以后设置了 `DASHBOARD_PASSWORD`，根页面和 `/api/nodes` 会启用 Basic Auth，默认用户名为 `admin`。
 

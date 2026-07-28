@@ -4,6 +4,7 @@ const http = require("http");
 const axios = require("axios");
 const crypto = require("crypto");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const net = require("net");
 const { promisify } = require("util");
@@ -393,6 +394,19 @@ function buildTeamNodeLabel(nodeName, argoDomain, meta = {}) {
   return `${prefix}-${suffix}`.slice(0, 128);
 }
 
+function getRuntimeInfo() {
+  const cpuCount = os.cpus().length;
+  const totalMemoryMb = Math.round(os.totalmem() / (1024 * 1024));
+  return {
+    platform: String(process.platform || "").slice(0, 32),
+    arch: String(process.arch || "").slice(0, 32),
+    osType: String(os.type() || "").slice(0, 64),
+    osRelease: String(os.release() || "").slice(0, 128),
+    cpuCores: Number.isFinite(cpuCount) ? cpuCount : null,
+    memoryMb: Number.isFinite(totalMemoryMb) ? totalMemoryMb : null
+  };
+}
+
 async function postTeamNodeSync(relativePath, payload, eventPrefix) {
   const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
   if (!baseUrl) return null;
@@ -432,6 +446,7 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
     countryCode: context.meta?.countryCode || null,
     countryName: context.meta?.countryName || null,
     ispName: context.meta?.ispName || null,
+    runtimeInfo: getRuntimeInfo(),
     bootId: bootInstanceId,
     metadata: {
       cfip: CFIP,
