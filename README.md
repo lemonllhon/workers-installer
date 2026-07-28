@@ -153,15 +153,28 @@ https://你的-worker.workers.dev/
 - `NAME`：节点名称前缀；
 - `UUID`：新机器不设置时自动随机生成；覆盖已有安装且不设置时，自动复用旧 `.env` 中的 UUID；显式指定时优先使用指定值；
 - `FORCE_KILL_PORTS=true`：清理旧安装时强制终止相关端口上的其他进程，谨慎使用。
+- `NODE_RUNTIME_VERSION`：仅当系统 Node.js 低于 14 时使用的项目专用 Node.js 版本，默认 `20.20.2`；不会升级或替换系统 Node.js。
+- `NODE_RUNTIME_SHA256`：仅在自定义 `NODE_RUNTIME_VERSION` 且该版本没有内置校验值时，填写对应 Node.js 官方 Linux 压缩包的 64 位 SHA256。
+
+如果目标机已有 Node.js 12，安装器不会把它升级成全局版本，也不会影响其他项目；它会在
+`/opt/nodejs-argo-no-docker/node-runtime/` 内安装并使用项目专用 Node.js 20.20.2。已有
+Node.js 14 或更高版本时，默认直接复用系统版本。
 
 以下示例使用 `install.lemon.vin`。如果你使用自己的 Worker 域名，请将命令中的地址全部替换为自己的 `/install.sh` 地址。
 
 安装器地址提供的是当前已部署到 Worker 的版本。修改本地文件后，必须先执行
 `npx wrangler deploy`，或提交到已连接的 Workers Builds 分支并等待部署完成，目标机器才会下载到新版本。
 
-### 推荐的一键安装命令
+### 快速安装：交互式或一键运行
 
-新机器建议使用下面的命令。它不使用 `<(...)`，因此从 `sh`、`bash` 或其他只支持 POSIX 命令的环境执行都可以；兑换密码会在安装过程中交互式输入，不会写入命令历史或目标机器的 `.env`：
+下面两种命令都先下载到临时文件，再由 `bash` 执行，不使用 `curl | bash` 或 `<(...)`。请把
+`https://install.lemon.vin/install.sh` 替换成你自己的 Worker 地址。
+
+通常不需要填写 `ARGO_PORT`（默认 `8001`）或 `UUID`（新机器会自动生成）。
+
+#### 方式 A：交互式安装（推荐）
+
+运行后在提示处输入 Worker 兑换密码；密码不会写入命令行参数或目标机器的 `.env`：
 
 ```bash
 env \
@@ -169,10 +182,13 @@ env \
   ARGO_DOMAIN='你的域名' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
-  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" https://install.lemon.vin/install.sh | bash'
+  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" "https://install.lemon.vin/install.sh?ts=$(date +%s)" -o /tmp/install-lemon.sh && bash /tmp/install-lemon.sh'
 ```
 
-通常不需要填写 `ARGO_PORT`（默认 `8001`），也不需要填写 `UUID`（新机器会自动生成）。如果是自动化、没有交互终端的环境，再额外设置 `TEAMNODE_SYNC_ENROLL_PASSWORD`：
+#### 方式 B：非交互式一键安装
+
+适合自动化环境或不方便输入密码的环境。将 Worker 上配置的兑换密码填入
+`TEAMNODE_SYNC_ENROLL_PASSWORD`：
 
 ```bash
 env \
@@ -181,10 +197,10 @@ env \
   ARGO_DOMAIN='你的域名' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
-  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" https://install.lemon.vin/install.sh | bash'
+  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" "https://install.lemon.vin/install.sh?ts=$(date +%s)" -o /tmp/install-lemon.sh && bash /tmp/install-lemon.sh'
 ```
 
-请将 `https://install.lemon.vin/install.sh` 替换为你自己的 Worker 域名。`FORCE_KILL_PORTS=true` 只建议在覆盖旧安装且确认需要清理占用端口时使用。
+如果是覆盖旧安装，再增加 `FORCE_KILL_PORTS='true'`；新机器不建议默认开启。真实兑换密码不要写入公开脚本、README、GitHub 或 Shell 历史。
 
 ### 新机器首次安装
 
@@ -273,12 +289,15 @@ env \
 不设置兑换密码变量，安装器会隐藏提示输入密码：
 
 ```bash
+curl -fsSL https://你的-worker.workers.dev/install.sh \
+  -o /tmp/install-lemon.sh &&
+
 env \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
-  bash -c 'curl -fsSL https://你的-worker.workers.dev/install.sh | bash'
+  bash /tmp/install-lemon.sh
 ```
 
 安装器流程：
@@ -297,13 +316,16 @@ env \
 自动化环境没有可用终端时，可以通过环境变量提供兑换密码：
 
 ```bash
+curl -fsSL https://你的-worker.workers.dev/install.sh \
+  -o /tmp/install-lemon.sh &&
+
 env \
   TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
-  bash -c 'curl -fsSL https://你的-worker.workers.dev/install.sh | bash'
+  bash /tmp/install-lemon.sh
 ```
 
 不要把真实兑换密码写入公开脚本、README、GitHub 或 Shell 历史。
@@ -357,11 +379,14 @@ wc -c /tmp/sub-check
 如果某台机器不需要 TeamNode：
 
 ```bash
+curl -fsSL https://你的-worker.workers.dev/install.sh \
+  -o /tmp/install-lemon.sh &&
+
 env \
   TEAMNODE_SYNC_ENABLED='false' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  bash -c 'curl -fsSL https://你的-worker.workers.dev/install.sh | bash'
+  bash /tmp/install-lemon.sh
 ```
 
 ## 三、端口和协议转发
@@ -465,10 +490,34 @@ FORCE_KILL_PORTS=true
 卸载：
 
 ```bash
-curl -fsSL https://你的-worker.workers.dev/install.sh | bash -s -- --uninstall
+curl -fsSL https://你的-worker.workers.dev/install.sh -o /tmp/install-lemon.sh && bash /tmp/install-lemon.sh --uninstall
 ```
 
 卸载只处理本安装器创建的目录和启动配置，不会删除系统全局 PM2。
+
+卸载后重新安装并保留原 UUID：
+
+```bash
+APP=/opt/nodejs-argo-no-docker
+UUID_OLD="$(sed -n 's/^UUID=//p' "${APP}/.env" 2>/dev/null | head -n 1)"
+
+curl -fsSL https://你的-worker.workers.dev/install.sh \
+  -o /tmp/install-lemon-uninstall.sh &&
+bash /tmp/install-lemon-uninstall.sh --uninstall &&
+
+curl -fsSL https://你的-worker.workers.dev/install.sh \
+  -o /tmp/install-lemon-install.sh &&
+env \
+  UUID="${UUID_OLD}" \
+  ARGO_AUTH='你的 Tunnel Token' \
+  ARGO_DOMAIN='你的域名' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash /tmp/install-lemon-install.sh
+```
+
+安装时会再次交互输入兑换密码；自动化环境再增加
+`TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码'`。
 
 ## 六、升级 Worker 和节点源码
 

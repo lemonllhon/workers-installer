@@ -14,6 +14,10 @@ readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
 readonly DEFAULT_XRAY_VERSION="v26.3.27"
 readonly DEFAULT_PM2_VERSION="5.4.3"
+# Keep the fallback runtime inside this installation directory.  It is only
+# used when the host's Node.js is missing or older than the application's
+# minimum, so other applications can continue using their own Node.js.
+readonly DEFAULT_NODE_RUNTIME_VERSION="20.20.2"
 
 APP_DIR="${APP_DIR:-${DEFAULT_APP_DIR}}"
 SERVICE_NAME="${SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
@@ -28,6 +32,8 @@ SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256-}"
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-${DEFAULT_CLOUDFLARED_VERSION}}"
 XRAY_VERSION="${XRAY_VERSION:-${DEFAULT_XRAY_VERSION}}"
 PM2_VERSION="${PM2_VERSION:-${DEFAULT_PM2_VERSION}}"
+NODE_RUNTIME_VERSION="${NODE_RUNTIME_VERSION:-${DEFAULT_NODE_RUNTIME_VERSION}}"
+NODE_RUNTIME_SHA256="${NODE_RUNTIME_SHA256:-}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
 FORCE_KILL_PORTS="${FORCE_KILL_PORTS:-false}"
 
@@ -51,6 +57,8 @@ BIN_PATH="${BIN_PATH:-}"
 SERVICE_BACKEND=""
 NODE_BIN=""
 NPM_BIN=""
+NODE_RUNTIME_DIR=""
+SYSTEM_NODE_MAJOR=""
 BASH_BIN=""
 RUNUSER_BIN=""
 SU_BIN=""
@@ -96,6 +104,7 @@ UUID 可选；新机器未设置时会随机生成。覆盖已有安装且未设
 
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、supervisor、rc.local、cron、none。
 auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
+如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
 USAGE
 }
 
@@ -252,19 +261,19 @@ supervisorctl_exec() {
 }
 
 install_os_dependencies() {
-  log "安装基础依赖：bash、curl、ca-certificates、unzip、Node.js、npm"
+  log "安装基础依赖：bash、curl、ca-certificates、unzip、tar、Node.js、npm"
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq bash ca-certificates curl coreutils iproute2 passwd unzip util-linux nodejs npm >/dev/null
+    apt-get install -y -qq bash ca-certificates curl coreutils iproute2 passwd tar xz-utils unzip util-linux nodejs npm >/dev/null
   elif has_command apk; then
-    apk add --no-cache bash ca-certificates curl coreutils iproute2 unzip util-linux nodejs npm >/dev/null
+    apk add --no-cache bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm >/dev/null
   elif has_command dnf; then
-    dnf install -y bash ca-certificates curl coreutils iproute unzip util-linux nodejs npm shadow-utils >/dev/null
+    dnf install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils >/dev/null
   elif has_command yum; then
-    yum install -y bash ca-certificates curl coreutils iproute unzip util-linux nodejs npm shadow-utils >/dev/null
+    yum install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils >/dev/null
   elif has_command zypper; then
-    zypper --non-interactive install bash ca-certificates curl coreutils iproute2 unzip util-linux nodejs npm >/dev/null
+    zypper --non-interactive install bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm >/dev/null
   else
     die "缺少依赖，且未找到 apt-get、apk、dnf、yum 或 zypper"
   fi
@@ -320,7 +329,7 @@ create_service_user() {
 }
 
 check_dependencies() {
-  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command ss || ! has_command unzip || ! has_command nohup || ! has_command node || ! has_command npm || ! can_run_as_service_user; then
+  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command ss || ! has_command tar || ! has_command unzip || ! has_command nohup || ! has_command node || ! has_command npm || ! can_run_as_service_user; then
     is_true "${DRY_RUN}" && die "缺少依赖（dry-run 不会安装依赖）"
     install_os_dependencies
   fi
@@ -330,13 +339,92 @@ check_dependencies() {
   has_command npm || die "未找到 npm"
   has_command sha256sum || die "未找到 sha256sum"
   has_command ss || die "未找到 ss，无法安全检测端口占用"
+  has_command tar || die "未找到 tar，无法安装项目专用 Node.js"
   has_command unzip || die "未找到 unzip"
   prepare_user_switch
 
-  local node_major
-  node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
-  [[ "${node_major}" =~ ^[0-9]+$ ]] || die "无法读取 Node.js 版本"
-  (( node_major >= 14 )) || die "Node.js 版本过低：${node_major}，需要 >= 14"
+  NODE_RUNTIME_VERSION="${NODE_RUNTIME_VERSION#v}"
+  [[ "${NODE_RUNTIME_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "NODE_RUNTIME_VERSION 必须是三段版本号，例如 20.20.2"
+
+  SYSTEM_NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+  [[ "${SYSTEM_NODE_MAJOR}" =~ ^[0-9]+$ ]] || die "无法读取 Node.js 版本"
+  if (( SYSTEM_NODE_MAJOR < 14 )); then
+    warn "检测到系统 Node.js ${SYSTEM_NODE_MAJOR}；不会升级全局 Node.js，将在本项目目录安装 Node.js ${NODE_RUNTIME_VERSION}"
+  fi
+}
+
+ensure_project_node_runtime() {
+  if (( SYSTEM_NODE_MAJOR >= 14 )); then
+    log "使用系统 Node.js $(node --version)，不修改其他项目的运行环境"
+    return 0
+  fi
+
+  local version="v${NODE_RUNTIME_VERSION}"
+  local node_arch
+  local asset
+  local archive
+  local expected_sha256
+  local npm_cli
+
+  case "$(uname -m)" in
+    x86_64|amd64) node_arch="x64" ;;
+    aarch64|arm64) node_arch="arm64" ;;
+    armv7l|armv7|armhf) node_arch="armv7l" ;;
+    ppc64le) node_arch="ppc64le" ;;
+    s390x) node_arch="s390x" ;;
+    *) die "系统 Node.js 低于 14，且不支持为该架构安装项目专用 Node.js：$(uname -m)" ;;
+  esac
+
+  asset="node-${version}-linux-${node_arch}.tar.xz"
+  archive="${TMP_DIR}/${asset}"
+
+  log "为本项目安装 Node.js ${version}（系统 Node.js ${SYSTEM_NODE_MAJOR} 保持不变）"
+  if [[ -n "${NODE_RUNTIME_SHA256}" ]]; then
+    expected_sha256="${NODE_RUNTIME_SHA256}"
+  elif [[ "${version}" = "v20.20.2" ]]; then
+    # SHA256 values from the official Node.js v20.20.2 SHASUMS256.txt.
+    case "${node_arch}" in
+      x64) expected_sha256="df770b2a6f130ed8627c9782c988fda9669fa23898329a61a871e32f965e007d" ;;
+      arm64) expected_sha256="73093db209e4e9e09dd7d15a47aeaab1b74833830df03efa5f942a1122c5fa71" ;;
+      armv7l) expected_sha256="f704ce75d9a194c30c378049b516000e49612c2f046ac83c7435eb33ec2926f0" ;;
+      ppc64le) expected_sha256="4ee91307b3b517f880cd63d3f75fc91f4afc926ad9447661b755d50060ba2816" ;;
+      s390x) expected_sha256="00590e7e1295d265fd22706e10467c03ecf170873b76c1835ff74b47b90ce6e0" ;;
+    esac
+  else
+    die "NODE_RUNTIME_VERSION=${NODE_RUNTIME_VERSION} 没有内置 SHA256；请同时设置该版本对应的 NODE_RUNTIME_SHA256"
+  fi
+  [[ "${expected_sha256}" =~ ^[0-9a-fA-F]{64}$ ]] || die "Node.js 项目专用运行时 SHA256 格式无效：${asset}"
+  download_verified \
+    "https://nodejs.org/dist/${version}/${asset}" \
+    "${archive}" "${expected_sha256}" "Node.js ${version}"
+
+  NODE_RUNTIME_DIR="${APP_DIR}/node-runtime"
+  rm -rf -- "${NODE_RUNTIME_DIR}"
+  install -d -m 0755 "${NODE_RUNTIME_DIR}"
+  tar -xJf "${archive}" --strip-components=1 -C "${NODE_RUNTIME_DIR}"
+
+  NODE_BIN="${NODE_RUNTIME_DIR}/bin/node"
+  npm_cli="${NODE_RUNTIME_DIR}/lib/node_modules/npm/bin/npm-cli.js"
+  [[ -x "${NODE_BIN}" ]] || die "项目专用 Node.js 安装后不可执行：${NODE_BIN}"
+  [[ -f "${npm_cli}" ]] || die "项目专用 npm 文件不存在：${npm_cli}"
+
+  # The bundled npm launcher uses /usr/bin/env node.  A wrapper with an
+  # absolute Node.js path prevents it from accidentally selecting Node 12.
+  NPM_BIN="${NODE_RUNTIME_DIR}/npm"
+  cat > "${NPM_BIN}" <<EOF
+#!${BASH_BIN}
+exec "${NODE_BIN}" "${npm_cli}" "\$@"
+EOF
+  chmod 0755 "${NPM_BIN}"
+  log "项目专用 Node.js 已就绪：$(${NODE_BIN} --version)；系统 Node.js 未被修改"
+}
+
+service_node_path() {
+  if [[ -n "${NODE_RUNTIME_DIR}" ]]; then
+    printf '%s:%s' "${NODE_RUNTIME_DIR}/bin" "${PATH}"
+  else
+    printf '%s' "${PATH}"
+  fi
 }
 
 detect_service_backend() {
@@ -917,10 +1005,12 @@ stop_pm2_service() {
   run_as_service_user env \
     HOME="${APP_DIR}/home" \
     PM2_HOME="${PM2_HOME_DIR}" \
+    PATH="$(service_node_path)" \
     "${PM2_BIN}" delete "${SERVICE_NAME}" >/dev/null 2>&1 || true
   run_as_service_user env \
     HOME="${APP_DIR}/home" \
     PM2_HOME="${PM2_HOME_DIR}" \
+    PATH="$(service_node_path)" \
     "${PM2_BIN}" kill >/dev/null 2>&1 || true
 }
 
@@ -935,6 +1025,7 @@ start_pm2_service() {
     HOME="${APP_DIR}/home" \
     PM2_HOME="${PM2_HOME_DIR}" \
     NPM_CONFIG_CACHE="${APP_DIR}/npm-cache" \
+    PATH="$(service_node_path)" \
     "${NPM_BIN}" --prefix "${PM2_DIR}" install "pm2@${PM2_VERSION}" \
       --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false
 
@@ -943,6 +1034,7 @@ start_pm2_service() {
   run_as_service_user env \
     HOME="${APP_DIR}/home" \
     PM2_HOME="${PM2_HOME_DIR}" \
+    PATH="$(service_node_path)" \
     "${PM2_BIN}" start "${RUNNER_SCRIPT}" \
       --name "${SERVICE_NAME}" \
       --cwd "${APP_DIR}/app" \
@@ -954,6 +1046,7 @@ start_pm2_service() {
   run_as_service_user env \
     HOME="${APP_DIR}/home" \
     PM2_HOME="${PM2_HOME_DIR}" \
+    PATH="$(service_node_path)" \
     "${PM2_BIN}" save --force
 
   log "PM2 已启动单实例运行包装器；ARGO 网关端口保持 ${ARGO_PORT}，HTTP 端口保持 ${SERVER_PORT}"
@@ -1277,7 +1370,11 @@ main() {
   detect_service_backend
 
   if is_true "${DRY_RUN}"; then
-    log "dry-run 检查通过：Node.js $(node --version)，启动方式：${SERVICE_BACKEND}"
+    if (( SYSTEM_NODE_MAJOR < 14 )); then
+      log "dry-run 检查通过：系统 Node.js $(node --version)，实际安装将使用项目专用 Node.js v${NODE_RUNTIME_VERSION}；启动方式：${SERVICE_BACKEND}"
+    else
+      log "dry-run 检查通过：Node.js $(node --version)，启动方式：${SERVICE_BACKEND}"
+    fi
     return 0
   fi
 
@@ -1291,6 +1388,7 @@ main() {
 
   install -d -m 0750 "${APP_DIR}" "${APP_DIR}/app" "${BIN_PATH}" "${FILE_PATH}"
   create_service_user
+  ensure_project_node_runtime
 
   local machine_arch
   case "$(uname -m)" in
