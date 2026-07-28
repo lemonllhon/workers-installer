@@ -428,6 +428,9 @@ async function dashboardPageResponse(request, env) {
       --green-soft: #e7f6ec;
       --amber: #9a6700;
       --amber-soft: #fff7df;
+      --accent: #1478c8;
+      --accent-soft: #eaf4ff;
+      --soft-surface: #f3f6f8;
     }
     * { box-sizing: border-box; }
     body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
@@ -446,12 +449,11 @@ async function dashboardPageResponse(request, env) {
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
     .hero-icon.waiting { color: var(--muted); background: #f0f2f4; }
     .eyebrow { margin: 0 0 2px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-    .hero .eyebrow { flex: 0 0 100%; }
     h1 { margin: 0; font-size: clamp(20px, 3vw, 25px); letter-spacing: -.035em; line-height: 1.15; }
     .hero-detail { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.4; }
     .section { margin-top: 30px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
-    .system-status-layout { display: grid; grid-template-columns: 145px minmax(0, 1fr); align-items: stretch; gap: 18px; }
+    .system-status-layout { display: grid; grid-template-columns: 145px minmax(0, 1fr); align-items: stretch; gap: 18px; padding: 12px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
     .system-status-heading { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
     .section-title { display: flex; align-items: baseline; gap: 10px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
@@ -467,6 +469,11 @@ async function dashboardPageResponse(request, env) {
     .filter-status-option[aria-pressed="true"] { background: var(--surface); box-shadow: 0 1px 3px rgba(32, 33, 36, .12); color: var(--ink); }
     .filter-status-option[data-status="online"][aria-pressed="true"] { color: var(--green); }
     .filter-status-option[data-status="timedOut"][aria-pressed="true"] { color: var(--amber); }
+    .node-view-toggle { padding: 3px; }
+    .node-view-option { display: grid; place-items: center; width: 34px; height: 30px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; }
+    .node-view-option:hover { color: var(--ink); }
+    .node-view-option[aria-pressed="true"] { background: var(--accent); box-shadow: 0 2px 7px rgba(20, 120, 200, .25); color: #fff; }
+    .node-view-option svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
     .filter-clear { padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
     .filter-clear:hover { color: var(--ink); border-color: #c5cad1; }
     .filter-result { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
@@ -483,15 +490,21 @@ async function dashboardPageResponse(request, env) {
     .service-state.waiting { color: var(--muted); }
     .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .node-list { display: grid; }
+    .node-list.node-cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 12px; background: var(--canvas); }
     .node-row { min-width: 0; padding: 14px 18px; border-bottom: 1px solid var(--line); }
     .node-row:last-child { border-bottom: 0; }
+    .node-cards .node-row { padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .node-cards .node-row:last-child { border-bottom: 1px solid var(--line); }
+    .node-cards .node-row-header { display: grid; gap: 12px; }
+    .node-cards .node-last-seen { text-align: left; }
+    .node-cards .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .node-row-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
     .node-identity { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
     .node-title { display: grid; min-width: 0; gap: 4px; }
     .node-title strong { overflow-wrap: anywhere; font-size: 15px; line-height: 1.35; }
     .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
     .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 11px; line-height: 1.45; text-align: right; }
-    .node-time-heading { display: flex; align-items: baseline; justify-content: flex-end; gap: 6px; }
+    .node-time-heading { display: grid; grid-template-columns: max-content 1fr; align-items: baseline; column-gap: 6px; width: 100%; text-align: left; }
     .node-time-pair { display: grid; width: max-content; gap: 1px; margin: 2px 0 0 auto; color: var(--ink); font-size: 11px; font-weight: 600; text-align: left; }
     .node-time-pair > span { display: grid; grid-template-columns: 32px auto 1fr; align-items: baseline; column-gap: 5px; }
     .node-time-pair b { color: var(--muted); font-size: 10px; font-weight: 700; }
@@ -500,6 +513,7 @@ async function dashboardPageResponse(request, env) {
     .node-time-shared { color: var(--muted); font-size: 10px; font-weight: 600; }
     .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
     .heartbeat-strip { position: relative; display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; overflow: hidden; isolation: isolate; }
+    .heartbeat-strip.heartbeat-short { grid-template-columns: repeat(24, minmax(2px, 1fr)); }
     .heartbeat-strip.heartbeat-active::after { position: absolute; z-index: 2; top: -5px; bottom: -5px; left: -24%; width: 22%; content: ""; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(239, 255, 246, .14) 28%, rgba(255, 255, 255, .78) 50%, rgba(239, 255, 246, .14) 72%, transparent); filter: blur(2px); animation: heartbeat-charge 3.8s linear infinite; }
     .pulse { position: relative; z-index: 1; display: block; min-width: 0; height: 18px; border-radius: 3px; background: #dff4e6; }
     .pulse-ok { height: 24px; background: #44d483; }
@@ -525,7 +539,6 @@ async function dashboardPageResponse(request, env) {
       .hero { align-items: flex-start; padding: 12px 14px; }
       .hero-copy { gap: 3px; }
       .hero-main { display: block; }
-      .hero .eyebrow { margin-bottom: 3px; }
       .hero-detail { margin-top: 4px; }
       .section { margin-top: 26px; }
       .system-status-layout { grid-template-columns: 1fr; gap: 14px; }
@@ -537,9 +550,11 @@ async function dashboardPageResponse(request, env) {
       .node-row { padding: 14px 16px; }
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .heartbeat-strip { gap: 2px; }
+      .node-list.node-cards { grid-template-columns: 1fr; padding: 10px; }
       .node-toolbar { align-items: stretch; flex-wrap: wrap; }
       .filter-search { flex-basis: 100%; }
       .filter-status { flex: 1 1 auto; }
+      .node-view-toggle { flex: 0 0 auto; }
       .filter-status-option { flex: 1 1 0; }
       .filter-result { align-self: center; }
     }
@@ -561,7 +576,6 @@ async function dashboardPageResponse(request, env) {
     <section class="hero" aria-live="polite">
       <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
       <div class="hero-copy">
-        <p class="eyebrow">当前状态</p>
         <div class="hero-main">
           <h1 id="overview-label">${overviewLabel}</h1>
           <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
@@ -602,6 +616,14 @@ async function dashboardPageResponse(request, env) {
           <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
           <button class="filter-status-option" type="button" data-status="timedOut" aria-pressed="false">超时</button>
         </div>
+        <div id="node-filter-view" class="filter-status node-view-toggle" role="group" aria-label="节点视图">
+          <button class="node-view-option" type="button" data-view="list" aria-pressed="true" aria-label="列表视图" title="列表视图">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h12M8 12h12M8 18h12"></path><path d="M4 6h.01M4 12h.01M4 18h.01"></path></svg>
+          </button>
+          <button class="node-view-option" type="button" data-view="cards" aria-pressed="false" aria-label="卡片视图" title="卡片视图">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="6" height="6" rx="1"></rect><rect x="14" y="4" width="6" height="6" rx="1"></rect><rect x="4" y="14" width="6" height="6" rx="1"></rect><rect x="14" y="14" width="6" height="6" rx="1"></rect></svg>
+          </button>
+        </div>
         <button id="node-filter-clear" class="filter-clear" type="button" hidden>清除</button>
         <span id="node-filter-result" class="filter-result"></span>
       </div>
@@ -620,6 +642,7 @@ async function dashboardPageResponse(request, env) {
       const nodeCountElement = document.getElementById("node-count");
       const filterSearchElement = document.getElementById("node-filter-search");
       const filterStatusElement = document.getElementById("node-filter-status");
+      const filterViewElement = document.getElementById("node-filter-view");
       const filterClearElement = document.getElementById("node-filter-clear");
       const filterResultElement = document.getElementById("node-filter-result");
       const heartbeatDescriptionElement = document.getElementById("heartbeat-description");
@@ -631,6 +654,7 @@ async function dashboardPageResponse(request, env) {
       let refreshing = false;
       let currentNodes = [];
       let selectedStatus = "all";
+      let selectedView = "list";
       let searchTimer = null;
 
       function escapeHtml(value) {
@@ -701,13 +725,14 @@ async function dashboardPageResponse(request, env) {
           + '</div>';
       }
 
-      function renderHeartbeatSegments(node) {
+      function renderHeartbeatSegments(node, limit = 72) {
+        const segmentLimit = Math.max(1, Math.min(72, Math.round(Number(limit) || 72)));
         const history = (Array.isArray(node?.heartbeatHistory) ? node.heartbeatHistory : [])
           .map((value) => Number(value))
           .filter((value) => Number.isFinite(value) && value > 0)
-          .slice(-72);
+          .slice(-segmentLimit);
         const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
-        return Array.from({ length: 72 }, (_, index) => {
+        return Array.from({ length: segmentLimit }, (_, index) => {
           const timestamp = history[index];
           if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
           const formatted = escapeHtml(formatTime(timestamp));
@@ -771,6 +796,13 @@ async function dashboardPageResponse(request, env) {
         });
       }
 
+      function setNodeView(view) {
+        selectedView = ["list", "cards"].includes(view) ? view : "list";
+        filterViewElement.querySelectorAll("[data-view]").forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.view === selectedView));
+        });
+      }
+
       function filteredNodes() {
         const query = filterSearchElement.value.trim().toLowerCase();
         return currentNodes.filter((node) => {
@@ -783,6 +815,7 @@ async function dashboardPageResponse(request, env) {
       function renderFilteredNodes() {
         const nodes = filteredNodes();
         const hasFilter = Boolean(filterSearchElement.value.trim()) || selectedStatus !== "all";
+        rowsElement.className = selectedView === "cards" ? "node-list node-cards" : "node-list";
         rowsElement.innerHTML = renderRows(nodes);
         filterClearElement.hidden = !hasFilter;
         filterResultElement.textContent = hasFilter
@@ -811,13 +844,15 @@ async function dashboardPageResponse(request, env) {
           const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
           const statusClass = node.online ? "online" : "offline";
           const runtime = runtimeSummary(node);
+          const heartbeatLimit = selectedView === "cards" ? 24 : 72;
+          const heartbeatWindowMinutes = Math.max(1, Math.round((Number(window.__onlineTtlMs || 600000) / 60000) * heartbeatLimit / 72));
           return '<article class="node-row">'
             + '<div class="node-row-header"><div class="node-identity">'
             + '<span class="badge ' + statusClass + '">' + status + '</span>'
             + '<div class="node-title"><strong>' + escapeHtml(node.label || "未命名节点") + '</strong><span>' + escapeHtml(node.argoDomain || "-") + '</span></div>'
             + '</div><div class="node-last-seen">' + renderNodeTimePair(node, node.lastSeen || node.lastEventAt) + '</div></div>'
-            + '<div class="heartbeat-strip' + (node.online ? " heartbeat-active" : "") + '" aria-label="最近心跳记录">' + renderHeartbeatSegments(node) + '</div>'
-            + '<div class="heartbeat-scale"><span>现在</span><span>' + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + ' 分钟前</span></div>'
+            + '<div class="heartbeat-strip' + (node.online ? " heartbeat-active" : "") + (heartbeatLimit < 72 ? " heartbeat-short" : "") + '" aria-label="最近心跳记录">' + renderHeartbeatSegments(node, heartbeatLimit) + '</div>'
+            + '<div class="heartbeat-scale"><span>现在</span><span>' + heartbeatWindowMinutes + ' 分钟前</span></div>'
             + '<div class="node-fields">'
             + '<div><span>来源 IP</span><strong>' + escapeHtml(node.sourceIp || "-") + '</strong></div>'
             + '<div><span>地区</span><strong>' + escapeHtml(node.country || node.countryName || "-") + '</strong></div>'
@@ -888,6 +923,12 @@ async function dashboardPageResponse(request, env) {
       filterStatusElement.querySelectorAll("[data-status]").forEach((button) => {
         button.addEventListener("click", () => {
           setStatusFilter(button.getAttribute("data-status"));
+          renderFilteredNodes();
+        });
+      });
+      filterViewElement.querySelectorAll("[data-view]").forEach((button) => {
+        button.addEventListener("click", () => {
+          setNodeView(button.getAttribute("data-view"));
           renderFilteredNodes();
         });
       });
