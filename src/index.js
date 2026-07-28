@@ -12,6 +12,7 @@ const DEFAULT_TEAMNODE_KEY_ID = "nodejs-argo-prod";
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_ONLINE_TTL_MS = 10 * 60 * 1000;
 const HEARTBEAT_HISTORY_LIMIT = 72;
+const TIMEZONE_COLLAPSE_THRESHOLD_MINUTES = 15;
 const NODE_REGISTRY_NAME = "nodejs-argo";
 
 function json(data, status = 200) {
@@ -295,6 +296,24 @@ function timeParts(value, timeZone) {
   };
 }
 
+function timeZoneOffsetMinutes(value, timeZone) {
+  const parts = timeParts(value, timeZone);
+  if (!parts) return null;
+  const [hour, minute, second] = parts.clock.split(":").map(Number);
+  const localAsUtc = Date.UTC(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    hour,
+    minute,
+    second
+  );
+  const timestamp = Math.trunc(Number(value) / 1000) * 1000;
+  return Number.isFinite(localAsUtc) && Number.isFinite(timestamp)
+    ? Math.round((localAsUtc - timestamp) / 60000)
+    : null;
+}
+
 function heartbeatTimeMarkup(node, value) {
   const china = timeParts(value, "Asia/Shanghai");
   const localZone = validTimeZone(node?.timezone);
@@ -319,6 +338,13 @@ function heartbeatTimeMarkup(node, value) {
     ? `${local.day} ${local.clock}`
     : sameYear ? `${local.month}-${local.day} ${local.clock}` : `${local.year}-${local.month}-${local.day} ${local.clock}`;
   const sharedMarkup = sharedPrefix ? `<span class="node-time-shared">${htmlEscape(sharedPrefix)}</span>` : "";
+  const chinaOffset = timeZoneOffsetMinutes(value, "Asia/Shanghai");
+  const localOffset = timeZoneOffsetMinutes(value, localZone);
+  const closeToChina = Number.isFinite(chinaOffset) && Number.isFinite(localOffset)
+    && Math.abs(chinaOffset - localOffset) <= TIMEZONE_COLLAPSE_THRESHOLD_MINUTES;
+  if (closeToChina) {
+    return `<div class="node-time-heading"><span>最后心跳</span>${sharedMarkup}</div><div class="node-time-pair node-time-single" title="中国时区：Asia/Shanghai；节点时区：${htmlEscape(localZone)} 与中国时间接近"><span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small>Asia/Shanghai</small></span></div>`;
+  }
   return `<div class="node-time-heading"><span>最后心跳</span>${sharedMarkup}</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；节点时区：${htmlEscape(localZone)}"><span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small>Asia/Shanghai</small></span><span><b>节点</b><strong>${htmlEscape(localText)}</strong><small>${htmlEscape(localZone)}</small></span></div>`;
 }
 
@@ -666,6 +692,7 @@ async function dashboardPageResponse(request, env) {
       let selectedStatus = "all";
       let selectedView = "list";
       let searchTimer = null;
+      const timezoneCollapseThresholdMinutes = 15;
 
       function escapeHtml(value) {
         const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -705,6 +732,24 @@ async function dashboardPageResponse(request, env) {
         }
       }
 
+      function timeZoneOffsetMinutes(value, timeZone) {
+        const parts = formatTimeParts(value, timeZone);
+        if (!parts) return null;
+        const clockParts = parts.clock.split(":").map(Number);
+        const localAsUtc = Date.UTC(
+          Number(parts.year),
+          Number(parts.month) - 1,
+          Number(parts.day),
+          clockParts[0],
+          clockParts[1],
+          clockParts[2]
+        );
+        const timestamp = Math.trunc(Number(value) / 1000) * 1000;
+        return Number.isFinite(localAsUtc) && Number.isFinite(timestamp)
+          ? Math.round((localAsUtc - timestamp) / 60000)
+          : null;
+      }
+
       function renderNodeTimePair(node, value) {
         const china = formatTimeParts(value, "Asia/Shanghai");
         const requestedZone = String(node?.timezone || "").trim();
@@ -733,6 +778,13 @@ async function dashboardPageResponse(request, env) {
           ? local.day + " " + local.clock
           : sameYear ? local.month + "-" + local.day + " " + local.clock : local.year + "-" + local.month + "-" + local.day + " " + local.clock;
         const sharedMarkup = sharedPrefix ? '<span class="node-time-shared">' + escapeHtml(sharedPrefix) + "</span>" : "";
+        const chinaOffset = timeZoneOffsetMinutes(value, "Asia/Shanghai");
+        const localOffset = timeZoneOffsetMinutes(value, localZone);
+        const closeToChina = Number.isFinite(chinaOffset) && Number.isFinite(localOffset)
+          && Math.abs(chinaOffset - localOffset) <= timezoneCollapseThresholdMinutes;
+        if (closeToChina) {
+          return '<div class="node-time-heading"><span>最后心跳</span>' + sharedMarkup + '</div><div class="node-time-pair node-time-single" title="中国时区：Asia/Shanghai；节点时区：' + escapeHtml(localZone) + ' 与中国时间接近"><span><b>中国</b><strong>' + escapeHtml(chinaText) + '</strong><small>Asia/Shanghai</small></span></div>';
+        }
         return '<div class="node-time-heading"><span>最后心跳</span>' + sharedMarkup + '</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；节点时区：' + escapeHtml(localZone) + '">'
           + '<span><b>中国</b><strong>' + escapeHtml(chinaText) + '</strong><small>Asia/Shanghai</small></span>'
           + '<span><b>节点</b><strong>' + escapeHtml(localText) + '</strong><small>' + escapeHtml(localZone) + '</small></span>'
