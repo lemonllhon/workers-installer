@@ -992,9 +992,13 @@ async function relayTeamNodeRequest(request, env, ctx) {
   }
 
   const configuredRelayToken = String(env.TEAMNODE_SYNC_RELAY_TOKEN || "").trim();
-  const expectedRelayToken = configuredRelayToken || await deriveRelayToken(syncSecret, uuid);
+  const derivedRelayToken = await deriveRelayToken(syncSecret, uuid);
   const presentedToken = request.headers.get("x-teamnode-sync-relay-token") || "";
-  if (!constantTimeEqual(presentedToken, expectedRelayToken)) {
+  // 派生令牌是当前默认方案。保留固定令牌仅用于旧版本兼容，不能让旧的
+  // TEAMNODE_SYNC_RELAY_TOKEN 配置覆盖或阻断新机器通过兑换密码获得的令牌。
+  const relayTokenValid = constantTimeEqual(presentedToken, derivedRelayToken)
+    || (configuredRelayToken && constantTimeEqual(presentedToken, configuredRelayToken));
+  if (!relayTokenValid) {
     return json({ error: "teamnode_relay_unauthorized" }, 401);
   }
 
