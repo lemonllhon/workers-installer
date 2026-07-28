@@ -9,7 +9,9 @@ const TEAMNODE_REDEEM_PATH = "/api/teamnode/redeem";
 const DASHBOARD_API_PATH = "/api/nodes";
 const DEFAULT_TEAMNODE_UPSTREAM_BASE_URL = "https://teamnode.lemon.vin";
 const DEFAULT_TEAMNODE_KEY_ID = "nodejs-argo-prod";
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_ONLINE_TTL_MS = 10 * 60 * 1000;
+const HEARTBEAT_HISTORY_LIMIT = 72;
 const NODE_REGISTRY_NAME = "nodejs-argo";
 
 function json(data, status = 200) {
@@ -95,6 +97,13 @@ function onlineTtlMs(env) {
   return Number.isFinite(configured) && configured >= 30000
     ? configured
     : DEFAULT_ONLINE_TTL_MS;
+}
+
+function heartbeatTimeoutMs(env) {
+  const configured = Number.parseInt(String(env.TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS || ""), 10);
+  return Number.isFinite(configured) && configured >= 30000
+    ? Math.min(configured, onlineTtlMs(env))
+    : Math.min(DEFAULT_HEARTBEAT_TIMEOUT_MS, onlineTtlMs(env));
 }
 
 async function recordNodeEvent(request, env, payload, eventPath) {
@@ -191,12 +200,17 @@ function dashboardAuthResponse(request, env) {
 
 function decorateNodeStatus(nodes, env) {
   const now = Date.now();
+  const timeout = heartbeatTimeoutMs(env);
   const ttl = onlineTtlMs(env);
   return nodes
     .map((node) => ({
       ...node,
       online: node.status === "online"
         && Number.isFinite(Number(node.lastSeen))
+        && now - Number(node.lastSeen) <= timeout,
+      timedOut: node.status === "online"
+        && Number.isFinite(Number(node.lastSeen))
+        && now - Number(node.lastSeen) > timeout
         && now - Number(node.lastSeen) <= ttl
     }))
     .sort((left, right) => {
@@ -214,6 +228,7 @@ async function dashboardNodesResponse(request, env) {
     const nodes = decorateNodeStatus(await listNodeEvents(env) || [], env);
     return json({
       ok: true,
+      heartbeatTimeoutMs: heartbeatTimeoutMs(env),
       onlineTtlMs: onlineTtlMs(env),
       generatedAt: Date.now(),
       nodes
@@ -229,33 +244,74 @@ function dashboardTime(value) {
   return new Date(timestamp).toISOString();
 }
 
+function heartbeatHistoryValues(node) {
+  return (Array.isArray(node?.heartbeatHistory) ? node.heartbeatHistory : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .slice(-HEARTBEAT_HISTORY_LIMIT);
+}
+
+function heartbeatSegments(node) {
+  const history = heartbeatHistoryValues(node);
+  const emptyCount = Math.max(0, HEARTBEAT_HISTORY_LIMIT - history.length);
+  const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
+  return Array.from({ length: HEARTBEAT_HISTORY_LIMIT }, (_, index) => {
+    const timestamp = history[index - emptyCount];
+    if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
+    return `<span class="pulse ${pulseClass}" title="${htmlEscape(dashboardTime(timestamp))}" aria-label="心跳 ${htmlEscape(dashboardTime(timestamp))}"></span>`;
+  }).join("");
+}
+
 async function dashboardPageResponse(request, env) {
   const authError = dashboardAuthResponse(request, env);
   if (authError) return authError;
   if (request.method !== "GET") return json({ error: "method_not_allowed" }, 405);
 
   try {
-    const nodes = decorateNodeStatus(await listNodeEvents(env) || [], env).filter((node) => node.online);
-    const onlineCount = nodes.length;
+    const nodes = decorateNodeStatus(await listNodeEvents(env) || [], env)
+      .filter((node) => node.online || node.timedOut);
+    const onlineCount = nodes.filter((node) => node.online).length;
+    const timedOutCount = nodes.filter((node) => node.timedOut).length;
+    const visibleCount = nodes.length;
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
-    const isOperational = onlineCount > 0;
-    const overviewLabel = isOperational ? "全部系统运行正常" : "暂无在线机器";
-    const overviewDetail = isOperational
-      ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(ttlMinutes) + " 分钟内保持在线。"
-      : "等待机器发送心跳；超过 " + String(ttlMinutes) + " 分钟未收到心跳的机器会自动移出列表。";
+    const isOperational = onlineCount > 0 && timedOutCount === 0;
+    const overviewLabel = timedOutCount > 0
+      ? "部分节点心跳超时"
+      : isOperational ? "全部系统运行正常" : "暂无在线机器";
+    const overviewDetail = timedOutCount > 0
+      ? String(timedOutCount) + " 台机器已超时并标记为灰色；超过 " + String(ttlMinutes) + " 分钟未收到心跳后自动移除。"
+      : isOperational
+        ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(ttlMinutes) + " 分钟内保持在线。"
+        : "等待机器发送心跳；超过 " + String(ttlMinutes) + " 分钟未收到心跳的机器会自动移出列表。";
     const overviewClass = isOperational ? "operational" : "attention";
+    const heartbeatDescription = timedOutCount > 0
+      ? String(timedOutCount) + " 台机器心跳超时，恢复后会自动变绿"
+      : onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
+    const heartbeatState = timedOutCount > 0 ? "有超时" : onlineCount > 0 ? "正常" : "等待中";
+    const nodeDescription = timedOutCount > 0
+      ? String(timedOutCount) + " 台节点暂时不可用，仍保留 5 分钟"
+      : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
+    const nodeState = timedOutCount > 0 ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
     const rows = nodes.length > 0
       ? nodes.map((node) => `
-        <tr>
-          <td><span class="badge ${node.online ? "online" : "offline"}">${node.online ? "在线" : node.status === "offline" ? "已下线" : "超时"}</span></td>
-          <td>${htmlEscape(node.sourceIp || "-")}</td>
-          <td>${htmlEscape(node.label || "-")}</td>
-          <td>${htmlEscape(node.argoDomain || "-")}</td>
-          <td>${htmlEscape(node.country || node.countryName || "-")}</td>
-          <td>${htmlEscape(node.provider || "-")}</td>
-          <td>${htmlEscape(dashboardTime(node.lastSeen || node.lastEventAt))}</td>
-        </tr>`).join("")
-      : '<tr><td class="empty" colspan="7">暂无在线机器</td></tr>';
+        <article class="node-row">
+          <div class="node-row-header">
+            <div class="node-identity">
+              <span class="badge ${node.online ? "online" : "offline"}">${node.online ? "在线" : node.status === "offline" ? "已下线" : "超时"}</span>
+              <div class="node-title"><strong>${htmlEscape(node.label || "未命名节点")}</strong><span>${htmlEscape(node.argoDomain || "-")}</span></div>
+            </div>
+            <div class="node-last-seen">最后心跳<br><strong>${htmlEscape(dashboardTime(node.lastSeen || node.lastEventAt))}</strong></div>
+          </div>
+          <div class="heartbeat-strip" aria-label="最近心跳记录">${heartbeatSegments(node)}</div>
+          <div class="heartbeat-scale"><span>最近 ${ttlMinutes} 分钟</span><span>现在</span></div>
+          <div class="node-fields">
+            <div><span>来源 IP</span><strong>${htmlEscape(node.sourceIp || "-")}</strong></div>
+            <div><span>地区</span><strong>${htmlEscape(node.country || node.countryName || "-")}</strong></div>
+            <div><span>Provider</span><strong>${htmlEscape(node.provider || "-")}</strong></div>
+            <div><span>连接域名</span><strong>${htmlEscape(node.argoDomain || "-")}</strong></div>
+          </div>
+        </article>`).join("")
+      : '<div class="empty">暂无在线机器</div>';
 
     const html = `<!doctype html>
 <html lang="zh-CN">
@@ -280,8 +336,8 @@ async function dashboardPageResponse(request, env) {
     }
     * { box-sizing: border-box; }
     body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
-    main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 28px 0 64px; }
-    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 4px 0 36px; }
+    main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 20px 0 44px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 2px 0 24px; }
     .brand { display: inline-flex; align-items: center; gap: 12px; color: inherit; text-decoration: none; }
     .brand img { width: 38px; height: 38px; border-radius: 50%; }
     .brand-name { font-size: 18px; font-weight: 700; letter-spacing: -.02em; }
@@ -289,43 +345,66 @@ async function dashboardPageResponse(request, env) {
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot, .service-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
     .service-dot.attention { background: #d18b00; box-shadow: 0 0 0 4px #d18b001c; }
-    .hero { display: flex; align-items: flex-start; gap: 18px; padding: 30px 32px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; }
+    .hero { display: flex; align-items: center; gap: 16px; padding: 18px 22px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .hero-icon { display: grid; flex: 0 0 42px; place-items: center; width: 42px; height: 42px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 24px; font-weight: 800; }
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
     .eyebrow { margin: 0 0 8px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
     h1 { margin: 0; font-size: clamp(25px, 4vw, 34px); letter-spacing: -.035em; line-height: 1.15; }
     .hero-detail { margin: 10px 0 0; color: var(--muted); font-size: 15px; line-height: 1.6; }
-    .section { margin-top: 46px; }
+    .section { margin-top: 30px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
     .count { color: var(--muted); font-size: 13px; }
-    .service-list, .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-    .service-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 22px; border-bottom: 1px solid var(--line); }
-    .service-row:last-child { border-bottom: 0; }
+    .service-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+    .service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; min-width: 0; padding: 18px; border-right: 1px solid var(--line); }
+    .service-row:last-child { border-right: 0; }
     .service-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
     .service-copy { min-width: 0; }
     .service-name { display: block; font-size: 14px; font-weight: 650; }
     .service-description { display: block; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
     .service-state { color: var(--green); font-size: 13px; font-weight: 650; white-space: nowrap; }
-    .node-card { overflow-x: auto; }
-    table { width: 100%; border-collapse: collapse; min-width: 920px; }
-    th, td { padding: 16px 18px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
-    th { color: var(--muted); font-size: 12px; font-weight: 650; letter-spacing: .02em; }
-    td { font-size: 14px; }
-    tr:last-child td { border-bottom: 0; }
+    .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+    .node-list { display: grid; }
+    .node-row { min-width: 0; padding: 20px 22px; border-bottom: 1px solid var(--line); }
+    .node-row:last-child { border-bottom: 0; }
+    .node-row-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
+    .node-identity { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
+    .node-title { display: grid; min-width: 0; gap: 4px; }
+    .node-title strong { overflow-wrap: anywhere; font-size: 15px; line-height: 1.35; }
+    .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
+    .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: right; }
+    .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
+    .heartbeat-strip { display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 28px; margin-top: 18px; }
+    .pulse { display: block; min-width: 0; height: 18px; border-radius: 3px; background: #dff4e6; }
+    .pulse-ok { height: 24px; background: #44d483; }
+    .pulse-timeout { height: 24px; background: #e05252; }
+    .pulse-empty { background: #eef0f2; }
+    .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 5px; color: var(--muted); font-size: 11px; }
+    .node-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 18px; padding-top: 16px; border-top: 1px solid #f0f1f2; }
+    .node-fields div { display: grid; min-width: 0; gap: 5px; }
+    .node-fields span { color: var(--muted); font-size: 11px; }
+    .node-fields strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 600; }
     .badge { display: inline-flex; align-items: center; gap: 7px; color: var(--green); font-size: 13px; font-weight: 650; }
     .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #22a652; }
+    .badge.offline { color: #6b7280; }
+    .badge.offline::before { background: #9ca3af; }
     .empty { padding: 34px; text-align: center; color: var(--muted); }
     .footer { margin: 18px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
     @media (max-width: 640px) {
-      main { width: min(100% - 28px, 1120px); padding-top: 18px; }
+      main { width: min(100% - 28px, 1120px); padding-top: 14px; }
       .topbar { align-items: flex-start; padding-bottom: 26px; }
       .brand-context { display: block; margin: 3px 0 0; }
       .live-meta { padding-top: 7px; }
-      .hero { padding: 24px 20px; }
-      .section { margin-top: 34px; }
+      .hero { padding: 16px; }
+      .section { margin-top: 26px; }
+      .service-list { grid-template-columns: 1fr; }
       .service-row { align-items: flex-start; padding: 16px; }
+      .service-row { border-right: 0; border-bottom: 1px solid var(--line); }
+      .service-row:last-child { border-bottom: 0; }
       .service-state { padding-top: 1px; }
+      .node-row { padding: 18px 16px; }
+      .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+      .heartbeat-strip { gap: 2px; }
     }
   </style>
 </head>
@@ -351,16 +430,16 @@ async function dashboardPageResponse(request, env) {
     <section class="section">
       <div class="section-heading">
         <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
-        <span id="dashboard-count" class="count">${onlineCount} 台在线</span>
+        <span id="dashboard-count" class="count">${onlineCount} 台在线${timedOutCount > 0 ? "，" + timedOutCount + " 台超时" : ""}</span>
       </div>
       <div class="service-list">
         <div class="service-row">
-          <div class="service-main"><span id="heartbeat-dot" class="service-dot ${isOperational ? "operational" : "attention"}"></span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳"}</span></span></div>
-          <span id="heartbeat-state" class="service-state">${onlineCount > 0 ? "正常" : "等待中"}</span>
+          <div class="service-main"><span id="heartbeat-dot" class="service-dot ${timedOutCount > 0 ? "attention" : isOperational ? "operational" : "attention"}"></span><span class="service-copy"><span class="service-name">TeamNode 心跳</span><span class="service-description" id="heartbeat-description">${heartbeatDescription}</span></span></div>
+          <span id="heartbeat-state" class="service-state">${heartbeatState}</span>
         </div>
         <div class="service-row">
-          <div class="service-main"><span id="node-dot" class="service-dot ${isOperational ? "operational" : "attention"}"></span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方"}</span></span></div>
-          <span id="node-state" class="service-state">${onlineCount > 0 ? "正常" : "等待中"}</span>
+          <div class="service-main"><span id="node-dot" class="service-dot ${timedOutCount > 0 ? "attention" : isOperational ? "operational" : "attention"}"></span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
+          <span id="node-state" class="service-state">${nodeState}</span>
         </div>
         <div class="service-row">
           <div class="service-main"><span class="service-dot"></span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
@@ -372,14 +451,10 @@ async function dashboardPageResponse(request, env) {
     <section class="section">
       <div class="section-heading">
         <div><p class="eyebrow">Online nodes</p><h2>在线机器</h2></div>
-        <span id="node-count" class="count">${onlineCount} 台</span>
+        <span id="node-count" class="count">${visibleCount} 台</span>
       </div>
       <div class="node-card">
-        <table>
-          <thead><tr><th>状态</th><th>来源 IP</th><th>名称</th><th>ARGO_DOMAIN</th><th>地区</th><th>Provider</th><th>最后心跳</th></tr></thead>
-          <tbody id="node-rows">${rows}
-          </tbody>
-        </table>
+        <div id="node-rows" class="node-list">${rows}</div>
       </div>
     </section>
     <p id="dashboard-status" class="footer">每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP；如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。</p>
@@ -410,26 +485,46 @@ async function dashboardPageResponse(request, env) {
       function formatTime(value) {
         const timestamp = Number(value);
         if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
-        return new Date(timestamp).toISOString();
+        return new Date(timestamp).toLocaleString("zh-CN", { hour12: false });
+      }
+
+      function renderHeartbeatSegments(node) {
+        const history = (Array.isArray(node?.heartbeatHistory) ? node.heartbeatHistory : [])
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value) && value > 0)
+          .slice(-72);
+        const emptyCount = Math.max(0, 72 - history.length);
+        const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
+        return Array.from({ length: 72 }, (_, index) => {
+          const timestamp = history[index - emptyCount];
+          if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
+          const formatted = escapeHtml(formatTime(timestamp));
+          return '<span class="pulse ' + pulseClass + '" title="心跳 ' + formatted + '" aria-label="心跳 ' + formatted + '"></span>';
+        }).join("");
       }
 
       function renderRows(nodes) {
         if (!nodes.length) {
-          return '<tr><td class="empty" colspan="7">暂无在线机器</td></tr>';
+          return '<div class="empty">暂无在线机器</div>';
         }
 
         return nodes.map((node) => {
           const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
           const statusClass = node.online ? "online" : "offline";
-          return "<tr>"
-            + "<td><span class=\"badge " + statusClass + "\">" + status + "</span></td>"
-            + "<td>" + escapeHtml(node.sourceIp || "-") + "</td>"
-            + "<td>" + escapeHtml(node.label || "-") + "</td>"
-            + "<td>" + escapeHtml(node.argoDomain || "-") + "</td>"
-            + "<td>" + escapeHtml(node.country || node.countryName || "-") + "</td>"
-            + "<td>" + escapeHtml(node.provider || "-") + "</td>"
-            + "<td>" + escapeHtml(formatTime(node.lastSeen || node.lastEventAt)) + "</td>"
-            + "</tr>";
+          const heartbeatTime = escapeHtml(formatTime(node.lastSeen || node.lastEventAt));
+          return "<article class=\"node-row\">"
+            + "<div class=\"node-row-header\"><div class=\"node-identity\">"
+            + "<span class=\"badge " + statusClass + "\">" + status + "</span>"
+            + "<div class=\"node-title\"><strong>" + escapeHtml(node.label || "未命名节点") + "</strong><span>" + escapeHtml(node.argoDomain || "-") + "</span></div>"
+            + "</div><div class=\"node-last-seen\">最后心跳<br><strong>" + heartbeatTime + "</strong></div></div>"
+            + "<div class=\"heartbeat-strip\" aria-label=\"最近心跳记录\">" + renderHeartbeatSegments(node) + "</div>"
+            + "<div class=\"heartbeat-scale\"><span>最近 " + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + " 分钟</span><span>现在</span></div>"
+            + "<div class=\"node-fields\">"
+            + "<div><span>来源 IP</span><strong>" + escapeHtml(node.sourceIp || "-") + "</strong></div>"
+            + "<div><span>地区</span><strong>" + escapeHtml(node.country || node.countryName || "-") + "</strong></div>"
+            + "<div><span>Provider</span><strong>" + escapeHtml(node.provider || "-") + "</strong></div>"
+            + "<div><span>连接域名</span><strong>" + escapeHtml(node.argoDomain || "-") + "</strong></div>"
+            + "</div></article>";
         }).join("");
       }
 
@@ -447,27 +542,34 @@ async function dashboardPageResponse(request, env) {
           const data = await response.json();
           if (!data || !Array.isArray(data.nodes)) throw new Error("invalid_dashboard_response");
 
-          const onlineNodes = data.nodes.filter((node) => node && node.online);
+          const visibleNodes = data.nodes.filter((node) => node && (node.online || node.timedOut));
+          const onlineNodes = visibleNodes.filter((node) => node.online);
+          const timedOutNodes = visibleNodes.filter((node) => node.timedOut);
           const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
-          const operational = onlineNodes.length > 0;
-          rowsElement.innerHTML = renderRows(onlineNodes);
+          const operational = onlineNodes.length > 0 && timedOutNodes.length === 0;
+          window.__onlineTtlMs = data.onlineTtlMs || 600000;
+          rowsElement.innerHTML = renderRows(visibleNodes);
           overviewIconElement.className = "hero-icon " + (operational ? "operational" : "attention");
           overviewIconElement.textContent = operational ? "✓" : "!";
-          overviewLabelElement.textContent = operational ? "全部系统运行正常" : "暂无在线机器";
-          overviewDetailElement.textContent = operational
-            ? onlineNodes.length + " 台机器正在发送心跳，最近 " + ttlMinutes + " 分钟内保持在线。"
-            : "等待机器发送心跳；超过 " + ttlMinutes + " 分钟未收到心跳的机器会自动移出列表。";
-          dashboardCountElement.textContent = onlineNodes.length + " 台在线";
-          nodeCountElement.textContent = onlineNodes.length + " 台";
-          heartbeatDescriptionElement.textContent = operational
-            ? onlineNodes.length + " 台机器正在上报状态"
-            : "当前没有收到在线机器的心跳";
-          heartbeatStateElement.textContent = operational ? "正常" : "等待中";
+          overviewLabelElement.textContent = timedOutNodes.length > 0
+            ? "部分节点心跳超时"
+            : operational ? "全部系统运行正常" : "暂无在线机器";
+          overviewDetailElement.textContent = timedOutNodes.length > 0
+            ? timedOutNodes.length + " 台机器已超时并标记为灰色；超过 " + ttlMinutes + " 分钟未收到心跳后自动移除。"
+            : operational
+              ? onlineNodes.length + " 台机器正在发送心跳，最近 " + ttlMinutes + " 分钟内保持在线。"
+              : "等待机器发送心跳；超过 " + ttlMinutes + " 分钟未收到心跳的机器会自动移出列表。";
+          dashboardCountElement.textContent = onlineNodes.length + " 台在线" + (timedOutNodes.length > 0 ? "，" + timedOutNodes.length + " 台超时" : "");
+          nodeCountElement.textContent = visibleNodes.length + " 台";
+          heartbeatDescriptionElement.textContent = timedOutNodes.length > 0
+            ? timedOutNodes.length + " 台机器心跳超时，恢复后会自动变绿"
+            : onlineNodes.length > 0 ? onlineNodes.length + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
+          heartbeatStateElement.textContent = timedOutNodes.length > 0 ? "有超时" : onlineNodes.length > 0 ? "正常" : "等待中";
           heartbeatDotElement.className = "service-dot " + (operational ? "operational" : "attention");
-          nodeDescriptionElement.textContent = operational
-            ? "在线节点可继续提供订阅和连接"
-            : "在线节点恢复后会显示在下方";
-          nodeStateElement.textContent = operational ? "正常" : "等待中";
+          nodeDescriptionElement.textContent = timedOutNodes.length > 0
+            ? timedOutNodes.length + " 台节点暂时不可用，仍保留 5 分钟"
+            : onlineNodes.length > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
+          nodeStateElement.textContent = timedOutNodes.length > 0 ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
           nodeDotElement.className = "service-dot " + (operational ? "operational" : "attention");
           lastUpdatedElement.textContent = "刚刚更新";
           statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP，如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。";
@@ -642,14 +744,23 @@ export class NodeRegistry {
       }
 
       const previous = (await this.state.storage.get(key)) || {};
+      const lastSeen = Number(event.lastSeen || Date.now());
+      const previousHistory = Array.isArray(previous.heartbeatHistory)
+        ? previous.heartbeatHistory.filter((value) => Number.isFinite(Number(value)))
+        : [];
+      const lastHistoryValue = previousHistory[previousHistory.length - 1];
+      const heartbeatHistory = lastHistoryValue === lastSeen
+        ? previousHistory
+        : [...previousHistory, lastSeen].slice(-HEARTBEAT_HISTORY_LIMIT);
       const record = {
         ...previous,
         ...event,
         uuid,
         status: "online",
-        lastSeen: Number(event.lastSeen || Date.now()),
+        lastSeen,
         lastEventAt: Number(event.lastEventAt || Date.now()),
-        updatedAt: Number(event.updatedAt || Date.now())
+        updatedAt: Number(event.updatedAt || Date.now()),
+        heartbeatHistory
       };
 
       await this.state.storage.put(key, record);
