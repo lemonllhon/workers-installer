@@ -22,7 +22,9 @@ SERVICE_USER="${SERVICE_USER:-nodejs-argo}"
 SERVICE_MODE="${SERVICE_MODE:-auto}"
 SUPERVISOR_CONF_DIR="${SUPERVISOR_CONF_DIR:-}"
 SOURCE_BASE_URL="${SOURCE_BASE_URL:-${DEFAULT_SOURCE_BASE_URL}}"
-SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256:-${DEFAULT_INDEX_SHA256}}"
+# Resolve this after command-line parsing so empty values from wrappers cannot
+# accidentally override the checksum injected by the Worker.
+SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256-}"
 
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-${DEFAULT_CLOUDFLARED_VERSION}}"
 XRAY_VERSION="${XRAY_VERSION:-${DEFAULT_XRAY_VERSION}}"
@@ -136,6 +138,15 @@ validate_uuid() {
   [[ "${UUID}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式无效：${UUID}"
 }
 
+resolve_source_checksum() {
+  # Some wrappers forward SOURCE_INDEX_SHA256='' or the literal string "".
+  # Treat those values as unset so the checksum injected by the Worker is used.
+  # A custom source still has to provide its own real checksum below.
+  if [[ -z "${SOURCE_INDEX_SHA256:-}" || "${SOURCE_INDEX_SHA256}" == '""' || "${SOURCE_INDEX_SHA256}" == "''" ]]; then
+    SOURCE_INDEX_SHA256="${DEFAULT_INDEX_SHA256}"
+  fi
+}
+
 generate_uuid_if_missing() {
   if [[ -n "${UUID:-}" ]]; then
     validate_uuid
@@ -158,6 +169,7 @@ generate_uuid_if_missing() {
 validate_worker_placeholders() {
   [[ "${SOURCE_BASE_URL}" != "__WORKER_SOURCE_BASE_URL__" ]] || die "安装脚本源码地址占位符未替换；请从 https://install.lemon.vin/install.sh 下载"
   [[ "${SOURCE_INDEX_SHA256}" != "__WORKER_SOURCE_SHA256__" ]] || die "安装脚本源码 SHA256 占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
+  [[ "${SOURCE_INDEX_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] || die "SOURCE_INDEX_SHA256 必须是 64 位十六进制值；默认应由 Worker 自动注入，使用自定义源码时请设置真实 SHA256"
   if [[ "${TEAMNODE_SYNC_BASE_URL}" == "__WORKER_SYNC_BASE_URL__" ]]; then
     die "TeamNode Worker 地址占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
   fi
@@ -520,24 +532,33 @@ redeem_teamnode_relay_token() {
     })));
   ' >"${request_file}" || die "无法生成 Worker 兑换请求"
 
-  local http_code
-  http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
+  local http_code=""
+  local curl_exit=0
+  if http_code="$(curl --silent --show-error \
+    --connect-timeout 10 --max-time 30 \
+    --retry 2 --retry-delay 1 --retry-max-time 45 \
     -X POST \
     -H "Content-Type: application/json" \
     --data-binary "@${request_file}" \
     -o "${response_file}" \
     -w '%{http_code}' \
-    "${TEAMNODE_SYNC_BASE_URL%/}/api/teamnode/redeem" || true)"
+    "${TEAMNODE_SYNC_BASE_URL%/}/api/teamnode/redeem")"; then
+    :
+  else
+    curl_exit="$?"
+    rm -f -- "${request_file}" "${response_file}"
+    die "Worker 兑换请求失败（curl exit ${curl_exit}），请检查 Worker 地址和网络连接"
+  fi
 
   if [[ ! "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
     local worker_error
-    worker_error="$(TEAMNODE_RESPONSE_FILE="${response_file}" ${NODE_BIN} -e '
+    worker_error="$("${NODE_BIN}" -e '
       const fs = require("fs");
       try {
-        const data = JSON.parse(fs.readFileSync(process.env.TEAMNODE_RESPONSE_FILE, "utf8"));
-        process.stdout.write(String(data.error || ""));
+        const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        process.stdout.write(String(data.error || "").trim().slice(0, 200));
       } catch {}
-    ' 2>/dev/null || true)"
+    ' "${response_file}" 2>/dev/null || true)"
     rm -f -- "${request_file}" "${response_file}"
     if [[ -n "${worker_error}" ]]; then
       die "Worker 兑换失败（HTTP ${http_code}：${worker_error}），请检查兑换密码和 Worker 配置"
@@ -545,13 +566,19 @@ redeem_teamnode_relay_token() {
     die "Worker 兑换失败（HTTP ${http_code}），请检查网络和 Worker 配置"
   fi
 
-  TEAMNODE_RESPONSE_FILE="${response_file}" TEAMNODE_SYNC_RELAY_TOKEN="$(${NODE_BIN} -e '
+  local relay_token=""
+  if ! relay_token="$("${NODE_BIN}" -e '
     const fs = require("fs");
-    const data = JSON.parse(fs.readFileSync(process.env.TEAMNODE_RESPONSE_FILE, "utf8"));
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
     const token = String(data.relayToken || "").trim();
-    if (!token) process.exit(1);
+    if (!/^relay_v1_[0-9a-f]{64}$/.test(token)) process.exit(1);
     process.stdout.write(token);
-  ')" || die "Worker 返回的中继令牌无效"
+  ' "${response_file}")"; then
+    rm -f -- "${request_file}" "${response_file}"
+    die "Worker 返回的中继令牌无效或响应格式错误"
+  fi
+
+  TEAMNODE_SYNC_RELAY_TOKEN="${relay_token}"
 
   unset password TEAMNODE_SYNC_ENROLL_PASSWORD
   rm -f -- "${request_file}" "${response_file}"
@@ -560,7 +587,15 @@ redeem_teamnode_relay_token() {
 
 write_runtime_files() {
   log "下载并校验固定版本的 nodejs-argo 源码"
-  download_verified "${SOURCE_BASE_URL%/}/index.js" "${APP_DIR}/app/index.js" "${SOURCE_INDEX_SHA256}" "nodejs-argo index.js"
+  local source_url="${SOURCE_BASE_URL%/}/index.js"
+  # Use the expected digest as a cache key. This prevents a CDN from returning
+  # an older index.js after the Worker has injected a newer digest.
+  if [[ "${source_url}" == *\?* ]]; then
+    source_url="${source_url}&sha256=${SOURCE_INDEX_SHA256}"
+  else
+    source_url="${source_url}?sha256=${SOURCE_INDEX_SHA256}"
+  fi
+  download_verified "${source_url}" "${APP_DIR}/app/index.js" "${SOURCE_INDEX_SHA256}" "nodejs-argo index.js"
 
   cat > "${APP_DIR}/app/package.json" <<'JSON'
 {
@@ -1166,6 +1201,7 @@ parse_args() {
 
 main() {
   parse_args "$@"
+  resolve_source_checksum
   validate_app_dir
   if is_true "${UNINSTALL}"; then
     uninstall

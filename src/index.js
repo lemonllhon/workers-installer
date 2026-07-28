@@ -255,7 +255,6 @@ async function dashboardPageResponse(request, env) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="30">
   <link rel="icon" type="image/png" href="/favicon.png">
   <title>lemon-监控面板</title>
   <style>
@@ -287,16 +286,83 @@ async function dashboardPageResponse(request, env) {
 <body>
   <main>
     <h1>lemon-监控面板</h1>
-    <p class="summary">在线 ${onlineCount} 台；每 30 秒自动刷新；超过 ${Math.round(onlineTtlMs(env) / 60000)} 分钟未收到心跳会从列表删除。</p>
+    <p id="dashboard-summary" class="summary">在线 ${onlineCount} 台；每 30 秒更新节点内容；超过 ${Math.round(onlineTtlMs(env) / 60000)} 分钟未收到心跳会从列表删除。</p>
     <div class="card">
       <table>
         <thead><tr><th>状态</th><th>来源 IP</th><th>名称</th><th>ARGO_DOMAIN</th><th>地区</th><th>Provider</th><th>最后心跳</th></tr></thead>
-        <tbody>${rows}
+        <tbody id="node-rows">${rows}
         </tbody>
       </table>
     </div>
-    <p class="footer">来源 IP 为 Cloudflare 看到的设备出口 IP；如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。</p>
+    <p id="dashboard-status" class="footer">来源 IP 为 Cloudflare 看到的设备出口 IP；如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。</p>
   </main>
+  <script>
+    (() => {
+      const rowsElement = document.getElementById("node-rows");
+      const summaryElement = document.getElementById("dashboard-summary");
+      const statusElement = document.getElementById("dashboard-status");
+      let refreshing = false;
+
+      function escapeHtml(value) {
+        const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+        return String(value ?? "").replace(/[&<>"']/g, (character) => entities[character]);
+      }
+
+      function formatTime(value) {
+        const timestamp = Number(value);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
+        return new Date(timestamp).toISOString();
+      }
+
+      function renderRows(nodes) {
+        if (!nodes.length) {
+          return '<tr><td class="empty" colspan="7">暂无在线机器</td></tr>';
+        }
+
+        return nodes.map((node) => {
+          const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
+          const statusClass = node.online ? "online" : "offline";
+          return "<tr>"
+            + "<td><span class=\"badge " + statusClass + "\">" + status + "</span></td>"
+            + "<td>" + escapeHtml(node.sourceIp || "-") + "</td>"
+            + "<td>" + escapeHtml(node.label || "-") + "</td>"
+            + "<td>" + escapeHtml(node.argoDomain || "-") + "</td>"
+            + "<td>" + escapeHtml(node.country || node.countryName || "-") + "</td>"
+            + "<td>" + escapeHtml(node.provider || "-") + "</td>"
+            + "<td>" + escapeHtml(formatTime(node.lastSeen || node.lastEventAt)) + "</td>"
+            + "</tr>";
+        }).join("");
+      }
+
+      async function refreshNodes() {
+        if (refreshing) return;
+        refreshing = true;
+        try {
+          const response = await fetch("/api/nodes", {
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "Accept": "application/json" }
+          });
+          if (!response.ok) throw new Error("HTTP " + response.status);
+
+          const data = await response.json();
+          if (!data || !Array.isArray(data.nodes)) throw new Error("invalid_dashboard_response");
+
+          const onlineNodes = data.nodes.filter((node) => node && node.online);
+          const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
+          rowsElement.innerHTML = renderRows(onlineNodes);
+          summaryElement.textContent = "在线 " + onlineNodes.length + " 台；每 30 秒更新节点内容；超过 " + ttlMinutes + " 分钟未收到心跳会从列表删除。";
+          statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；来源 IP 为 Cloudflare 看到的设备出口 IP，如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。";
+        } catch (error) {
+          statusElement.textContent = "内容刷新失败（" + String(error?.message || error) + "），保留上次数据显示。";
+        } finally {
+          refreshing = false;
+        }
+      }
+
+      window.setInterval(refreshNodes, 30000);
+    })();
+  </script>
 </body>
 </html>`;
 

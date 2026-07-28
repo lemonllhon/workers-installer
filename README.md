@@ -121,6 +121,8 @@ https://install.lemon.vin/install.sh
 
 每次请求 `install.sh` 时，Worker 会重新计算当前 `agent/index.js` 的 SHA256，并注入源码地址和校验值。因此不要直接使用 GitHub 原始文件中的 `public/install.sh`。
 
+`SOURCE_INDEX_SHA256` 通常不需要手动设置。安装器会使用 Worker 自动注入的 64 位十六进制 SHA256；空值或常见包装器传入的 `""` 会按未设置处理。只有使用自定义 `SOURCE_BASE_URL` 时，才需要同时提供对应的真实 `SOURCE_INDEX_SHA256`。安装器还会将 SHA256 加入源码下载 URL，避免 CDN 返回旧版本文件。
+
 ### lemon-监控面板
 
 部署后直接打开：
@@ -151,6 +153,96 @@ https://你的-worker.workers.dev/
 - `NAME`：节点名称前缀；
 - `UUID`：不设置时自动随机生成；
 - `FORCE_KILL_PORTS=true`：清理旧安装时强制终止相关端口上的其他进程，谨慎使用。
+
+以下示例使用 `install.lemon.vin`。如果你使用自己的 Worker 域名，请将命令中的地址全部替换为自己的 `/install.sh` 地址。
+
+安装器地址提供的是当前已部署到 Worker 的版本。修改本地文件后，必须先执行
+`npx wrangler deploy`，或提交到已连接的 Workers Builds 分支并等待部署完成，目标机器才会下载到新版本。
+
+### 新机器首次安装
+
+先下载 Worker 动态生成的安装脚本。不要直接下载 GitHub 中的
+`public/install.sh`，因为其中的源码地址和 SHA256 是占位符：
+
+```bash
+sudo -i
+
+rm -f /tmp/install-lemon.sh
+curl -fsSL --retry 3 \
+  -H 'Cache-Control: no-cache' \
+  "https://install.lemon.vin/install.sh?ts=$(date +%s)" \
+  -o /tmp/install-lemon.sh
+
+bash -n /tmp/install-lemon.sh
+```
+
+然后执行安装。未设置 `TEAMNODE_SYNC_ENROLL_PASSWORD` 时，脚本会在终端中隐藏输入兑换密码：
+
+```bash
+env \
+  FORCE_KILL_PORTS='true' \
+  ARGO_AUTH='你的 Tunnel Token' \
+  ARGO_DOMAIN='你的域名' \
+  ARGO_PORT='8001' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash /tmp/install-lemon.sh
+```
+
+新机器不指定 `UUID` 时，安装器会自动生成 UUID。安装完成后，中继令牌会写入：
+
+```text
+/opt/nodejs-argo-no-docker/.env
+```
+
+目标机器只保存 `TEAMNODE_SYNC_RELAY_TOKEN`，不会保存 Worker 的
+`TEAMNODE_SYNC_SECRET`。
+
+### 旧版本机器覆盖安装最新版
+
+覆盖安装会先停止本安装器创建的进程和服务，再删除旧的安装目录并重新安装。它适用于修复旧版安装器、更新后台运行逻辑、更新心跳逻辑或重新生成三种协议。
+
+建议保留旧机器原来的 UUID，这样面板中的节点身份不会因为重新安装而改变。先读取 UUID，不要直接打印整个 `.env`：
+
+```bash
+sudo -i
+
+UUID="$(sed -n 's/^UUID=//p' /opt/nodejs-argo-no-docker/.env | head -n 1)"
+if [ -z "${UUID}" ]; then
+  echo '旧安装中没有找到 UUID，请手动指定一个 UUID' >&2
+  exit 1
+fi
+```
+
+下载并检查最新版安装器：
+
+```bash
+rm -f /tmp/install-lemon.sh
+curl -fsSL --retry 3 \
+  -H 'Cache-Control: no-cache' \
+  "https://install.lemon.vin/install.sh?ts=$(date +%s)" \
+  -o /tmp/install-lemon.sh
+
+bash -n /tmp/install-lemon.sh
+```
+
+使用原来的 `UUID` 覆盖安装：
+
+```bash
+env \
+  UUID="${UUID}" \
+  FORCE_KILL_PORTS='true' \
+  ARGO_AUTH='你的 Tunnel Token' \
+  ARGO_DOMAIN='你的域名' \
+  ARGO_PORT='8001' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash /tmp/install-lemon.sh
+```
+
+覆盖安装过程中会再次要求输入兑换密码，并为这个 UUID 重新获取中继令牌。不要同时设置 `TEAMNODE_SYNC_SECRET` 和 `TEAMNODE_SYNC_RELAY_TOKEN`；让 Worker 完成兑换即可。
+
+如果不指定原来的 UUID，安装器会生成新的节点身份，旧节点会在停止心跳后最多保留 10 分钟，新节点随后以另一条记录出现。
 
 ### 交互式安装
 
@@ -195,6 +287,46 @@ env \
 ```
 
 不要把真实兑换密码写入公开脚本、README、GitHub 或 Shell 历史。
+
+### 安装完成后检查心跳
+
+兑换成功只说明 Worker 已签发中继令牌，还需要确认 Node.js 已加载 `.env` 并成功发送心跳：
+
+```bash
+APP_DIR=/opt/nodejs-argo-no-docker
+
+grep -E '^(TEAMNODE_SYNC_ENABLED|TEAMNODE_SYNC_BASE_URL|TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS)=' \
+  "${APP_DIR}/.env"
+
+for key in UUID TEAMNODE_SYNC_RELAY_TOKEN; do
+  if grep -q "^${key}=" "${APP_DIR}/.env"; then
+    echo "${key}=present"
+  else
+    echo "${key}=missing"
+  fi
+done
+
+grep -Ei 'TeamNode|注册|心跳|同步|relay|失败|error' \
+  "${APP_DIR}/data/nodejs-argo.log" | tail -50
+```
+
+日志中应出现：
+
+```text
+TeamNode 注册成功
+TeamNode 心跳成功
+```
+
+也可以检查本机 Node.js 服务和订阅内容：
+
+```bash
+ps aux | grep -E 'run.sh|index.js' | grep -v grep
+
+curl -fsS -o /tmp/sub-check http://127.0.0.1:3000/sub
+wc -c /tmp/sub-check
+```
+
+确认日志出现“注册成功”或“心跳成功”后，刷新监控面板。面板现在每 30 秒只更新节点内容，不会重新加载整个页面。
 
 ### 关闭 TeamNode 同步
 
