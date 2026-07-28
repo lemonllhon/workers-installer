@@ -313,7 +313,7 @@ function heartbeatTimeMarkup(node, value) {
     ? `${local.day} ${local.clock}`
     : sameYear ? `${local.month}-${local.day} ${local.clock}` : `${local.year}-${local.month}-${local.day} ${local.clock}`;
   const sharedMarkup = sharedPrefix ? `<span class="node-time-shared">${htmlEscape(sharedPrefix)}</span>` : "";
-  return `<span>最后心跳</span><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：${htmlEscape(localZone)}">${sharedMarkup}<span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small></small></span><span><b>当地</b><strong>${htmlEscape(localText)}</strong><small>${htmlEscape(localZone)}</small></span></div>`;
+  return `<div class="node-time-heading"><span>最后心跳</span>${sharedMarkup}</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：${htmlEscape(localZone)}"><span><b>中国</b><strong>${htmlEscape(chinaText)}</strong><small></small></span><span><b>当地</b><strong>${htmlEscape(localText)}</strong><small>${htmlEscape(localZone)}</small></span></div>`;
 }
 
 function heartbeatHistoryValues(node) {
@@ -370,7 +370,8 @@ async function dashboardPageResponse(request, env) {
       : isOperational
         ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(ttlMinutes) + " 分钟内保持在线。"
         : "等待机器发送心跳；超过 " + String(ttlMinutes) + " 分钟未收到心跳的机器会自动移出列表。";
-    const overviewClass = isOperational ? "operational" : "attention";
+    const overviewClass = isOperational ? "operational" : timedOutCount > 0 ? "attention" : "waiting";
+    const overviewSymbol = isOperational ? "✓" : timedOutCount > 0 ? "!" : "…";
     const heartbeatDescription = timedOutCount > 0
       ? String(timedOutCount) + " 台机器心跳超时，恢复后会自动变绿"
       : onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
@@ -438,10 +439,12 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .hero { display: flex; align-items: center; gap: 13px; padding: 11px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
-    .hero > div:last-child { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; }
+    .hero { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; gap: 13px; padding: 11px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; }
+    .hero-copy { display: grid; min-width: 0; gap: 2px; align-content: center; }
+    .hero-main { display: flex; align-items: baseline; flex-wrap: wrap; column-gap: 13px; row-gap: 2px; min-width: 0; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
+    .hero-icon.waiting { color: var(--muted); background: #f0f2f4; }
     .eyebrow { margin: 0 0 2px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
     .hero .eyebrow { flex: 0 0 100%; }
     h1 { margin: 0; font-size: clamp(20px, 3vw, 25px); letter-spacing: -.035em; line-height: 1.15; }
@@ -467,8 +470,8 @@ async function dashboardPageResponse(request, env) {
     .service-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .service-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; min-width: 0; padding: 18px; border-right: 1px solid var(--line); }
     .service-row:last-child { border-right: 0; }
-    .service-main { display: flex; align-items: flex-start; gap: 12px; min-width: 0; }
-    .service-copy { min-width: 0; }
+    .service-main { display: flex; flex: 1; align-items: flex-start; gap: 12px; min-width: 0; }
+    .service-copy { flex: 1; min-width: 0; text-align: center; }
     .service-name { display: block; font-size: 14px; font-weight: 650; }
     .service-description { display: block; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
     .service-state { flex: 0 0 auto; min-width: 42px; padding-top: 1px; color: var(--muted); font-size: 13px; font-weight: 700; white-space: nowrap; }
@@ -485,13 +488,13 @@ async function dashboardPageResponse(request, env) {
     .node-title strong { overflow-wrap: anywhere; font-size: 15px; line-height: 1.35; }
     .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
     .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 11px; line-height: 1.45; text-align: right; }
-    .node-last-seen > span { display: block; }
+    .node-time-heading { display: flex; align-items: baseline; justify-content: flex-end; gap: 6px; }
     .node-time-pair { display: grid; width: max-content; gap: 1px; margin: 2px 0 0 auto; color: var(--ink); font-size: 11px; font-weight: 600; text-align: left; }
-    .node-time-pair > span:not(.node-time-shared) { display: grid; grid-template-columns: 32px auto 1fr; align-items: baseline; column-gap: 5px; }
+    .node-time-pair > span { display: grid; grid-template-columns: 32px auto 1fr; align-items: baseline; column-gap: 5px; }
     .node-time-pair b { color: var(--muted); font-size: 10px; font-weight: 700; }
     .node-time-pair strong { color: var(--ink); font-size: 11px; font-weight: 600; white-space: nowrap; }
     .node-time-pair small { color: var(--muted); font-size: 9px; font-weight: 500; white-space: nowrap; }
-    .node-time-shared { grid-column: 1 / -1; color: var(--muted); font-size: 10px; font-weight: 600; text-align: right; }
+    .node-time-shared { color: var(--muted); font-size: 10px; font-weight: 600; }
     .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
     .heartbeat-strip { position: relative; display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; overflow: hidden; isolation: isolate; }
     .heartbeat-strip.heartbeat-active::after { position: absolute; z-index: 2; top: -5px; bottom: -5px; left: -24%; width: 22%; content: ""; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(239, 255, 246, .14) 28%, rgba(255, 255, 255, .78) 50%, rgba(239, 255, 246, .14) 72%, transparent); filter: blur(2px); animation: heartbeat-charge 3.8s linear infinite; }
@@ -517,7 +520,8 @@ async function dashboardPageResponse(request, env) {
       .brand-context { display: block; margin: 3px 0 0; }
       .live-meta { padding-top: 7px; }
       .hero { align-items: flex-start; padding: 12px 14px; }
-      .hero > div:last-child { display: block; }
+      .hero-copy { gap: 3px; }
+      .hero-main { display: block; }
       .hero .eyebrow { margin-bottom: 3px; }
       .hero-detail { margin-top: 4px; }
       .section { margin-top: 26px; }
@@ -551,11 +555,13 @@ async function dashboardPageResponse(request, env) {
     </header>
 
     <section class="hero" aria-live="polite">
-      <div id="overview-icon" class="hero-icon ${overviewClass}">${isOperational ? "✓" : "!"}</div>
-      <div>
+      <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
+      <div class="hero-copy">
         <p class="eyebrow">当前状态</p>
-        <h1 id="overview-label">${overviewLabel}</h1>
-        <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
+        <div class="hero-main">
+          <h1 id="overview-label">${overviewLabel}</h1>
+          <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
+        </div>
       </div>
     </section>
 
@@ -684,13 +690,12 @@ async function dashboardPageResponse(request, env) {
         const localText = sameYearMonth
           ? local.day + " " + local.clock
           : sameYear ? local.month + "-" + local.day + " " + local.clock : local.year + "-" + local.month + "-" + local.day + " " + local.clock;
-        const sharedMarkup = sharedPrefix ? "<span class=\"node-time-shared\">" + escapeHtml(sharedPrefix) + "</span>" : "";
+        const sharedMarkup = sharedPrefix ? '<span class="node-time-shared">' + escapeHtml(sharedPrefix) + "</span>" : "";
         const localLabel = requestedZone ? "当地" : "本地";
-        return "<span>最后心跳</span><div class=\"node-time-pair\" title=\"中国时区：Asia/Shanghai；当地时区：" + escapeHtml(localZone) + "\">"
-          + sharedMarkup
-          + "<span><b>中国</b><strong>" + escapeHtml(chinaText) + "</strong><small></small></span>"
-          + "<span><b>" + localLabel + "</b><strong>" + escapeHtml(localText) + "</strong><small>" + escapeHtml(localZone) + "</small></span>"
-          + "</div>";
+        return '<div class="node-time-heading"><span>最后心跳</span>' + sharedMarkup + '</div><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：' + escapeHtml(localZone) + '">'
+          + '<span><b>中国</b><strong>' + escapeHtml(chinaText) + '</strong><small></small></span>'
+          + '<span><b>' + localLabel + '</b><strong>' + escapeHtml(localText) + '</strong><small>' + escapeHtml(localZone) + '</small></span>'
+          + '</div>';
       }
 
       function renderHeartbeatSegments(node) {
@@ -803,21 +808,21 @@ async function dashboardPageResponse(request, env) {
           const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
           const statusClass = node.online ? "online" : "offline";
           const runtime = runtimeSummary(node);
-          return "<article class=\"node-row\">"
-            + "<div class=\"node-row-header\"><div class=\"node-identity\">"
-            + "<span class=\"badge " + statusClass + "\">" + status + "</span>"
-            + "<div class=\"node-title\"><strong>" + escapeHtml(node.label || "未命名节点") + "</strong><span>" + escapeHtml(node.argoDomain || "-") + "</span></div>"
-            + "</div><div class=\"node-last-seen\">" + renderNodeTimePair(node, node.lastSeen || node.lastEventAt) + "</div></div>"
-            + "<div class=\"heartbeat-strip" + (node.online ? " heartbeat-active" : "") + "\" aria-label=\"最近心跳记录\">" + renderHeartbeatSegments(node) + "</div>"
-            + "<div class=\"heartbeat-scale\"><span>现在</span><span>" + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + " 分钟前</span></div>"
-            + "<div class=\"node-fields\">"
-            + "<div><span>来源 IP</span><strong>" + escapeHtml(node.sourceIp || "-") + "</strong></div>"
-            + "<div><span>地区</span><strong>" + escapeHtml(node.country || node.countryName || "-") + "</strong></div>"
-            + "<div><span>Provider</span><strong>" + escapeHtml(node.provider || "-") + "</strong></div>"
-            + "<div><span>操作系统</span><strong>" + escapeHtml(runtime.system) + "</strong></div>"
-            + "<div><span>系统架构</span><strong>" + escapeHtml(runtime.arch) + "</strong></div>"
-            + "<div><span>CPU / 内存</span><strong>" + escapeHtml(runtime.resources) + "</strong></div>"
-            + "</div></article>";
+          return '<article class="node-row">'
+            + '<div class="node-row-header"><div class="node-identity">'
+            + '<span class="badge ' + statusClass + '">' + status + '</span>'
+            + '<div class="node-title"><strong>' + escapeHtml(node.label || "未命名节点") + '</strong><span>' + escapeHtml(node.argoDomain || "-") + '</span></div>'
+            + '</div><div class="node-last-seen">' + renderNodeTimePair(node, node.lastSeen || node.lastEventAt) + '</div></div>'
+            + '<div class="heartbeat-strip' + (node.online ? " heartbeat-active" : "") + '" aria-label="最近心跳记录">' + renderHeartbeatSegments(node) + '</div>'
+            + '<div class="heartbeat-scale"><span>现在</span><span>' + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + ' 分钟前</span></div>'
+            + '<div class="node-fields">'
+            + '<div><span>来源 IP</span><strong>' + escapeHtml(node.sourceIp || "-") + '</strong></div>'
+            + '<div><span>地区</span><strong>' + escapeHtml(node.country || node.countryName || "-") + '</strong></div>'
+            + '<div><span>Provider</span><strong>' + escapeHtml(node.provider || "-") + '</strong></div>'
+            + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
+            + '<div><span>系统架构</span><strong>' + escapeHtml(runtime.arch) + '</strong></div>'
+            + '<div><span>CPU / 内存</span><strong>' + escapeHtml(runtime.resources) + '</strong></div>'
+            + '</div></article>';
         }).join("");
       }
 
@@ -843,8 +848,10 @@ async function dashboardPageResponse(request, env) {
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
           currentNodes = visibleNodes;
           renderFilteredNodes();
-          overviewIconElement.className = "hero-icon " + (operational ? "operational" : "attention");
-          overviewIconElement.textContent = operational ? "✓" : "!";
+          const overviewStatus = operational ? "operational" : timedOutNodes.length > 0 ? "attention" : "waiting";
+          overviewIconElement.className = "hero-icon " + overviewStatus;
+          overviewIconElement.textContent = operational ? "✓" : timedOutNodes.length > 0 ? "!" : "…";
+          overviewIconElement.setAttribute("aria-label", timedOutNodes.length > 0 ? "部分节点心跳超时" : operational ? "全部系统运行正常" : "等待机器心跳");
           overviewLabelElement.textContent = timedOutNodes.length > 0
             ? "部分节点心跳超时"
             : operational ? "全部系统运行正常" : "暂无在线机器";
