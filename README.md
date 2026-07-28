@@ -180,10 +180,8 @@ bash -n /tmp/install-lemon.sh
 
 ```bash
 env \
-  FORCE_KILL_PORTS='true' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  ARGO_PORT='8001' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
   bash /tmp/install-lemon.sh
@@ -234,7 +232,6 @@ env \
   FORCE_KILL_PORTS='true' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  ARGO_PORT='8001' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
   bash /tmp/install-lemon.sh
@@ -250,13 +247,11 @@ env \
 
 ```bash
 env \
-  FORCE_KILL_PORTS='true' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  ARGO_PORT='8001' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
-  bash <(curl -fsSL https://你的-worker.workers.dev/install.sh)
+  bash -c 'curl -fsSL https://你的-worker.workers.dev/install.sh | bash'
 ```
 
 安装器流程：
@@ -277,16 +272,16 @@ env \
 ```bash
 env \
   TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码' \
-  FORCE_KILL_PORTS='true' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  ARGO_PORT='8001' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
-  bash <(curl -fsSL https://你的-worker.workers.dev/install.sh)
+  bash -c 'curl -fsSL https://你的-worker.workers.dev/install.sh | bash'
 ```
 
 不要把真实兑换密码写入公开脚本、README、GitHub 或 Shell 历史。
+
+`ARGO_PORT` 默认是 `8001`，通常不需要填写。`FORCE_KILL_PORTS=true` 只在覆盖旧安装、确认其他程序占用节点端口且需要强制清理时添加；新机器安装不建议默认开启。
 
 ### 安装完成后检查心跳
 
@@ -337,7 +332,7 @@ env \
   TEAMNODE_SYNC_ENABLED='false' \
   ARGO_AUTH='你的 Tunnel Token' \
   ARGO_DOMAIN='你的域名' \
-  bash <(curl -fsSL https://你的-worker.workers.dev/install.sh)
+  bash -c 'curl -fsSL https://你的-worker.workers.dev/install.sh | bash'
 ```
 
 ## 三、端口和协议转发
@@ -441,7 +436,7 @@ FORCE_KILL_PORTS=true
 卸载：
 
 ```bash
-bash <(curl -fsSL https://你的-worker.workers.dev/install.sh) --uninstall
+curl -fsSL https://你的-worker.workers.dev/install.sh | bash -s -- --uninstall
 ```
 
 卸载只处理本安装器创建的目录和启动配置，不会删除系统全局 PM2。

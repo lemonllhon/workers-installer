@@ -189,10 +189,17 @@ generate_uuid_if_missing() {
 }
 
 validate_worker_placeholders() {
-  [[ "${SOURCE_BASE_URL}" != "__WORKER_SOURCE_BASE_URL__" ]] || die "安装脚本源码地址占位符未替换；请从 https://install.lemon.vin/install.sh 下载"
-  [[ "${SOURCE_INDEX_SHA256}" != "__WORKER_SOURCE_SHA256__" ]] || die "安装脚本源码 SHA256 占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
+  # Keep the sentinels split in the source. The Worker replaces its
+  # placeholders globally, so writing the complete sentinel here would make
+  # the validation check compare the resolved value with itself.
+  local source_placeholder='__WORKER''_SOURCE_BASE_URL__'
+  local checksum_placeholder='__WORKER''_SOURCE_SHA256__'
+  local sync_placeholder='__WORKER''_SYNC_BASE_URL__'
+
+  [[ "${SOURCE_BASE_URL}" != "${source_placeholder}" ]] || die "安装脚本源码地址占位符未替换；请从 https://install.lemon.vin/install.sh 下载"
+  [[ "${SOURCE_INDEX_SHA256}" != "${checksum_placeholder}" ]] || die "安装脚本源码 SHA256 占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
   [[ "${SOURCE_INDEX_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] || die "SOURCE_INDEX_SHA256 必须是 64 位十六进制值；默认应由 Worker 自动注入，使用自定义源码时请设置真实 SHA256"
-  if [[ "${TEAMNODE_SYNC_BASE_URL}" == "__WORKER_SYNC_BASE_URL__" ]]; then
+  if [[ "${TEAMNODE_SYNC_BASE_URL}" == "${sync_placeholder}" ]]; then
     die "TeamNode Worker 地址占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
   fi
 }
