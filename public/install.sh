@@ -1196,6 +1196,10 @@ uninstall() {
   fi
 
   cleanup_owned_processes
+  if [[ -e "${APP_DIR}/.env" || -L "${APP_DIR}/.env" ]]; then
+    rm -f -- "${APP_DIR}/.env" || die "无法清理旧环境文件：${APP_DIR}/.env"
+    log "已清理旧环境文件：${APP_DIR}/.env"
+  fi
   rm -rf -- "${APP_DIR}"
   log "已卸载：${APP_DIR} 和 ${SERVICE_NAME} 的启动配置"
 }
