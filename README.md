@@ -248,7 +248,7 @@ base64 -d /opt/nodejs-argo-no-docker/data/sub.txt \
 安装器按以下顺序自动选择启动方式：
 
 ```text
-systemd → OpenRC → SysV/init.d → rc.local → cron/crond
+systemd → OpenRC → SysV/init.d → Supervisor → rc.local → cron/crond
 ```
 
 如果系统没有可用的 init 或 cron，安装器会使用固定版本 PM2（默认 `5.4.3`）保证 Node 进程退出后自动重启，但无法保证机器重启后自动启动。
@@ -260,7 +260,22 @@ export SERVICE_MODE=auto
 bash /tmp/install-lemon.sh
 ```
 
-可用模式：`auto`、`systemd`、`openrc`、`sysv`、`rc.local`、`cron`、`none`。
+可用模式：`auto`、`systemd`、`openrc`、`sysv`、`supervisor`、`rc.local`、`cron`、`none`。
+
+如果系统已经安装并配置了 Supervisor，`auto` 会优先使用它，并在
+`/etc/supervisor/conf.d/` 或 `/etc/supervisord.d/` 写入本安装器的配置。没有可用
+Supervisor 时仍会继续尝试其他启动方式。
+
+运行包装器会先加载 `/opt/nodejs-argo-no-docker/.env`，再启动 Node.js，因此
+`ARGO_DOMAIN`、`BIN_PATH`、TeamNode 中继令牌等变量不会依赖 `su/runuser` 的隐式环境继承。
+启动器和子进程日志位于：
+
+```text
+/opt/nodejs-argo-no-docker/data/nodejs-argo.log
+/opt/nodejs-argo-no-docker/data/runner-launcher.log
+/opt/nodejs-argo-no-docker/data/xray-boot.log
+/opt/nodejs-argo-no-docker/data/cloudflared-boot.log
+```
 
 正常重启不会重新输入兑换密码。UUID 和中继令牌会保存在：
 

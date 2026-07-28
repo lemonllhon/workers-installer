@@ -108,6 +108,10 @@ const subPath = path.join(FILE_PATH, "sub.txt");
 const listPath = path.join(FILE_PATH, "list.txt");
 const bootLogPath = path.join(FILE_PATH, "boot.log");
 const configPath = path.join(FILE_PATH, "config.json");
+const nginxBootLogPath = path.join(FILE_PATH, "nginx-boot.log");
+const nezhaBootLogPath = path.join(FILE_PATH, "nezha-boot.log");
+const xrayBootLogPath = path.join(FILE_PATH, "xray-boot.log");
+const cloudflaredBootLogPath = path.join(FILE_PATH, "cloudflared-boot.log");
 const xrayAccessLogPath = path.join(FILE_PATH, "xray-access.log");
 const xrayErrorLogPath = path.join(FILE_PATH, "xray-error.log");
 const cloudflaredLogPath = path.join(FILE_PATH, "cloudflared.log");
@@ -949,7 +953,7 @@ async function stopDirectNginx() {
 async function startNginx() {
   const config = path.resolve(directNginxConfigPath);
   await exec(`${shellQuote(NGINX_BIN)} -t -c ${shellQuote(config)}`);
-  await exec(`nohup ${shellQuote(NGINX_BIN)} -c ${shellQuote(config)} >/dev/null 2>&1 &`);
+  await exec(`nohup ${shellQuote(NGINX_BIN)} -c ${shellQuote(config)} >>${shellQuote(nginxBootLogPath)} 2>&1 &`);
   await new Promise((resolve) => setTimeout(resolve, 500));
 }
 
@@ -1305,14 +1309,14 @@ function getCloudflaredProtocol() {
 
 function buildCloudflaredArgs() {
   if (ARGO_AUTH.match(/^[A-Z0-9a-z=]{120,250}$/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run --token ${ARGO_AUTH}`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile ${shellQuote(cloudflaredLogPath)} --loglevel ${shellQuote(CLOUDFLARED_LOG_LEVEL)} run --token ${shellQuote(ARGO_AUTH)}`;
   }
 
   if (ARGO_AUTH.match(/TunnelSecret/)) {
-    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config "${tunnelYamlPath}" --logfile "${cloudflaredLogPath}" --loglevel ${CLOUDFLARED_LOG_LEVEL} run`;
+    return `tunnel --edge-ip-version auto --autoupdate-freq 24h --config ${shellQuote(tunnelYamlPath)} --logfile ${shellQuote(cloudflaredLogPath)} --loglevel ${shellQuote(CLOUDFLARED_LOG_LEVEL)} run`;
   }
 
-  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile "${bootLogPath}" --loglevel info --url http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`;
+  return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile ${shellQuote(bootLogPath)} --loglevel info --url ${shellQuote(`http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`)}`;
 }
 
 // 启动镜像内置的哪吒、Xray、cloudflared
@@ -1359,7 +1363,7 @@ use_ipv6_country_code: false
 uuid: ${UUID}`;
 
         fs.writeFileSync(nezhaConfigPath, configYaml);
-        await exec(`nohup "${phpPath}" -c "${nezhaConfigPath}" >/dev/null 2>&1 &`);
+        await exec(`nohup ${shellQuote(phpPath)} -c ${shellQuote(nezhaConfigPath)} >>${shellQuote(nezhaBootLogPath)} 2>&1 &`);
         console.log(`${phpName} 已启动`);
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
@@ -1376,7 +1380,7 @@ uuid: ${UUID}`;
           NEZHA_TLS = "--tls";
         }
 
-        await exec(`nohup "${npmPath}" -s ${NEZHA_SERVER}:${NEZHA_PORT} -p ${NEZHA_KEY} ${NEZHA_TLS} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >/dev/null 2>&1 &`);
+        await exec(`nohup ${shellQuote(npmPath)} -s ${shellQuote(`${NEZHA_SERVER}:${NEZHA_PORT}`)} -p ${shellQuote(NEZHA_KEY)} ${NEZHA_TLS} --disable-auto-update --report-delay 4 --skip-conn --skip-procs >>${shellQuote(nezhaBootLogPath)} 2>&1 &`);
         console.log(`${npmName} 已启动`);
         await new Promise((resolve) => setTimeout(resolve, 1000));
       } catch (error) {
@@ -1388,7 +1392,7 @@ uuid: ${UUID}`;
   }
 
   try {
-    await exec(`nohup "${webPath}" -c "${configPath}" >/dev/null 2>&1 &`);
+    await exec(`nohup ${shellQuote(webPath)} -c ${shellQuote(configPath)} >>${shellQuote(xrayBootLogPath)} 2>&1 &`);
     console.log(`${webName} 已启动`);
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch (error) {
@@ -1418,7 +1422,7 @@ uuid: ${UUID}`;
   } else {
     try {
       const args = buildCloudflaredArgs();
-      await exec(`nohup "${botPath}" ${args} >/dev/null 2>&1 &`);
+      await exec(`nohup ${shellQuote(botPath)} ${args} >>${shellQuote(cloudflaredBootLogPath)} 2>&1 &`);
       console.log(`${botName} 已启动`);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     } catch (error) {
@@ -1523,7 +1527,7 @@ async function extractDomains() {
 
     try {
       const args = buildCloudflaredArgs();
-      await exec(`nohup "${botPath}" ${args} >/dev/null 2>&1 &`);
+          await exec(`nohup ${shellQuote(botPath)} ${args} >>${shellQuote(cloudflaredBootLogPath)} 2>&1 &`);
       console.log(`${botName} 已重新启动`);
       await new Promise((resolve) => setTimeout(resolve, 3000));
       await extractDomains();

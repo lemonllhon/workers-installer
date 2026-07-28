@@ -20,6 +20,7 @@ APP_DIR="${APP_DIR:-${DEFAULT_APP_DIR}}"
 SERVICE_NAME="${SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
 SERVICE_USER="${SERVICE_USER:-nodejs-argo}"
 SERVICE_MODE="${SERVICE_MODE:-auto}"
+SUPERVISOR_CONF_DIR="${SUPERVISOR_CONF_DIR:-}"
 SOURCE_BASE_URL="${SOURCE_BASE_URL:-${DEFAULT_SOURCE_BASE_URL}}"
 SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256:-${DEFAULT_INDEX_SHA256}}"
 
@@ -55,6 +56,8 @@ RUNUSER_BIN=""
 SU_BIN=""
 ENV_FILE=""
 SERVICE_FILE=""
+SUPERVISOR_CONFIG_FILE="${SUPERVISOR_CONFIG_FILE:-}"
+SUPERVISOR_CONF_FILE=""
 RUNNER_SCRIPT=""
 PID_FILE=""
 PM2_DIR=""
@@ -77,7 +80,7 @@ usage() {
   install.sh --uninstall              卸载本安装器创建的服务和目录
   install.sh --dry-run                只检查环境，不写入系统
   install.sh --app-dir /opt/example   覆盖安装目录
-  install.sh --service-mode auto      自动选择 systemd/OpenRC/SysV/cron
+  install.sh --service-mode auto      自动选择 systemd/OpenRC/SysV/Supervisor/cron
 
 ARGO_AUTH、ARGO_DOMAIN 通过环境变量传入，不写入脚本。
 默认使用 Worker 代理 TeamNode；客户端不保存 TEAMNODE_SYNC_SECRET。可直接设置 TEAMNODE_SYNC_RELAY_TOKEN，或安装时输入兑换密码自动获取。
@@ -85,7 +88,7 @@ ARGO_AUTH、ARGO_DOMAIN 通过环境变量传入，不写入脚本。
 如明确直连 TeamNode，才设置 TEAMNODE_SYNC_BASE_URL 和 TEAMNODE_SYNC_SECRET。
 UUID 可选；未设置时安装器会随机生成并保存到 .env。
 
-SERVICE_MODE 可选：auto、systemd、openrc、sysv、rc.local、cron、none。
+SERVICE_MODE 可选：auto、systemd、openrc、sysv、supervisor、rc.local、cron、none。
 auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
 USAGE
 }
@@ -161,6 +164,45 @@ validate_worker_placeholders() {
 }
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
+
+resolve_supervisor_config() {
+  local config
+  if [[ -n "${SUPERVISOR_CONFIG_FILE:-}" && -f "${SUPERVISOR_CONFIG_FILE}" ]]; then
+    printf '%s\n' "${SUPERVISOR_CONFIG_FILE}"
+    return 0
+  fi
+  for config in /etc/supervisor/supervisord.conf /etc/supervisord.conf; do
+    if [[ -f "${config}" ]]; then
+      printf '%s\n' "${config}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_supervisor_conf_dir() {
+  if [[ -n "${SUPERVISOR_CONF_DIR}" && -d "${SUPERVISOR_CONF_DIR}" ]]; then
+    printf '%s\n' "${SUPERVISOR_CONF_DIR}"
+    return 0
+  fi
+  for directory in /etc/supervisor/conf.d /etc/supervisord.d; do
+    if [[ -d "${directory}" ]]; then
+      printf '%s\n' "${directory}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+supervisorctl_exec() {
+  local config_file
+  config_file="$(resolve_supervisor_config 2>/dev/null || true)"
+  if [[ -n "${config_file}" ]]; then
+    supervisorctl -c "${config_file}" "$@"
+  else
+    supervisorctl "$@"
+  fi
+}
 
 install_os_dependencies() {
   log "安装基础依赖：bash、curl、ca-certificates、unzip、Node.js、npm"
@@ -260,6 +302,8 @@ detect_service_backend() {
         SERVICE_BACKEND="openrc"
       elif [[ -d /etc/init.d ]] && (has_command update-rc.d || has_command chkconfig) && has_command runuser && has_command nohup; then
         SERVICE_BACKEND="sysv"
+      elif has_command supervisorctl && has_command supervisord && resolve_supervisor_config >/dev/null 2>&1 && resolve_supervisor_conf_dir >/dev/null 2>&1; then
+        SERVICE_BACKEND="supervisor"
       elif [[ -x /etc/rc.local ]] && has_command runuser && has_command nohup; then
         SERVICE_BACKEND="rc.local"
       elif has_command crontab && (has_command cron || has_command crond) && has_command runuser && has_command nohup; then
@@ -268,7 +312,7 @@ detect_service_backend() {
         SERVICE_BACKEND="none"
       fi
       ;;
-    systemd|openrc|sysv|rc.local|cron|none)
+    systemd|openrc|sysv|supervisor|rc.local|cron|none)
       SERVICE_BACKEND="${requested}"
       ;;
     *) die "SERVICE_MODE 无效：${SERVICE_MODE}（可选 auto、systemd、openrc、sysv、rc.local、cron、none）" ;;
@@ -283,6 +327,13 @@ detect_service_backend() {
       ;;
     sysv)
       [[ -d /etc/init.d ]] && (has_command update-rc.d || has_command chkconfig) && has_command runuser && has_command nohup || die "未找到 SysV init 所需的 /etc/init.d、update-rc.d/chkconfig、runuser 或 nohup"
+      ;;
+    supervisor)
+      has_command supervisorctl && has_command supervisord || die "未找到 supervisorctl 或 supervisord"
+      SUPERVISOR_CONFIG_FILE="$(resolve_supervisor_config 2>/dev/null || true)"
+      SUPERVISOR_CONF_DIR="$(resolve_supervisor_conf_dir 2>/dev/null || true)"
+      [[ -n "${SUPERVISOR_CONFIG_FILE}" ]] || die "未找到 Supervisor 配置文件；可设置 SUPERVISOR_CONFIG_FILE"
+      [[ -n "${SUPERVISOR_CONF_DIR}" ]] || die "未找到 Supervisor 配置目录；可设置 SUPERVISOR_CONF_DIR"
       ;;
     rc.local)
       [[ -x /etc/rc.local ]] && has_command runuser && has_command nohup || die "未找到可执行的 /etc/rc.local、runuser 或 nohup"
@@ -469,12 +520,30 @@ redeem_teamnode_relay_token() {
     })));
   ' >"${request_file}" || die "无法生成 Worker 兑换请求"
 
-  curl -fsS --connect-timeout 10 --max-time 30 \
+  local http_code
+  http_code="$(curl -sS --connect-timeout 10 --max-time 30 \
     -X POST \
     -H "Content-Type: application/json" \
     --data-binary "@${request_file}" \
-    "${TEAMNODE_SYNC_BASE_URL%/}/api/teamnode/redeem" \
-    -o "${response_file}" || die "Worker 兑换中继令牌失败，请检查兑换密码和 Worker 配置"
+    -o "${response_file}" \
+    -w '%{http_code}' \
+    "${TEAMNODE_SYNC_BASE_URL%/}/api/teamnode/redeem" || true)"
+
+  if [[ ! "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
+    local worker_error
+    worker_error="$(TEAMNODE_RESPONSE_FILE="${response_file}" ${NODE_BIN} -e '
+      const fs = require("fs");
+      try {
+        const data = JSON.parse(fs.readFileSync(process.env.TEAMNODE_RESPONSE_FILE, "utf8"));
+        process.stdout.write(String(data.error || ""));
+      } catch {}
+    ' 2>/dev/null || true)"
+    rm -f -- "${request_file}" "${response_file}"
+    if [[ -n "${worker_error}" ]]; then
+      die "Worker 兑换失败（HTTP ${http_code}：${worker_error}），请检查兑换密码和 Worker 配置"
+    fi
+    die "Worker 兑换失败（HTTP ${http_code}），请检查网络和 Worker 配置"
+  fi
 
   TEAMNODE_RESPONSE_FILE="${response_file}" TEAMNODE_SYNC_RELAY_TOKEN="$(${NODE_BIN} -e '
     const fs = require("fs");
@@ -579,6 +648,9 @@ trap stop_runner TERM INT
 set -a
 . "\${ENV_FILE}"
 set +a
+export HOME="${APP_DIR}/home"
+export PM2_HOME="${APP_DIR}/pm2-home"
+cd "\${APP_DIR}/app"
 
 while true; do
   "\${NODE_BIN}" "\${APP_DIR}/app/index.js" >>"\${LOG_FILE}" 2>&1 &
@@ -606,8 +678,7 @@ Type=simple
 User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}/app
-EnvironmentFile=${ENV_FILE}
-ExecStart=${NODE_BIN} ${APP_DIR}/app/index.js
+ExecStart=${RUNNER_SCRIPT}
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
@@ -670,7 +741,7 @@ is_running() {
 
 start() {
   is_running && return 0
-  nohup "\${RUNUSER}" -u "\${SERVICE_USER}" -- "\${DAEMON}" >/dev/null 2>&1 &
+  nohup "\${RUNUSER}" -u "\${SERVICE_USER}" -- "\${DAEMON}" >>"${FILE_PATH}/runner-launcher.log" 2>&1 &
   echo "\$!" >"\${PIDFILE}"
 }
 
@@ -701,11 +772,65 @@ EOF
   chmod 0755 "${SERVICE_FILE}"
 }
 
+write_supervisor_service() {
+  SUPERVISOR_CONF_FILE="${SUPERVISOR_CONF_DIR}/${SERVICE_NAME}.conf"
+  cat >"${SUPERVISOR_CONF_FILE}" <<EOF
+[program:${SERVICE_NAME}]
+command=${RUNNER_SCRIPT}
+directory=${APP_DIR}/app
+user=${SERVICE_USER}
+autostart=true
+autorestart=true
+stopsignal=TERM
+stopasgroup=true
+killasgroup=true
+stdout_logfile=${FILE_PATH}/supervisor-stdout.log
+stderr_logfile=${FILE_PATH}/supervisor-stderr.log
+stdout_logfile_maxbytes=10MB
+stderr_logfile_maxbytes=10MB
+EOF
+  chmod 0644 "${SUPERVISOR_CONF_FILE}"
+}
+
+ensure_supervisor_running() {
+  if supervisorctl_exec pid >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if has_command service; then
+    service supervisor start >/dev/null 2>&1 || service supervisord start >/dev/null 2>&1 || true
+  elif has_command rc-service; then
+    rc-service supervisord start >/dev/null 2>&1 || rc-service supervisor start >/dev/null 2>&1 || true
+  fi
+
+  if ! supervisorctl_exec pid >/dev/null 2>&1; then
+    log "启动 Supervisor 守护进程"
+    nohup supervisord -c "${SUPERVISOR_CONFIG_FILE}" \
+      >>"${FILE_PATH}/supervisord-launcher.log" 2>&1 &
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 0.5
+      supervisorctl_exec pid >/dev/null 2>&1 && return 0
+    done
+  fi
+
+  supervisorctl_exec pid >/dev/null 2>&1 || die "Supervisor 守护进程未运行，请检查 ${SUPERVISOR_CONFIG_FILE}"
+}
+
+start_supervisor_service() {
+  write_supervisor_service
+  ensure_supervisor_running
+  supervisorctl_exec reread >/dev/null
+  supervisorctl_exec update >/dev/null
+  supervisorctl_exec start "${SERVICE_NAME}" >/dev/null 2>&1 || supervisorctl_exec status "${SERVICE_NAME}"
+}
+
 start_background_runner() {
   if [[ -n "${RUNUSER_BIN}" ]]; then
-    nohup "${RUNUSER_BIN}" -u "${SERVICE_USER}" -- "${RUNNER_SCRIPT}" >/dev/null 2>&1 &
+    nohup "${RUNUSER_BIN}" -u "${SERVICE_USER}" -- "${RUNNER_SCRIPT}" \
+      >>"${FILE_PATH}/runner-launcher.log" 2>&1 &
   else
-    nohup "${SU_BIN}" -s "${BASH_BIN}" -c 'exec "$@"' "${SERVICE_USER}" -- "${RUNNER_SCRIPT}" >/dev/null 2>&1 &
+    nohup "${SU_BIN}" -s "${BASH_BIN}" -c 'exec "$@"' "${SERVICE_USER}" -- "${RUNNER_SCRIPT}" \
+      >>"${FILE_PATH}/runner-launcher.log" 2>&1 &
   fi
   printf '%s\n' "$!" >"${PID_FILE}"
 }
@@ -765,15 +890,13 @@ start_pm2_service() {
 
   [[ -x "${PM2_BIN}" ]] || die "PM2 安装完成但未找到可执行文件：${PM2_BIN}"
 
-  set -a
-  . "${ENV_FILE}"
-  set +a
   run_as_service_user env \
     HOME="${APP_DIR}/home" \
     PM2_HOME="${PM2_HOME_DIR}" \
-    "${PM2_BIN}" start "${APP_DIR}/app/index.js" \
+    "${PM2_BIN}" start "${RUNNER_SCRIPT}" \
       --name "${SERVICE_NAME}" \
       --cwd "${APP_DIR}/app" \
+      --interpreter "${BASH_BIN}" \
       --instances 1 \
       --restart-delay 10000 \
       --time \
@@ -783,7 +906,7 @@ start_pm2_service() {
     PM2_HOME="${PM2_HOME_DIR}" \
     "${PM2_BIN}" save --force
 
-  log "PM2 已启动单实例 Node 服务；ARGO 网关端口保持 ${ARGO_PORT}，HTTP 端口保持 ${SERVER_PORT}"
+  log "PM2 已启动单实例运行包装器；ARGO 网关端口保持 ${ARGO_PORT}，HTTP 端口保持 ${SERVER_PORT}"
   log "当前无可靠开机自启机制，重启后仍需通过 init/cron 或手动启动 PM2"
 }
 
@@ -855,9 +978,26 @@ cleanup_owned_port_processes() {
   done
 }
 
+cleanup_owned_processes() {
+  has_command ps || return 0
+
+  local pid
+  while read -r pid; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    (( pid > 1 && pid != $$ )) || continue
+    warn "停止旧安装残留进程：PID ${pid}（$(process_command "${pid}")）"
+    terminate_pid "${pid}"
+  done < <(
+    ps -eo pid=,args= 2>/dev/null |
+      awk -v app="${APP_DIR}" -v self="$$" \
+        '$1 != self && index($0, app) > 0 && $0 ~ /(node|xray|cloudflared|run\.sh)/ { print $1 }' |
+      sort -u
+  )
+}
+
 write_rc_local_service() {
   local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
-  local line="${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} >/dev/null 2>&1 & ${marker}"
+  local line="${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} >>${FILE_PATH}/runner-launcher.log 2>&1 & ${marker}"
   if ! grep -Fq "${marker}" /etc/rc.local 2>/dev/null; then
     local rc_local_tmp="${APP_DIR}.rc.local.tmp"
     awk -v line="${line}" -v marker="${marker}" '
@@ -874,7 +1014,7 @@ write_rc_local_service() {
 
 write_cron_service() {
   local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
-  local line="@reboot ${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} ${marker}"
+  local line="@reboot ${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} >>${FILE_PATH}/runner-launcher.log 2>&1 ${marker}"
   local current_cron
   current_cron="$(crontab -l 2>/dev/null || true)"
   if [[ "${current_cron}" != *"${marker}"* ]]; then
@@ -911,6 +1051,9 @@ start_service() {
       fi
       "${SERVICE_FILE}" start
       ;;
+    supervisor)
+      start_supervisor_service
+      ;;
     rc.local)
       write_rc_local_service
       start_background_runner
@@ -923,6 +1066,31 @@ start_service() {
       start_pm2_service
       ;;
   esac
+}
+
+stop_supervisor_service() {
+  local config_file="${SUPERVISOR_CONF_FILE:-}"
+  local candidate
+
+  if [[ -z "${config_file}" || ! -f "${config_file}" ]]; then
+    for candidate in \
+      "/etc/supervisor/conf.d/${SERVICE_NAME}.conf" \
+      "/etc/supervisord.d/${SERVICE_NAME}.conf"; do
+      if [[ -f "${candidate}" ]]; then
+        config_file="${candidate}"
+        break
+      fi
+    done
+  fi
+
+  if has_command supervisorctl && [[ -n "${config_file}" && -f "${config_file}" ]]; then
+    supervisorctl_exec stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    rm -f -- "${config_file}"
+    supervisorctl_exec reread >/dev/null 2>&1 || true
+    supervisorctl_exec update >/dev/null 2>&1 || true
+    return 0
+  fi
+  [[ -z "${config_file}" ]] || rm -f -- "${config_file}"
 }
 
 uninstall() {
@@ -950,6 +1118,7 @@ uninstall() {
 
   stop_background_runner
   stop_pm2_service
+  stop_supervisor_service
 
   if has_command crontab; then
     local current_cron
@@ -967,6 +1136,7 @@ uninstall() {
     rm -f -- "${rc_local_tmp}"
   fi
 
+  cleanup_owned_processes
   rm -rf -- "${APP_DIR}"
   log "已卸载：${APP_DIR} 和 ${SERVICE_NAME} 的启动配置"
 }
@@ -974,6 +1144,7 @@ uninstall() {
 clean_previous_installation() {
   log "清理旧安装、旧服务和旧进程：${APP_DIR}"
   uninstall
+  cleanup_owned_processes
   cleanup_owned_port_processes
 }
 
@@ -1054,7 +1225,7 @@ main() {
   log "安装完成"
   case "${SERVICE_BACKEND}" in
     systemd) log "查看日志：journalctl -u ${SERVICE_NAME}.service -f" ;;
-    openrc|sysv) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
+    openrc|sysv|supervisor) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
     rc.local|cron) log "查看日志：tail -f ${FILE_PATH}/nodejs-argo.log" ;;
     none) log "查看 PM2：${PM2_BIN} status；查看日志：${PM2_BIN} logs ${SERVICE_NAME}" ;;
   esac
