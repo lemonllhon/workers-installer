@@ -8,6 +8,7 @@ readonly DEFAULT_APP_DIR="/opt/nodejs-argo-no-docker"
 readonly DEFAULT_SERVICE_NAME="nodejs-argo-no-docker"
 readonly DEFAULT_SOURCE_BASE_URL="__WORKER_SOURCE_BASE_URL__"
 readonly DEFAULT_INDEX_SHA256="__WORKER_SOURCE_SHA256__"
+readonly DEFAULT_TEAMNODE_SYNC_BASE_URL="__WORKER_SYNC_BASE_URL__"
 
 readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
@@ -29,8 +30,11 @@ PM2_VERSION="${PM2_VERSION:-${DEFAULT_PM2_VERSION}}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
 FORCE_KILL_PORTS="${FORCE_KILL_PORTS:-false}"
 
-TEAMNODE_SYNC_BASE_URL="${TEAMNODE_SYNC_BASE_URL:-https://teamnode.lemon.vin}"
+TEAMNODE_SYNC_BASE_URL="${TEAMNODE_SYNC_BASE_URL:-${DEFAULT_TEAMNODE_SYNC_BASE_URL}}"
 TEAMNODE_SYNC_KEY_ID="${TEAMNODE_SYNC_KEY_ID:-nodejs-argo-prod}"
+TEAMNODE_SYNC_SECRET="${TEAMNODE_SYNC_SECRET:-}"
+TEAMNODE_SYNC_RELAY_TOKEN="${TEAMNODE_SYNC_RELAY_TOKEN:-}"
+TEAMNODE_SYNC_ENROLL_PASSWORD="${TEAMNODE_SYNC_ENROLL_PASSWORD:-}"
 TEAMNODE_SYNC_GROUP_KEY="${TEAMNODE_SYNC_GROUP_KEY:-basic}"
 TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS="${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS:-300000}"
 TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT="${TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT:-true}"
@@ -75,8 +79,10 @@ usage() {
   install.sh --app-dir /opt/example   覆盖安装目录
   install.sh --service-mode auto      自动选择 systemd/OpenRC/SysV/cron
 
-所有密钥通过环境变量传入，不写入脚本：
-  TEAMNODE_SYNC_SECRET、ARGO_AUTH、ARGO_DOMAIN
+ARGO_AUTH、ARGO_DOMAIN 通过环境变量传入，不写入脚本。
+默认使用 Worker 代理 TeamNode；客户端不保存 TEAMNODE_SYNC_SECRET。可直接设置 TEAMNODE_SYNC_RELAY_TOKEN，或安装时输入兑换密码自动获取。
+如果未设置 TEAMNODE_SYNC_RELAY_TOKEN，安装时会交互式询问兑换密码，从 Worker 获取中继令牌；兑换密码不会写入 .env。
+如明确直连 TeamNode，才设置 TEAMNODE_SYNC_BASE_URL 和 TEAMNODE_SYNC_SECRET。
 UUID 可选；未设置时安装器会随机生成并保存到 .env。
 
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、rc.local、cron、none。
@@ -111,9 +117,16 @@ require_root() {
 }
 
 require_config() {
-  [[ -n "${TEAMNODE_SYNC_SECRET:-}" ]] || die "必须设置 TEAMNODE_SYNC_SECRET"
   [[ -n "${ARGO_DOMAIN:-}" ]] || die "必须设置 ARGO_DOMAIN"
   [[ -n "${ARGO_AUTH:-}" ]] || die "必须设置 ARGO_AUTH"
+  if is_true "${TEAMNODE_SYNC_ENABLED}"; then
+    if [[ -n "${TEAMNODE_SYNC_SECRET}" && -n "${TEAMNODE_SYNC_RELAY_TOKEN}" ]]; then
+      die "不要同时设置 TEAMNODE_SYNC_SECRET 和 TEAMNODE_SYNC_RELAY_TOKEN；Worker 代理模式只设置中继令牌"
+    fi
+    if [[ -n "${TEAMNODE_SYNC_SECRET}" && "${TEAMNODE_SYNC_BASE_URL}" == "${DEFAULT_TEAMNODE_SYNC_BASE_URL}" ]]; then
+      die "直连 TeamNode 时必须同时设置 TEAMNODE_SYNC_BASE_URL；不要把主密钥发送到 Worker"
+    fi
+  fi
 }
 
 validate_uuid() {
@@ -142,6 +155,9 @@ generate_uuid_if_missing() {
 validate_worker_placeholders() {
   [[ "${SOURCE_BASE_URL}" != "__WORKER_SOURCE_BASE_URL__" ]] || die "安装脚本源码地址占位符未替换；请从 https://install.lemon.vin/install.sh 下载"
   [[ "${SOURCE_INDEX_SHA256}" != "__WORKER_SOURCE_SHA256__" ]] || die "安装脚本源码 SHA256 占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
+  if [[ "${TEAMNODE_SYNC_BASE_URL}" == "__WORKER_SYNC_BASE_URL__" ]]; then
+    die "TeamNode Worker 地址占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
+  fi
 }
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
@@ -425,6 +441,54 @@ write_env_value() {
   printf '%s=%q\n' "${key}" "${value}" >> "${ENV_FILE}"
 }
 
+redeem_teamnode_relay_token() {
+  if ! is_true "${TEAMNODE_SYNC_ENABLED}" || [[ -n "${TEAMNODE_SYNC_SECRET}" || -n "${TEAMNODE_SYNC_RELAY_TOKEN}" ]]; then
+    return 0
+  fi
+
+  local password="${TEAMNODE_SYNC_ENROLL_PASSWORD:-}"
+  if [[ -z "${password}" ]]; then
+    if [[ ! -t 0 || ! -t 1 ]]; then
+      die "未设置 TEAMNODE_SYNC_RELAY_TOKEN，且当前不是交互终端；请设置 TEAMNODE_SYNC_ENROLL_PASSWORD，或先手动兑换中继令牌"
+    fi
+    printf '请输入 Worker TeamNode 兑换密码：' >&2
+    IFS= read -r -s password
+    printf '\n' >&2
+  fi
+  [[ -n "${password}" ]] || die "兑换密码不能为空"
+
+  local request_file="${TMP_DIR}/teamnode-enroll-request.json"
+  local response_file="${TMP_DIR}/teamnode-enroll-response.json"
+  printf '%s' "${password}" | TEAMNODE_ENROLL_UUID="${UUID}" "${NODE_BIN}" -e '
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => process.stdout.write(JSON.stringify({
+      password: input,
+      uuid: process.env.TEAMNODE_ENROLL_UUID
+    })));
+  ' >"${request_file}" || die "无法生成 Worker 兑换请求"
+
+  curl -fsS --connect-timeout 10 --max-time 30 \
+    -X POST \
+    -H "Content-Type: application/json" \
+    --data-binary "@${request_file}" \
+    "${TEAMNODE_SYNC_BASE_URL%/}/api/teamnode/redeem" \
+    -o "${response_file}" || die "Worker 兑换中继令牌失败，请检查兑换密码和 Worker 配置"
+
+  TEAMNODE_RESPONSE_FILE="${response_file}" TEAMNODE_SYNC_RELAY_TOKEN="$(${NODE_BIN} -e '
+    const fs = require("fs");
+    const data = JSON.parse(fs.readFileSync(process.env.TEAMNODE_RESPONSE_FILE, "utf8"));
+    const token = String(data.relayToken || "").trim();
+    if (!token) process.exit(1);
+    process.stdout.write(token);
+  ')" || die "Worker 返回的中继令牌无效"
+
+  unset password TEAMNODE_SYNC_ENROLL_PASSWORD
+  rm -f -- "${request_file}" "${response_file}"
+  log "已通过 Worker 兑换 TeamNode 中继令牌（兑换密码未写入 .env）"
+}
+
 write_runtime_files() {
   log "下载并校验固定版本的 nodejs-argo 源码"
   download_verified "${SOURCE_BASE_URL%/}/index.js" "${APP_DIR}/app/index.js" "${SOURCE_INDEX_SHA256}" "nodejs-argo index.js"
@@ -475,6 +539,7 @@ write_env_file() {
   write_env_value "TEAMNODE_SYNC_BASE_URL" "${TEAMNODE_SYNC_BASE_URL}"
   write_env_value "TEAMNODE_SYNC_KEY_ID" "${TEAMNODE_SYNC_KEY_ID}"
   write_env_value "TEAMNODE_SYNC_SECRET" "${TEAMNODE_SYNC_SECRET}"
+  write_env_value "TEAMNODE_SYNC_RELAY_TOKEN" "${TEAMNODE_SYNC_RELAY_TOKEN}"
   write_env_value "TEAMNODE_SYNC_GROUP_KEY" "${TEAMNODE_SYNC_GROUP_KEY}"
   write_env_value "TEAMNODE_SYNC_PROVIDER" "${TEAMNODE_SYNC_PROVIDER:-}"
   write_env_value "TEAMNODE_SYNC_LABEL_PREFIX" "${TEAMNODE_SYNC_LABEL_PREFIX:-}"
@@ -963,6 +1028,7 @@ main() {
 
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf -- "${TMP_DIR}"' EXIT
+  redeem_teamnode_relay_token
 
   install -d -m 0750 "${APP_DIR}" "${APP_DIR}/app" "${BIN_PATH}" "${FILE_PATH}"
   create_service_user

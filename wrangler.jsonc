@@ -1,9 +1,24 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "nodejs-argo-installer",
+  "name": "workers-installer",
   "main": "src/index.js",
   "compatibility_date": "2026-07-28",
   "workers_dev": true,
+  "keep_vars": true,
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "NODE_REGISTRY",
+        "class_name": "NodeRegistry"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["NodeRegistry"]
+    }
+  ],
   "assets": {
     "directory": "./public",
     "binding": "ASSETS",

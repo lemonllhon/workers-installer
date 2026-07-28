@@ -61,6 +61,7 @@ const NAME = process.env.NAME || ""; // 节点名称前缀
 const TEAMNODE_SYNC_BASE_URL = process.env.TEAMNODE_SYNC_BASE_URL || "https://teamnode.lemon.vin";
 const TEAMNODE_SYNC_KEY_ID = process.env.TEAMNODE_SYNC_KEY_ID || "nodejs-argo-prod";
 const TEAMNODE_SYNC_SECRET = process.env.TEAMNODE_SYNC_SECRET || "";
+const TEAMNODE_SYNC_RELAY_TOKEN = process.env.TEAMNODE_SYNC_RELAY_TOKEN || "";
 const TEAMNODE_SYNC_GROUP_KEY = process.env.TEAMNODE_SYNC_GROUP_KEY || "basic";
 const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "";
 const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
@@ -144,7 +145,7 @@ function parseBoolean(value, fallback = false) {
 
 const TEAMNODE_SYNC_ENABLED = parseBoolean(
   process.env.TEAMNODE_SYNC_ENABLED,
-  Boolean(TEAMNODE_SYNC_SECRET)
+  Boolean(TEAMNODE_SYNC_SECRET || TEAMNODE_SYNC_RELAY_TOKEN)
 );
 
 function normalizeBaseUrl(value) {
@@ -186,10 +187,12 @@ function createTeamNodeSyncHeaders({ method = "GET", path: requestPath = "/", ra
     nonce,
     eventId
   ].join("\n");
-  const signature = crypto
-    .createHmac("sha256", String(TEAMNODE_SYNC_SECRET || ""))
-    .update(signaturePayload, "utf8")
-    .digest("hex");
+  const signature = TEAMNODE_SYNC_SECRET
+    ? crypto
+      .createHmac("sha256", String(TEAMNODE_SYNC_SECRET))
+      .update(signaturePayload, "utf8")
+      .digest("hex")
+    : "";
 
   return {
     eventId,
@@ -201,7 +204,10 @@ function createTeamNodeSyncHeaders({ method = "GET", path: requestPath = "/", ra
       "x-sync-timestamp": timestamp,
       "x-sync-nonce": nonce,
       "x-event-id": eventId,
-      "x-sync-signature": signature
+      ...(signature ? { "x-sync-signature": signature } : {}),
+      ...(TEAMNODE_SYNC_RELAY_TOKEN
+        ? { "x-teamnode-sync-relay-token": TEAMNODE_SYNC_RELAY_TOKEN }
+        : {})
     }
   };
 }
@@ -211,7 +217,7 @@ function isTeamNodeSyncConfigured() {
     TEAMNODE_SYNC_ENABLED
     && normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL)
     && TEAMNODE_SYNC_KEY_ID
-    && TEAMNODE_SYNC_SECRET
+    && (TEAMNODE_SYNC_SECRET || TEAMNODE_SYNC_RELAY_TOKEN)
   );
 }
 
@@ -1745,7 +1751,8 @@ async function AddVisitTask() {
 async function startserver() {
   try {
     console.log(`启动配置：ARGO_DOMAIN=${ARGO_DOMAIN || "(empty)"}，ARGO_PORT=${ARGO_PORT}，SERVER_PORT=${PORT}`);
-    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，密钥${TEAMNODE_SYNC_SECRET ? "已配置" : "未配置"}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
+    const teamNodeMode = TEAMNODE_SYNC_SECRET ? "直连" : TEAMNODE_SYNC_RELAY_TOKEN ? "Worker 代理" : "未配置";
+    console.log(`Cloudflare Tunnel：${ARGO_AUTH ? "已配置认证" : "临时隧道"}；TeamNode：${TEAMNODE_SYNC_ENABLED ? "已启用" : "未启用"}，模式=${teamNodeMode}，心跳间隔 ${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}ms`);
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();
