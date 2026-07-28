@@ -143,6 +143,7 @@ async function recordNodeEvent(request, env, payload, eventPath) {
     provider: String(payload?.provider || "").slice(0, 64),
     countryCode: String(payload?.countryCode || "").slice(0, 16),
     countryName: String(payload?.countryName || "").slice(0, 128),
+    timezone: String(payload?.timezone || "").slice(0, 64),
     runtimeStatus: String(payload?.runtimeStatus || "").slice(0, 32),
     runtimeInfo: normalizeRuntimeInfo(payload?.runtimeInfo),
     contentIncluded: Boolean(payload?.contentBase64),
@@ -260,6 +261,61 @@ function dashboardTime(value) {
   return new Date(timestamp).toISOString();
 }
 
+function validTimeZone(value) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return "UTC";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: candidate }).format();
+    return candidate;
+  } catch {
+    return "UTC";
+  }
+}
+
+function timeParts(value, timeZone) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    hourCycle: "h23"
+  }).formatToParts(new Date(timestamp));
+  const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return {
+    year: values.year,
+    month: values.month,
+    day: values.day,
+    clock: `${values.hour}:${values.minute}:${values.second}`
+  };
+}
+
+function heartbeatTimeMarkup(node, value) {
+  const china = timeParts(value, "Asia/Shanghai");
+  const localZone = validTimeZone(node?.timezone);
+  const local = timeParts(value, localZone);
+  if (!china || !local) {
+    return `<span>最后心跳</span><strong>${htmlEscape(dashboardTime(value))}</strong>`;
+  }
+
+  const sameYear = china.year === local.year;
+  const sameYearMonth = sameYear && china.month === local.month;
+  const sharedPrefix = sameYearMonth ? `${china.year}-${china.month}` : sameYear ? china.year : "";
+  const chinaText = sameYearMonth
+    ? `${china.day} ${china.clock}`
+    : sameYear ? `${china.month}-${china.day} ${china.clock}` : `${china.year}-${china.month}-${china.day} ${china.clock}`;
+  const localText = sameYearMonth
+    ? `${local.day} ${local.clock}`
+    : sameYear ? `${local.month}-${local.day} ${local.clock}` : `${local.year}-${local.month}-${local.day} ${local.clock}`;
+  const sharedMarkup = sharedPrefix ? `<span class="node-time-shared">${htmlEscape(sharedPrefix)}</span>` : "";
+  return `<span>最后心跳</span><div class="node-time-pair" title="中国时区：Asia/Shanghai；当地时区：${htmlEscape(localZone)}">${sharedMarkup}<span><b>中国</b> ${htmlEscape(chinaText)}</span><span><b>当地</b> ${htmlEscape(localText)} <small>${htmlEscape(localZone)}</small></span></div>`;
+}
+
 function heartbeatHistoryValues(node) {
   return (Array.isArray(node?.heartbeatHistory) ? node.heartbeatHistory : [])
     .map((value) => Number(value))
@@ -335,7 +391,7 @@ async function dashboardPageResponse(request, env) {
               <span class="badge ${node.online ? "online" : "offline"}">${node.online ? "在线" : node.status === "offline" ? "已下线" : "超时"}</span>
               <div class="node-title"><strong>${htmlEscape(node.label || "未命名节点")}</strong><span>${htmlEscape(node.argoDomain || "-")}</span></div>
             </div>
-            <div class="node-last-seen">最后心跳<br><strong>${htmlEscape(dashboardTime(node.lastSeen || node.lastEventAt))}</strong></div>
+            <div class="node-last-seen">${heartbeatTimeMarkup(node, node.lastSeen || node.lastEventAt)}</div>
           </div>
           <div class="heartbeat-strip${node.online ? " heartbeat-active" : ""}" aria-label="最近心跳记录">${heartbeatSegments(node)}</div>
           <div class="heartbeat-scale"><span>现在</span><span>${ttlMinutes} 分钟前</span></div>
@@ -397,9 +453,14 @@ async function dashboardPageResponse(request, env) {
     .node-toolbar { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
     .filter-search { display: flex; align-items: center; flex: 1 1 320px; gap: 8px; min-width: 0; padding: 9px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; color: var(--muted); }
     .filter-search span { font-size: 16px; line-height: 1; }
-    .filter-search input, .node-toolbar select { min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
+    .filter-search input { min-width: 0; border: 0; outline: 0; background: transparent; color: var(--ink); font: inherit; font-size: 13px; }
     .filter-search input { width: 100%; }
-    .node-toolbar select { flex: 0 0 110px; padding: 9px 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+    .filter-status { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; padding: 3px; background: #f5f6f7; border: 1px solid var(--line); border-radius: 9px; }
+    .filter-status-option { padding: 7px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 12px; font-weight: 600; white-space: nowrap; }
+    .filter-status-option:hover { color: var(--ink); }
+    .filter-status-option[aria-pressed="true"] { background: var(--surface); box-shadow: 0 1px 3px rgba(32, 33, 36, .12); color: var(--ink); }
+    .filter-status-option[data-status="online"][aria-pressed="true"] { color: var(--green); }
+    .filter-status-option[data-status="timedOut"][aria-pressed="true"] { color: var(--amber); }
     .filter-clear { padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; }
     .filter-clear:hover { color: var(--ink); border-color: #c5cad1; }
     .filter-result { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
@@ -423,7 +484,12 @@ async function dashboardPageResponse(request, env) {
     .node-title { display: grid; min-width: 0; gap: 4px; }
     .node-title strong { overflow-wrap: anywhere; font-size: 15px; line-height: 1.35; }
     .node-title span { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
-    .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: right; }
+    .node-last-seen { flex: 0 0 auto; color: var(--muted); font-size: 11px; line-height: 1.45; text-align: right; }
+    .node-last-seen > span { display: block; }
+    .node-time-pair { display: grid; gap: 1px; margin-top: 2px; color: var(--ink); font-size: 11px; font-weight: 600; }
+    .node-time-pair b { margin-right: 3px; color: var(--muted); font-size: 10px; font-weight: 700; }
+    .node-time-pair small { margin-left: 2px; color: var(--muted); font-size: 9px; font-weight: 500; }
+    .node-time-shared { color: var(--muted); font-size: 10px; font-weight: 600; }
     .node-last-seen strong { color: var(--ink); font-size: 13px; font-weight: 600; }
     .heartbeat-strip { position: relative; display: grid; grid-template-columns: repeat(72, minmax(2px, 1fr)); align-items: end; gap: 3px; height: 24px; margin-top: 11px; overflow: hidden; isolation: isolate; }
     .heartbeat-strip.heartbeat-active::after { position: absolute; z-index: 2; top: -5px; bottom: -5px; left: -24%; width: 22%; content: ""; pointer-events: none; background: linear-gradient(90deg, transparent, rgba(239, 255, 246, .14) 28%, rgba(255, 255, 255, .78) 50%, rgba(239, 255, 246, .14) 72%, transparent); filter: blur(2px); animation: heartbeat-charge 3.8s linear infinite; }
@@ -463,7 +529,8 @@ async function dashboardPageResponse(request, env) {
       .heartbeat-strip { gap: 2px; }
       .node-toolbar { align-items: stretch; flex-wrap: wrap; }
       .filter-search { flex-basis: 100%; }
-      .node-toolbar select { flex: 1 1 0; }
+      .filter-status { flex: 1 1 auto; }
+      .filter-status-option { flex: 1 1 0; }
       .filter-result { align-self: center; }
     }
     @media (prefers-reduced-motion: reduce) {
@@ -518,11 +585,11 @@ async function dashboardPageResponse(request, env) {
           <span aria-hidden="true">⌕</span>
           <input id="node-filter-search" type="search" placeholder="搜索名称、IP、域名、系统或架构" autocomplete="off">
         </label>
-        <select id="node-filter-status" aria-label="状态筛选">
-          <option value="all">全部状态</option>
-          <option value="online">在线</option>
-          <option value="timedOut">超时</option>
-        </select>
+        <div id="node-filter-status" class="filter-status" role="group" aria-label="状态筛选">
+          <button class="filter-status-option" type="button" data-status="all" aria-pressed="true">全部</button>
+          <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
+          <button class="filter-status-option" type="button" data-status="timedOut" aria-pressed="false">超时</button>
+        </div>
         <button id="node-filter-clear" class="filter-clear" type="button" hidden>清除</button>
         <span id="node-filter-result" class="filter-result"></span>
       </div>
@@ -552,6 +619,7 @@ async function dashboardPageResponse(request, env) {
       const statusElement = document.getElementById("dashboard-status");
       let refreshing = false;
       let currentNodes = [];
+      let selectedStatus = "all";
 
       function escapeHtml(value) {
         const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
@@ -562,6 +630,64 @@ async function dashboardPageResponse(request, env) {
         const timestamp = Number(value);
         if (!Number.isFinite(timestamp) || timestamp <= 0) return "-";
         return new Date(timestamp).toLocaleString("zh-CN", { hour12: false });
+      }
+
+      function formatTimeParts(value, timeZone) {
+        const timestamp = Number(value);
+        if (!Number.isFinite(timestamp) || timestamp <= 0) return null;
+        try {
+          const parts = new Intl.DateTimeFormat("en-US", {
+            timeZone,
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            hour12: false,
+            hourCycle: "h23"
+          }).formatToParts(new Date(timestamp));
+          const values = Object.fromEntries(parts.filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+          return {
+            year: values.year,
+            month: values.month,
+            day: values.day,
+            clock: values.hour + ":" + values.minute + ":" + values.second
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      function renderNodeTimePair(node, value) {
+        const china = formatTimeParts(value, "Asia/Shanghai");
+        const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+        const requestedZone = String(node?.timezone || "").trim();
+        let localZone = browserZone;
+        if (requestedZone && formatTimeParts(value, requestedZone)) {
+          localZone = requestedZone;
+        }
+        const local = formatTimeParts(value, localZone);
+        if (!china || !local) {
+          return "<span>最后心跳</span><strong>" + escapeHtml(formatTime(value)) + "</strong>";
+        }
+
+        const sameYear = china.year === local.year;
+        const sameYearMonth = sameYear && china.month === local.month;
+        const sharedPrefix = sameYearMonth ? china.year + "-" + china.month : sameYear ? china.year : "";
+        const chinaText = sameYearMonth
+          ? china.day + " " + china.clock
+          : sameYear ? china.month + "-" + china.day + " " + china.clock : china.year + "-" + china.month + "-" + china.day + " " + china.clock;
+        const localText = sameYearMonth
+          ? local.day + " " + local.clock
+          : sameYear ? local.month + "-" + local.day + " " + local.clock : local.year + "-" + local.month + "-" + local.day + " " + local.clock;
+        const sharedMarkup = sharedPrefix ? "<span class=\"node-time-shared\">" + escapeHtml(sharedPrefix) + "</span>" : "";
+        const localLabel = requestedZone ? "当地" : "本地";
+        return "<span>最后心跳</span><div class=\"node-time-pair\" title=\"中国时区：Asia/Shanghai；当地时区：" + escapeHtml(localZone) + "\">"
+          + sharedMarkup
+          + "<span><b>中国</b> " + escapeHtml(chinaText) + "</span>"
+          + "<span><b>" + localLabel + "</b> " + escapeHtml(localText) + " <small>" + escapeHtml(localZone) + "</small></span>"
+          + "</div>";
       }
 
       function renderHeartbeatSegments(node) {
@@ -604,19 +730,25 @@ async function dashboardPageResponse(request, env) {
         ].filter(Boolean).join(" ").toLowerCase();
       }
 
+      function setStatusFilter(status) {
+        selectedStatus = ["all", "online", "timedOut"].includes(status) ? status : "all";
+        filterStatusElement.querySelectorAll("[data-status]").forEach((button) => {
+          button.setAttribute("aria-pressed", String(button.dataset.status === selectedStatus));
+        });
+      }
+
       function filteredNodes() {
         const query = filterSearchElement.value.trim().toLowerCase();
-        const status = filterStatusElement.value;
         return currentNodes.filter((node) => {
-          if (status === "online" && !node.online) return false;
-          if (status === "timedOut" && !node.timedOut) return false;
+          if (selectedStatus === "online" && !node.online) return false;
+          if (selectedStatus === "timedOut" && !node.timedOut) return false;
           return !query || nodeSearchText(node).includes(query);
         });
       }
 
       function renderFilteredNodes() {
         const nodes = filteredNodes();
-        const hasFilter = Boolean(filterSearchElement.value.trim()) || filterStatusElement.value !== "all";
+        const hasFilter = Boolean(filterSearchElement.value.trim()) || selectedStatus !== "all";
         rowsElement.innerHTML = renderRows(nodes);
         filterClearElement.hidden = !hasFilter;
         filterResultElement.textContent = hasFilter
@@ -632,13 +764,12 @@ async function dashboardPageResponse(request, env) {
         return nodes.map((node) => {
           const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
           const statusClass = node.online ? "online" : "offline";
-          const heartbeatTime = escapeHtml(formatTime(node.lastSeen || node.lastEventAt));
           const runtime = runtimeSummary(node);
           return "<article class=\"node-row\">"
             + "<div class=\"node-row-header\"><div class=\"node-identity\">"
             + "<span class=\"badge " + statusClass + "\">" + status + "</span>"
             + "<div class=\"node-title\"><strong>" + escapeHtml(node.label || "未命名节点") + "</strong><span>" + escapeHtml(node.argoDomain || "-") + "</span></div>"
-            + "</div><div class=\"node-last-seen\">最后心跳<br><strong>" + heartbeatTime + "</strong></div></div>"
+            + "</div><div class=\"node-last-seen\">" + renderNodeTimePair(node, node.lastSeen || node.lastEventAt) + "</div></div>"
             + "<div class=\"heartbeat-strip" + (node.online ? " heartbeat-active" : "") + "\" aria-label=\"最近心跳记录\">" + renderHeartbeatSegments(node) + "</div>"
             + "<div class=\"heartbeat-scale\"><span>现在</span><span>" + Math.max(1, Math.round(Number(window.__onlineTtlMs || 600000) / 60000)) + " 分钟前</span></div>"
             + "<div class=\"node-fields\">"
@@ -706,10 +837,15 @@ async function dashboardPageResponse(request, env) {
       }
 
       filterSearchElement.addEventListener("input", renderFilteredNodes);
-      filterStatusElement.addEventListener("change", renderFilteredNodes);
+      filterStatusElement.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-status]");
+        if (!button) return;
+        setStatusFilter(button.dataset.status);
+        renderFilteredNodes();
+      });
       filterClearElement.addEventListener("click", () => {
         filterSearchElement.value = "";
-        filterStatusElement.value = "all";
+        setStatusFilter("all");
         renderFilteredNodes();
         filterSearchElement.focus();
       });

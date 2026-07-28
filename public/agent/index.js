@@ -446,6 +446,7 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
     countryCode: context.meta?.countryCode || null,
     countryName: context.meta?.countryName || null,
     ispName: context.meta?.ispName || null,
+    timezone: context.ipRisk?.location?.timezone || context.meta?.timezone || null,
     runtimeInfo: getRuntimeInfo(),
     bootId: bootInstanceId,
     metadata: {
@@ -1497,6 +1498,7 @@ async function getMetaInfo() {
         countryCode: String(response1.data.country_code || "").trim() || "Unknown",
         countryName: String(response1.data.country || "").trim() || null,
         ispName: String(response1.data.isp || "").trim() || "Unknown",
+        timezone: String(response1.data.timezone || "").trim() || null,
         display: `${response1.data.country_code}-${response1.data.isp}`.replace(/\s+/g, "_")
       };
     }
@@ -1512,6 +1514,7 @@ async function getMetaInfo() {
           countryCode: String(response2.data.countryCode || "").trim() || "Unknown",
           countryName: String(response2.data.country || "").trim() || null,
           ispName: String(response2.data.org || "").trim() || "Unknown",
+          timezone: String(response2.data.timezone || "").trim() || null,
           display: `${response2.data.countryCode}-${response2.data.org}`.replace(/\s+/g, "_")
         };
       }
@@ -1520,6 +1523,7 @@ async function getMetaInfo() {
         countryCode: "Unknown",
         countryName: null,
         ispName: "Unknown",
+        timezone: null,
         display: "Unknown"
       };
     }
@@ -1529,6 +1533,7 @@ async function getMetaInfo() {
     countryCode: "Unknown",
     countryName: null,
     ispName: "Unknown",
+    timezone: null,
     display: "Unknown"
   };
 }
