@@ -65,6 +65,8 @@ PM2_HOME_DIR=""
 PM2_BIN=""
 RUN_AS_ROOT=false
 TMP_DIR=""
+STAGE_CURRENT=0
+readonly STAGE_TOTAL=10
 
 UNINSTALL=false
 DRY_RUN=false
@@ -72,6 +74,10 @@ DRY_RUN=false
 log() { printf '[%s] %s\n' "${SCRIPT_NAME}" "$*"; }
 warn() { printf '[%s] WARNING: %s\n' "${SCRIPT_NAME}" "$*" >&2; }
 die() { printf '[%s] ERROR: %s\n' "${SCRIPT_NAME}" "$*" >&2; exit 1; }
+stage() {
+  STAGE_CURRENT=$((STAGE_CURRENT + 1))
+  log "阶段 ${STAGE_CURRENT}/${STAGE_TOTAL}：$*"
+}
 
 usage() {
   cat <<'USAGE'
@@ -402,9 +408,16 @@ download_verified() {
   local temporary="${TMP_DIR}/$(basename "${destination}").download"
 
   log "下载 ${label}"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300 \
-    --output "${temporary}" "${url}"
+  local curl_options=(
+    --fail --show-error --location --proto '=https' --tlsv1.2
+    --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 300
+  )
+  if [[ -t 1 && -t 2 && -z "${CI:-}" ]]; then
+    curl_options+=(--progress-bar)
+  else
+    curl_options+=(--silent)
+  fi
+  curl "${curl_options[@]}" --output "${temporary}" "${url}"
 
   if [[ -n "${expected_sha256}" ]]; then
     expected_sha256="${expected_sha256,,}"
@@ -419,6 +432,7 @@ download_verified() {
   fi
 
   install -m 0644 "${temporary}" "${destination}"
+  log "完成 ${label}"
 }
 
 install_cloudflared() {
@@ -1104,6 +1118,35 @@ start_service() {
   esac
 }
 
+port_is_listening() {
+  local port="$1"
+  ss -lntH 2>/dev/null |
+    awk -v suffix=":${port}" '$4 ~ suffix "$" { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+verify_runtime() {
+  local server_ready=false
+  local argo_ready=false
+
+  log "运行检查：等待 HTTP ${SERVER_PORT} 和 ARGO ${ARGO_PORT} 端口监听（最多 30 秒）"
+  for _ in 1 2 3 4 5 6 7 8 9 10 \
+    11 12 13 14 15 16 17 18 19 20 \
+    21 22 23 24 25 26 27 28 29 30; do
+    port_is_listening "${SERVER_PORT}" && server_ready=true
+    port_is_listening "${ARGO_PORT}" && argo_ready=true
+    if [[ "${server_ready}" = true && "${argo_ready}" = true ]]; then
+      log "运行检查通过：HTTP ${SERVER_PORT}、ARGO ${ARGO_PORT} 均已监听"
+      return 0
+    fi
+    sleep 1
+  done
+
+  [[ "${server_ready}" = true ]] || warn "HTTP ${SERVER_PORT} 未监听"
+  [[ "${argo_ready}" = true ]] || warn "ARGO ${ARGO_PORT} 未监听"
+  warn "请查看运行日志：${FILE_PATH}/nodejs-argo.log"
+  die "程序未正常启动；安装已中止，请先修复日志中的错误"
+}
+
 stop_supervisor_service() {
   local config_file="${SUPERVISOR_CONF_FILE:-}"
   local candidate
@@ -1207,6 +1250,7 @@ parse_args() {
 main() {
   parse_args "$@"
   resolve_source_checksum
+  stage "检查安装参数和源码校验"
   validate_app_dir
   if is_true "${UNINSTALL}"; then
     uninstall
@@ -1237,10 +1281,12 @@ main() {
     return 0
   fi
 
+  stage "清理旧安装和占用端口"
   clean_previous_installation
 
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf -- "${TMP_DIR}"' EXIT
+  stage "兑换 TeamNode 中继令牌"
   redeem_teamnode_relay_token
 
   install -d -m 0750 "${APP_DIR}" "${APP_DIR}/app" "${BIN_PATH}" "${FILE_PATH}"
@@ -1253,16 +1299,25 @@ main() {
     *) die "不支持的系统架构：$(uname -m)" ;;
   esac
 
+  stage "安装 Cloudflare Tunnel"
   install_cloudflared "${machine_arch}"
+  stage "安装 Xray"
   install_xray "${machine_arch}"
+  stage "下载并校验节点应用"
   write_runtime_files
+  stage "写入环境变量和启动配置"
   write_env_file
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"
   chmod 0600 "${ENV_FILE}"
   write_runner_script
+  stage "启动节点和 Cloudflare Tunnel"
   start_service
 
+  stage "验证节点运行状态"
+  verify_runtime
+
+  stage "安装完成"
   log "安装完成"
   case "${SERVICE_BACKEND}" in
     systemd) log "查看日志：journalctl -u ${SERVICE_NAME}.service -f" ;;
