@@ -7,7 +7,7 @@ readonly SCRIPT_NAME="nodejs-argo-no-docker-installer"
 readonly DEFAULT_APP_DIR="/opt/nodejs-argo-no-docker"
 readonly DEFAULT_SERVICE_NAME="nodejs-argo-no-docker"
 readonly DEFAULT_SOURCE_BASE_URL="__WORKER_SOURCE_BASE_URL__"
-readonly DEFAULT_INDEX_SHA256="C806E53F7C7DAF1B66DF2D380B6253EC5E4A5C17E0B8A0F5B976693061751891"
+readonly DEFAULT_INDEX_SHA256="__WORKER_SOURCE_SHA256__"
 
 readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
@@ -113,6 +113,11 @@ require_config() {
   [[ -n "${ARGO_DOMAIN:-}" ]] || die "必须设置 ARGO_DOMAIN"
   [[ -n "${ARGO_AUTH:-}" ]] || die "必须设置 ARGO_AUTH"
   [[ -n "${UUID:-}" ]] || die "必须设置 UUID"
+}
+
+validate_worker_placeholders() {
+  [[ "${SOURCE_BASE_URL}" != "__WORKER_SOURCE_BASE_URL__" ]] || die "安装脚本源码地址占位符未替换；请从 https://install.lemon.vin/install.sh 下载"
+  [[ "${SOURCE_INDEX_SHA256}" != "__WORKER_SOURCE_SHA256__" ]] || die "安装脚本源码 SHA256 占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
 }
 
 has_command() { command -v "$1" >/dev/null 2>&1; }
@@ -834,6 +839,7 @@ main() {
 
   require_root
   require_config
+  validate_worker_placeholders
   check_dependencies
   NODE_BIN="$(command -v node)"
   NPM_BIN="$(command -v npm)"

@@ -28,6 +28,8 @@ https://你的-worker.workers.dev/install.sh
 
 Worker 只返回静态脚本，不保存 `ARGO_AUTH` 或 `TEAMNODE_SYNC_SECRET`。
 
+Worker 返回 `install.sh` 时会根据当前 `/agent/index.js` 的实际字节动态计算并注入 `DEFAULT_INDEX_SHA256`，因此源码更新或换行格式变化后不需要手工修改 SHA256。请始终从 Worker 地址下载安装器；直接使用 GitHub 原始 `public/install.sh` 时，源码地址和 SHA 占位符不会被注入。
+
 ## 2. 在无 Docker 的 Linux 机器安装
 
 建议先通过文件或安全的环境注入方式设置变量，再执行安装器。不要把密钥提交到仓库：
