@@ -27,6 +27,7 @@ XRAY_VERSION="${XRAY_VERSION:-${DEFAULT_XRAY_VERSION}}"
 NEZHA_VERSION="${NEZHA_VERSION:-${DEFAULT_NEZHA_VERSION}}"
 PM2_VERSION="${PM2_VERSION:-${DEFAULT_PM2_VERSION}}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
+FORCE_KILL_PORTS="${FORCE_KILL_PORTS:-false}"
 
 TEAMNODE_SYNC_BASE_URL="${TEAMNODE_SYNC_BASE_URL:-https://teamnode.lemon.vin}"
 TEAMNODE_SYNC_KEY_ID="${TEAMNODE_SYNC_KEY_ID:-nodejs-argo-prod}"
@@ -127,15 +128,15 @@ install_os_dependencies() {
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq bash ca-certificates curl coreutils passwd unzip util-linux nodejs npm >/dev/null
+    apt-get install -y -qq bash ca-certificates curl coreutils iproute2 passwd unzip util-linux nodejs npm >/dev/null
   elif has_command apk; then
-    apk add --no-cache bash ca-certificates curl coreutils unzip util-linux nodejs npm >/dev/null
+    apk add --no-cache bash ca-certificates curl coreutils iproute2 unzip util-linux nodejs npm >/dev/null
   elif has_command dnf; then
-    dnf install -y bash ca-certificates curl coreutils unzip util-linux nodejs npm shadow-utils >/dev/null
+    dnf install -y bash ca-certificates curl coreutils iproute unzip util-linux nodejs npm shadow-utils >/dev/null
   elif has_command yum; then
-    yum install -y bash ca-certificates curl coreutils unzip util-linux nodejs npm shadow-utils >/dev/null
+    yum install -y bash ca-certificates curl coreutils iproute unzip util-linux nodejs npm shadow-utils >/dev/null
   elif has_command zypper; then
-    zypper --non-interactive install bash ca-certificates curl coreutils unzip util-linux nodejs npm >/dev/null
+    zypper --non-interactive install bash ca-certificates curl coreutils iproute2 unzip util-linux nodejs npm >/dev/null
   else
     die "缺少依赖，且未找到 apt-get、apk、dnf、yum 或 zypper"
   fi
@@ -191,7 +192,7 @@ create_service_user() {
 }
 
 check_dependencies() {
-  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command unzip || ! has_command nohup || ! has_command node || ! has_command npm || ! can_run_as_service_user; then
+  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command ss || ! has_command unzip || ! has_command nohup || ! has_command node || ! has_command npm || ! can_run_as_service_user; then
     is_true "${DRY_RUN}" && die "缺少依赖（dry-run 不会安装依赖）"
     install_os_dependencies
   fi
@@ -200,6 +201,7 @@ check_dependencies() {
   has_command node || die "未找到 node"
   has_command npm || die "未找到 npm"
   has_command sha256sum || die "未找到 sha256sum"
+  has_command ss || die "未找到 ss，无法安全检测端口占用"
   has_command unzip || die "未找到 unzip"
   prepare_user_switch
 
@@ -697,6 +699,74 @@ start_pm2_service() {
   log "当前无可靠开机自启机制，重启后仍需通过 init/cron 或手动启动 PM2"
 }
 
+process_command() {
+  local pid="$1"
+  if has_command ps; then
+    ps -p "${pid}" -o args= 2>/dev/null || true
+  elif [[ -r "/proc/${pid}/cmdline" ]]; then
+    tr '\0' ' ' <"/proc/${pid}/cmdline" 2>/dev/null || true
+  fi
+}
+
+port_owner_pids() {
+  local port="$1"
+  ss -lntpH 2>/dev/null |
+    awk -v port=":${port}" 'index($4, port) > 0 { print }' |
+    grep -oE 'pid=[0-9]+' |
+    cut -d= -f2 |
+    sort -u
+}
+
+terminate_pid() {
+  local pid="$1"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 0
+  (( pid > 1 )) || return 0
+
+  kill -TERM "${pid}" >/dev/null 2>&1 || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "${pid}" >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  kill -KILL "${pid}" >/dev/null 2>&1 || true
+}
+
+validate_local_port() {
+  local name="$1"
+  local value="$2"
+  [[ "${value}" =~ ^[0-9]+$ ]] || die "${name} 必须是数字端口：${value}"
+  (( value >= 1 && value <= 65535 )) || die "${name} 端口范围无效：${value}"
+}
+
+cleanup_owned_port_processes() {
+  local ports=()
+  local port
+  local pid
+  local command
+  local seen=" "
+
+  for port in "${SERVER_PORT}" "${ARGO_PORT}" 3001 3002 3003 3004; do
+    [[ "${seen}" == *" ${port} "* ]] && continue
+    seen+="${port} "
+    ports+=("${port}")
+  done
+
+  for port in "${ports[@]}"; do
+    while read -r pid; do
+      [[ -n "${pid}" ]] || continue
+      command="$(process_command "${pid}")"
+      if [[ "${command}" == *"${APP_DIR}"* ]]; then
+        warn "停止旧安装进程：PID ${pid}，端口 ${port}"
+        terminate_pid "${pid}"
+      elif is_true "${FORCE_KILL_PORTS}"; then
+        warn "FORCE_KILL_PORTS=true，将停止端口 ${port} 的非本项目进程：PID ${pid}（${command}）"
+        terminate_pid "${pid}"
+      else
+        die "端口 ${port} 被其他程序占用（PID ${pid}：${command}）；为避免误杀，请先停止它，或明确设置 FORCE_KILL_PORTS=true"
+      fi
+    done < <(port_owner_pids "${port}")
+  done
+}
+
 write_rc_local_service() {
   local marker="# nodejs-argo-no-docker: ${SERVICE_NAME}"
   local line="${RUNUSER_BIN} -u ${SERVICE_USER} -- ${RUNNER_SCRIPT} >/dev/null 2>&1 & ${marker}"
@@ -813,6 +883,12 @@ uninstall() {
   log "已卸载：${APP_DIR} 和 ${SERVICE_NAME} 的启动配置"
 }
 
+clean_previous_installation() {
+  log "清理旧安装、旧服务和旧进程：${APP_DIR}"
+  uninstall
+  cleanup_owned_port_processes
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -845,6 +921,8 @@ main() {
   NPM_BIN="$(command -v npm)"
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
+  validate_local_port "SERVER_PORT" "${SERVER_PORT}"
+  validate_local_port "ARGO_PORT" "${ARGO_PORT}"
   validate_runtime_paths
   ENV_FILE="${APP_DIR}/.env"
   RUNNER_SCRIPT="${APP_DIR}/run.sh"
@@ -856,6 +934,8 @@ main() {
     log "dry-run 检查通过：Node.js $(node --version)，启动方式：${SERVICE_BACKEND}"
     return 0
   fi
+
+  clean_previous_installation
 
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf -- "${TMP_DIR}"' EXIT
