@@ -495,7 +495,8 @@ async function dashboardPageResponse(request, env) {
       --accent-soft: #eaf4ff;
       --soft-surface: #f3f6f8;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; scrollbar-width: none; -ms-overflow-style: none; }
+    *::-webkit-scrollbar { width: 0; height: 0; display: none; }
     body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
     main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 12px 0 40px; }
     .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0; }
