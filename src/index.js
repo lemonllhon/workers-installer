@@ -495,8 +495,8 @@ async function dashboardPageResponse(request, env) {
     }
     * { box-sizing: border-box; }
     body { margin: 0; min-width: 320px; background: var(--canvas); color: var(--ink); }
-    main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 20px 0 44px; }
-    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 2px 0 24px; }
+    main { width: min(1120px, calc(100% - 40px)); margin: 0 auto; padding: 16px 0 40px; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 2px 0 10px; }
     .brand { display: inline-flex; align-items: center; gap: 12px; color: inherit; text-decoration: none; }
     .brand img { width: 38px; height: 38px; border-radius: 50%; }
     .brand-name { font-size: 18px; font-weight: 700; letter-spacing: -.02em; }
@@ -513,7 +513,7 @@ async function dashboardPageResponse(request, env) {
     h1 { margin: 0; font-size: clamp(16px, 2vw, 20px); letter-spacing: -.025em; line-height: 1.25; }
     .system-status-summary h1 { font-size: 13px; font-weight: 650; letter-spacing: 0; line-height: 1.35; }
     .hero-detail { max-width: 220px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
-    .section { margin-top: 30px; }
+    .section { margin-top: 18px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
     .system-status-layout { display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr); align-items: stretch; gap: 18px; padding: 14px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
     .system-status-heading { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: center; gap: 14px; min-width: 0; padding: 0 2px; }
@@ -616,7 +616,7 @@ async function dashboardPageResponse(request, env) {
       .system-status-overview-copy { gap: 3px; }
       .system-status-summary { display: grid; text-align: center; }
       .hero-detail { margin-top: 4px; }
-      .section { margin-top: 26px; }
+      .section { margin-top: 16px; }
       .system-status-layout { grid-template-columns: 1fr; gap: 14px; }
       .service-list { grid-template-columns: 1fr; }
       .service-row { align-items: flex-start; padding: 16px; }
