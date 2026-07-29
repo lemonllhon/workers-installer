@@ -417,8 +417,9 @@ async function dashboardPageResponse(request, env) {
     const rows = nodes.length > 0
       ? nodes.map((node) => {
         const runtime = runtimeSummary(node);
+        const nodeStatusClass = node.online ? "online" : node.timedOut ? "timed-out" : "offline";
         return `
-        <article class="node-row">
+        <article class="node-row node-row-${nodeStatusClass}">
           <div class="node-row-header">
             <div class="node-identity">
               <span class="badge ${node.online ? "online" : "offline"}">${node.online ? "在线" : node.status === "offline" ? "已下线" : "超时"}</span>
@@ -523,12 +524,16 @@ async function dashboardPageResponse(request, env) {
     .service-state.attention { color: var(--amber); }
     .service-state.waiting { color: var(--muted); }
     .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-    .node-list { display: grid; }
+    .node-list { display: grid; gap: 8px; padding: 8px 0; }
     .node-list.node-cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 12px; background: var(--canvas); }
-    .node-row { min-width: 0; padding: 14px 18px; border-bottom: 1px solid var(--line); }
-    .node-row:last-child { border-bottom: 0; }
+    .node-row { min-width: 0; padding: 14px 18px; border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .node-row-online { border-color: #bfe8ce; border-left-color: #22a652; }
+    .node-row-timed-out { border-color: #f0caca; border-left-color: #e05252; }
+    .node-row-offline { border-color: #d9dde2; border-left-color: #9ca3af; }
     .node-cards .node-row { padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
-    .node-cards .node-row:last-child { border-bottom: 1px solid var(--line); }
+    .node-cards .node-row.node-row-online { border-color: #bfe8ce; border-left-color: #22a652; }
+    .node-cards .node-row.node-row-timed-out { border-color: #f0caca; border-left-color: #e05252; }
+    .node-cards .node-row.node-row-offline { border-color: #d9dde2; border-left-color: #9ca3af; }
     .node-cards .node-row-header { display: grid; gap: 12px; }
     .node-cards .node-last-seen { text-align: left; }
     .node-cards .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -908,10 +913,11 @@ async function dashboardPageResponse(request, env) {
         return nodes.map((node) => {
           const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
           const statusClass = node.online ? "online" : "offline";
+          const nodeStatusClass = node.online ? "online" : node.timedOut ? "timed-out" : "offline";
           const runtime = runtimeSummary(node);
           const heartbeatLimit = selectedView === "cards" ? 24 : 72;
           const heartbeatWindowMinutes = Math.max(1, Math.round((Number(window.__onlineTtlMs || 600000) / 60000) * heartbeatLimit / 72));
-          return '<article class="node-row">'
+          return '<article class="node-row node-row-' + nodeStatusClass + '">'
             + '<div class="node-row-header"><div class="node-identity">'
             + '<span class="badge ' + statusClass + '">' + status + '</span>'
             + '<div class="node-title"><strong>' + escapeHtml(node.label || "未命名节点") + '</strong><span>' + escapeHtml(node.argoDomain || "-") + '</span></div>'
