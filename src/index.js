@@ -523,13 +523,15 @@ async function dashboardPageResponse(request, env) {
     .service-state.operational { color: var(--green); }
     .service-state.attention { color: var(--amber); }
     .service-state.waiting { color: var(--muted); }
-    .node-card { overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
-    .node-list { display: grid; gap: 8px; padding: 8px 0; }
-    .node-list.node-cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 12px; background: var(--canvas); }
-    .node-row { min-width: 0; padding: 14px 18px; border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 10px; background: var(--surface); }
-    .node-row-online { border-color: #bfe8ce; border-left-color: #22a652; }
-    .node-row-timed-out { border-color: #f0caca; border-left-color: #e05252; }
-    .node-row-offline { border-color: #d9dde2; border-left-color: #9ca3af; }
+    .node-card { overflow: visible; background: transparent; border: 0; border-radius: 0; }
+    .node-list { display: grid; gap: 8px; padding: 0; background: transparent; }
+    .node-list.node-cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 0; background: transparent; }
+    .node-row { position: relative; isolation: isolate; min-width: 0; padding: 14px 18px; border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 10px; background: var(--surface); }
+    .node-row > * { position: relative; z-index: 1; }
+    .node-row::after { position: absolute; z-index: 0; inset: -1px; padding: 2px; border-radius: inherit; content: ""; pointer-events: none; background: conic-gradient(from 0deg, transparent 0deg 300deg, var(--node-border-runner) 320deg 350deg, transparent 360deg); mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite: exclude; -webkit-mask-composite: xor; opacity: .78; animation: node-border-run 4.5s linear infinite; }
+    .node-row-online { --node-border-runner: #22a652; border-color: #bfe8ce; border-left-color: #22a652; }
+    .node-row-timed-out { --node-border-runner: #e05252; border-color: #f0caca; border-left-color: #e05252; }
+    .node-row-offline { --node-border-runner: #9ca3af; border-color: #d9dde2; border-left-color: #9ca3af; }
     .node-cards .node-row { padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
     .node-cards .node-row.node-row-online { border-color: #bfe8ce; border-left-color: #22a652; }
     .node-cards .node-row.node-row-timed-out { border-color: #f0caca; border-left-color: #e05252; }
@@ -558,6 +560,7 @@ async function dashboardPageResponse(request, env) {
     .pulse-ok { height: 24px; background: #44d483; }
     .pulse-timeout { height: 24px; background: #e05252; }
     .pulse-empty { background: #eef0f2; }
+    @keyframes node-border-run { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
     @keyframes heartbeat-charge { 0% { opacity: 0; transform: translateX(0); } 12% { opacity: .45; } 82% { opacity: .45; } 100% { opacity: 0; transform: translateX(565%); } }
     .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 3px; color: var(--muted); font-size: 10px; }
     .node-fields { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid #f0f1f2; }
@@ -590,7 +593,7 @@ async function dashboardPageResponse(request, env) {
       .node-row { padding: 14px 16px; }
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .heartbeat-strip { gap: 2px; }
-      .node-list.node-cards { grid-template-columns: 1fr; padding: 10px; }
+      .node-list.node-cards { grid-template-columns: 1fr; padding: 0; }
       .node-section-head { grid-template-columns: 1fr; align-items: stretch; gap: 10px; padding: 12px 10px; }
       .node-toolbar { align-items: stretch; flex-wrap: wrap; }
       .filter-search { flex-basis: 100%; width: 100%; max-width: none; margin-right: 0; }
@@ -600,6 +603,7 @@ async function dashboardPageResponse(request, env) {
       .filter-result { align-self: center; }
     }
     @media (prefers-reduced-motion: reduce) {
+      .node-row::after { animation: none; opacity: .35; }
       .heartbeat-strip.heartbeat-active::after { animation: none; opacity: 0; }
     }
   </style>
