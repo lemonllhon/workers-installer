@@ -157,8 +157,18 @@ https://你的-worker.workers.dev/
 - `NODE_RUNTIME_SHA256`：仅在自定义 `NODE_RUNTIME_VERSION` 且该版本没有内置校验值时，填写对应 Node.js 官方 Linux 压缩包的 64 位 SHA256。
 
 如果目标机已有 Node.js 12，安装器不会把它升级成全局版本，也不会影响其他项目；它会在
-`/opt/nodejs-argo-no-docker/node-runtime/` 内安装并使用项目专用 Node.js 20.20.2。已有
-Node.js 14 或更高版本时，默认直接复用系统版本。
+安装目录内的 `node-runtime/` 安装并使用项目专用 Node.js 20.20.2。已有 Node.js 14 或更高版本
+且可用 npm 时，默认直接复用系统版本。
+
+安装权限说明：
+
+- root 安装默认使用 `/opt/nodejs-argo-no-docker`，并按系统能力配置 systemd、OpenRC、SysV、Supervisor
+  或 cron 开机自启；没有可用机制时使用项目目录内的 PM2 保持运行。
+- 非 root 安装会自动切换为当前用户，默认安装到
+  `$HOME/.local/share/nodejs-argo-no-docker`，不会写入 `/opt`、`/etc` 或系统级服务，也不会修改系统 Node.js。
+  此模式会在项目目录内安装需要的 Node.js 和 PM2，并立即启动程序；由于没有系统级权限，不能保证重启后自动启动。
+- 非 root 安装不能把 `APP_DIR`、`BIN_PATH` 或 `FILE_PATH` 指向当前用户目录之外；如目标目录不可写，请用
+  `--app-dir "$HOME/.local/share/nodejs-argo-no-docker"` 显式指定可写目录。
 
 以下示例使用 `install.lemon.vin`。如果你使用自己的 Worker 域名，请将命令中的地址全部替换为自己的 `/install.sh` 地址。
 
@@ -201,6 +211,25 @@ env \
 ```
 
 如果是覆盖旧安装，再增加 `FORCE_KILL_PORTS='true'`；新机器不建议默认开启。真实兑换密码不要写入公开脚本、README、GitHub 或 Shell 历史。
+
+#### 无 root 权限时安装
+
+不需要先执行 `sudo`。直接以当前用户运行下面的命令，安装器会自动选择用户目录并使用用户级 PM2：
+
+```bash
+env \
+  ARGO_AUTH='你的 Tunnel Token' \
+  TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码' \
+  ARGO_DOMAIN='你的域名' \
+  CFIP='cdst.lemon.vin' \
+  NAME='lemon' \
+  bash -c 'curl -fsSL --retry 3 -H "Cache-Control: no-cache" "https://install.lemon.vin/install.sh?ts=$(date +%s)" -o /tmp/install-lemon.sh && bash /tmp/install-lemon.sh'
+```
+
+非 root 默认目录为 `$HOME/.local/share/nodejs-argo-no-docker`。如该目录所在磁盘不可写，使用
+`--app-dir "$HOME/你的目录"` 覆盖目录。此模式不会尝试安装系统软件包，不会删除或升级其他项目使用的
+Node.js 12；当前项目缺少可用 Node.js/npm 时，只在自己的目录内下载项目专用运行时。安装完成后程序会立即运行，
+但没有 root 权限时无法配置系统级开机自启。
 
 ### 新机器首次安装
 

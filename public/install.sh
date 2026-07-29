@@ -4,7 +4,7 @@ IFS=$'\n\t'
 umask 077
 
 readonly SCRIPT_NAME="nodejs-argo-no-docker-installer"
-readonly DEFAULT_APP_DIR="/opt/nodejs-argo-no-docker"
+readonly DEFAULT_ROOT_APP_DIR="/opt/nodejs-argo-no-docker"
 readonly DEFAULT_SERVICE_NAME="nodejs-argo-no-docker"
 readonly DEFAULT_SOURCE_BASE_URL="__WORKER_SOURCE_BASE_URL__"
 readonly DEFAULT_INDEX_SHA256="__WORKER_SOURCE_SHA256__"
@@ -19,9 +19,9 @@ readonly DEFAULT_PM2_VERSION="5.4.3"
 # minimum, so other applications can continue using their own Node.js.
 readonly DEFAULT_NODE_RUNTIME_VERSION="20.20.2"
 
-APP_DIR="${APP_DIR:-${DEFAULT_APP_DIR}}"
+APP_DIR="${APP_DIR:-}"
 SERVICE_NAME="${SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
-SERVICE_USER="${SERVICE_USER:-nodejs-argo}"
+SERVICE_USER="${SERVICE_USER:-}"
 SERVICE_MODE="${SERVICE_MODE:-auto}"
 SUPERVISOR_CONF_DIR="${SUPERVISOR_CONF_DIR:-}"
 SOURCE_BASE_URL="${SOURCE_BASE_URL:-${DEFAULT_SOURCE_BASE_URL}}"
@@ -72,6 +72,8 @@ PM2_DIR=""
 PM2_HOME_DIR=""
 PM2_BIN=""
 RUN_AS_ROOT=false
+CURRENT_USER=""
+CURRENT_USER_HOME=""
 TMP_DIR=""
 STAGE_CURRENT=0
 readonly STAGE_TOTAL=10
@@ -93,7 +95,7 @@ usage() {
   install.sh                         安装或更新无 Docker 节点
   install.sh --uninstall              卸载本安装器创建的服务和目录
   install.sh --dry-run                只检查环境，不写入系统
-  install.sh --app-dir /opt/example   覆盖安装目录
+  install.sh --app-dir /opt/example   覆盖安装目录（root；非 root 必须位于当前用户目录）
   install.sh --service-mode auto      自动选择 systemd/OpenRC/SysV/Supervisor/cron
 
 ARGO_AUTH、ARGO_DOMAIN 通过环境变量传入，不写入脚本。
@@ -121,6 +123,12 @@ validate_app_dir() {
   [[ "${APP_DIR}" != *$'\n'* && "${APP_DIR}" != *$'\r'* && "${APP_DIR}" != *' '* ]] || die "APP_DIR 不得包含空格或换行"
   [[ "${SERVICE_NAME}" =~ ^[a-zA-Z0-9_.@-]+$ ]] || die "SERVICE_NAME 含有非法字符"
   [[ "${SERVICE_USER}" =~ ^[a-zA-Z0-9_.-]+$ ]] || die "SERVICE_USER 含有非法字符"
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    case "${APP_DIR}" in
+      "${CURRENT_USER_HOME}"/*) ;;
+      *) die "非 root 安装只能使用当前用户目录下的 APP_DIR：${CURRENT_USER_HOME}/..." ;;
+    esac
+  fi
 }
 
 validate_runtime_paths() {
@@ -128,10 +136,43 @@ validate_runtime_paths() {
   [[ "${BIN_PATH}" = /* ]] || die "BIN_PATH 必须是绝对路径"
   [[ "${FILE_PATH}" != *$'\n'* && "${FILE_PATH}" != *$'\r'* && "${FILE_PATH}" != *' '* ]] || die "FILE_PATH 不得包含空格或换行"
   [[ "${BIN_PATH}" != *$'\n'* && "${BIN_PATH}" != *$'\r'* && "${BIN_PATH}" != *' '* ]] || die "BIN_PATH 不得包含空格或换行"
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    case "${BIN_PATH}" in
+      "${APP_DIR}"/*) ;;
+      *) die "非 root 安装的 BIN_PATH 必须位于 APP_DIR 内：${APP_DIR}/..." ;;
+    esac
+    case "${FILE_PATH}" in
+      "${APP_DIR}"/*) ;;
+      *) die "非 root 安装的 FILE_PATH 必须位于 APP_DIR 内：${APP_DIR}/..." ;;
+    esac
+  fi
+}
+
+configure_install_context() {
+  CURRENT_USER="$(id -un 2>/dev/null || true)"
+  CURRENT_USER_HOME=""
+  if command -v getent >/dev/null 2>&1; then
+    CURRENT_USER_HOME="$(getent passwd "${CURRENT_USER}" | cut -d: -f6)"
+  fi
+  CURRENT_USER_HOME="${CURRENT_USER_HOME:-${HOME:-}}"
+  [[ -n "${CURRENT_USER}" && -n "${CURRENT_USER_HOME}" ]] || die "无法确定当前用户和用户目录"
+
+  if [[ "${EUID}" -eq 0 ]]; then
+    RUN_AS_ROOT=true
+    APP_DIR="${APP_DIR:-${DEFAULT_ROOT_APP_DIR}}"
+    SERVICE_USER="${SERVICE_USER:-nodejs-argo}"
+    return 0
+  fi
+
+  RUN_AS_ROOT=false
+  APP_DIR="${APP_DIR:-${CURRENT_USER_HOME}/.local/share/nodejs-argo-no-docker}"
+  SERVICE_USER="${SERVICE_USER:-${CURRENT_USER}}"
+  [[ "${SERVICE_USER}" == "${CURRENT_USER}" ]] || die "非 root 安装只能使用当前用户运行：${CURRENT_USER}"
+  warn "当前不是 root，将使用当前用户 ${CURRENT_USER} 安装到 ${APP_DIR}；不会写入 /opt、/etc 或系统服务。"
 }
 
 require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "请使用 root 运行，或执行 sudo -i 后再运行"
+  [[ "${EUID}" -eq 0 ]] || return 0
 }
 
 require_config() {
@@ -261,6 +302,10 @@ supervisorctl_exec() {
 }
 
 install_os_dependencies() {
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    warn "非 root 安装不会修改系统软件包；将使用当前用户目录内的项目专用 Node.js。"
+    return 0
+  fi
   log "安装基础依赖：bash、curl、ca-certificates、unzip、tar、Node.js、npm"
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
@@ -287,6 +332,10 @@ prepare_user_switch() {
   BASH_BIN="$(command -v bash 2>/dev/null || true)"
   [[ -n "${BASH_BIN}" ]] || die "未找到 bash"
 
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    return 0
+  fi
+
   if has_command runuser; then
     RUNUSER_BIN="$(command -v runuser)"
   elif has_command su; then
@@ -302,6 +351,10 @@ prepare_user_switch() {
 }
 
 run_as_service_user() {
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    "$@"
+    return 0
+  fi
   if [[ -n "${RUNUSER_BIN}" ]]; then
     "${RUNUSER_BIN}" -u "${SERVICE_USER}" -- "$@"
   elif [[ -n "${SU_BIN}" ]]; then
@@ -314,6 +367,7 @@ run_as_service_user() {
 }
 
 create_service_user() {
+  [[ "${RUN_AS_ROOT}" == true ]] || return 0
   if id "${SERVICE_USER}" >/dev/null 2>&1; then
     return 0
   fi
@@ -329,14 +383,16 @@ create_service_user() {
 }
 
 check_dependencies() {
-  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command ss || ! has_command tar || ! has_command unzip || ! has_command nohup || ! has_command node || ! has_command npm || ! can_run_as_service_user; then
+  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command ss || ! has_command tar || ! has_command unzip || ! has_command nohup || ([[ "${RUN_AS_ROOT}" == true ]] && (! has_command node || ! has_command npm || ! can_run_as_service_user)); then
     is_true "${DRY_RUN}" && die "缺少依赖（dry-run 不会安装依赖）"
     install_os_dependencies
   fi
 
   has_command bash || die "未找到 bash"
-  has_command node || die "未找到 node"
-  has_command npm || die "未找到 npm"
+  if [[ "${RUN_AS_ROOT}" == true ]]; then
+    has_command node || die "未找到 node"
+    has_command npm || die "未找到 npm"
+  fi
   has_command sha256sum || die "未找到 sha256sum"
   has_command ss || die "未找到 ss，无法安全检测端口占用"
   has_command tar || die "未找到 tar，无法安装项目专用 Node.js"
@@ -346,17 +402,30 @@ check_dependencies() {
   NODE_RUNTIME_VERSION="${NODE_RUNTIME_VERSION#v}"
   [[ "${NODE_RUNTIME_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "NODE_RUNTIME_VERSION 必须是三段版本号，例如 20.20.2"
 
-  SYSTEM_NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+  if has_command node; then
+    SYSTEM_NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || true)"
+  else
+    SYSTEM_NODE_MAJOR="0"
+  fi
   [[ "${SYSTEM_NODE_MAJOR}" =~ ^[0-9]+$ ]] || die "无法读取 Node.js 版本"
   if (( SYSTEM_NODE_MAJOR < 14 )); then
     warn "检测到系统 Node.js ${SYSTEM_NODE_MAJOR}；不会升级全局 Node.js，将在本项目目录安装 Node.js ${NODE_RUNTIME_VERSION}"
   fi
 }
 
+set_owner() {
+  [[ "${RUN_AS_ROOT}" == true ]] || return 0
+  chown "$@"
+}
+
 ensure_project_node_runtime() {
-  if (( SYSTEM_NODE_MAJOR >= 14 )); then
+  if (( SYSTEM_NODE_MAJOR >= 14 )) && has_command npm; then
     log "使用系统 Node.js $(node --version)，不修改其他项目的运行环境"
     return 0
+  fi
+
+  if (( SYSTEM_NODE_MAJOR >= 14 )) && ! has_command npm; then
+    warn "系统 Node.js ${SYSTEM_NODE_MAJOR} 可用但未找到 npm，将安装项目专用 Node.js ${NODE_RUNTIME_VERSION}"
   fi
 
   local version="v${NODE_RUNTIME_VERSION}"
@@ -429,6 +498,14 @@ service_node_path() {
 
 detect_service_backend() {
   local requested="${SERVICE_MODE,,}"
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    if [[ "${requested}" != auto && "${requested}" != none ]]; then
+      warn "非 root 安装不写入系统服务，将忽略 SERVICE_MODE=${SERVICE_MODE} 并使用用户级 PM2"
+    fi
+    SERVICE_BACKEND="none"
+    warn "非 root 安装不具备系统级开机自启权限；将使用当前用户目录中的 PM2 保持程序运行"
+    return 0
+  fi
   case "${requested}" in
     auto)
       if has_command systemctl && [[ -d /run/systemd/system ]]; then
@@ -717,7 +794,7 @@ write_runtime_files() {
 JSON
 
   install -d -m 0700 "${APP_DIR}/home" "${APP_DIR}/npm-cache"
-  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+  set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   log "安装固定 npm 依赖（禁止 install scripts）"
   run_as_service_user env HOME="${APP_DIR}/home" NPM_CONFIG_CACHE="${APP_DIR}/npm-cache" \
     "${NPM_BIN}" --prefix "${APP_DIR}/app" install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false
@@ -760,7 +837,7 @@ write_env_file() {
   write_env_value "XRAY_SNIFFING_ENABLED" "${XRAY_SNIFFING_ENABLED:-false}"
   write_env_value "DIRECT_MODE" "${DIRECT_MODE:-false}"
   write_env_value "PLATFORM_PROXY_MODE" "${PLATFORM_PROXY_MODE:-false}"
-  chown "${SERVICE_USER}:${SERVICE_USER}" "${ENV_FILE}"
+  set_owner "${SERVICE_USER}:${SERVICE_USER}" "${ENV_FILE}"
 }
 
 write_runner_script() {
@@ -800,7 +877,7 @@ while true; do
   sleep 10
 done
 EOF
-  chown "${SERVICE_USER}:${SERVICE_USER}" "${RUNNER_SCRIPT}"
+  set_owner "${SERVICE_USER}:${SERVICE_USER}" "${RUNNER_SCRIPT}"
   chmod 0750 "${RUNNER_SCRIPT}"
 }
 
@@ -1018,7 +1095,7 @@ start_pm2_service() {
   validate_pm2_version
   prepare_pm2_paths
   install -d -m 0700 "${PM2_DIR}" "${PM2_HOME_DIR}"
-  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${PM2_DIR}" "${PM2_HOME_DIR}"
+  set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${PM2_DIR}" "${PM2_HOME_DIR}"
 
   log "未检测到可用 init/cron，安装 PM2 ${PM2_VERSION} 作为最后的进程守护"
   run_as_service_user env \
@@ -1270,27 +1347,29 @@ uninstall() {
   validate_app_dir
   prepare_user_switch
 
-  if has_command systemctl; then
-    systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
-    systemctl daemon-reload >/dev/null 2>&1 || true
-  fi
-  rm -f -- "/etc/systemd/system/${SERVICE_NAME}.service"
-
-  if [[ -x "/etc/init.d/${SERVICE_NAME}" ]]; then
-    if has_command rc-service; then
-      rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
-      has_command rc-update && rc-update del "${SERVICE_NAME}" default >/dev/null 2>&1 || true
-    else
-      "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1 || true
-      has_command update-rc.d && update-rc.d -f "${SERVICE_NAME}" remove >/dev/null 2>&1 || true
-      has_command chkconfig && chkconfig --del "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  if [[ "${RUN_AS_ROOT}" == true ]]; then
+    if has_command systemctl; then
+      systemctl disable --now "${SERVICE_NAME}.service" >/dev/null 2>&1 || true
+      systemctl daemon-reload >/dev/null 2>&1 || true
     fi
-    rm -f -- "/etc/init.d/${SERVICE_NAME}"
+    rm -f -- "/etc/systemd/system/${SERVICE_NAME}.service"
+
+    if [[ -x "/etc/init.d/${SERVICE_NAME}" ]]; then
+      if has_command rc-service; then
+        rc-service "${SERVICE_NAME}" stop >/dev/null 2>&1 || true
+        has_command rc-update && rc-update del "${SERVICE_NAME}" default >/dev/null 2>&1 || true
+      else
+        "/etc/init.d/${SERVICE_NAME}" stop >/dev/null 2>&1 || true
+        has_command update-rc.d && update-rc.d -f "${SERVICE_NAME}" remove >/dev/null 2>&1 || true
+        has_command chkconfig && chkconfig --del "${SERVICE_NAME}" >/dev/null 2>&1 || true
+      fi
+      rm -f -- "/etc/init.d/${SERVICE_NAME}"
+    fi
   fi
 
   stop_background_runner
   stop_pm2_service
-  stop_supervisor_service
+  [[ "${RUN_AS_ROOT}" == true ]] && stop_supervisor_service
 
   if has_command crontab; then
     local current_cron
@@ -1301,7 +1380,7 @@ uninstall() {
     fi
   fi
 
-  if [[ -f /etc/rc.local ]]; then
+  if [[ "${RUN_AS_ROOT}" == true && -f /etc/rc.local ]]; then
     local rc_local_tmp="${APP_DIR}.rc.local.tmp"
     grep -vF -- "# nodejs-argo-no-docker: ${SERVICE_NAME}" /etc/rc.local >"${rc_local_tmp}" || true
     install -m 0755 "${rc_local_tmp}" /etc/rc.local
@@ -1342,6 +1421,7 @@ parse_args() {
 
 main() {
   parse_args "$@"
+  configure_install_context
   resolve_source_checksum
   stage "检查安装参数和源码校验"
   validate_app_dir
@@ -1354,10 +1434,9 @@ main() {
   require_config
   validate_worker_placeholders
   check_dependencies
-  NODE_BIN="$(command -v node)"
-  NPM_BIN="$(command -v npm)"
+  NODE_BIN="$(command -v node || true)"
+  NPM_BIN="$(command -v npm || true)"
   restore_existing_uuid_if_missing
-  generate_uuid_if_missing
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
   validate_local_port "SERVER_PORT" "${SERVER_PORT}"
@@ -1389,6 +1468,7 @@ main() {
   install -d -m 0750 "${APP_DIR}" "${APP_DIR}/app" "${BIN_PATH}" "${FILE_PATH}"
   create_service_user
   ensure_project_node_runtime
+  generate_uuid_if_missing
 
   local machine_arch
   case "$(uname -m)" in
@@ -1405,7 +1485,7 @@ main() {
   write_runtime_files
   stage "写入环境变量和启动配置"
   write_env_file
-  chown -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
+  set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"
   chmod 0600 "${ENV_FILE}"
   write_runner_script
