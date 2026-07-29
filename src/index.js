@@ -221,16 +221,25 @@ function decorateNodeStatus(nodes, env) {
   const timeout = heartbeatTimeoutMs(env);
   const ttl = onlineTtlMs(env);
   return nodes
-    .map((node) => ({
-      ...node,
-      online: node.status === "online"
-        && Number.isFinite(Number(node.lastSeen))
-        && now - Number(node.lastSeen) <= timeout,
-      timedOut: node.status === "online"
-        && Number.isFinite(Number(node.lastSeen))
-        && now - Number(node.lastSeen) > timeout
-        && now - Number(node.lastSeen) <= ttl
-    }))
+    .map((node) => {
+      const lastSeen = Number(node.lastSeen);
+      const stoppedAt = Number(node.stoppedAt);
+      const hasLastSeen = Number.isFinite(lastSeen) && lastSeen > 0;
+      const hasStoppedAt = Number.isFinite(stoppedAt) && stoppedAt > 0;
+      const activityAt = hasStoppedAt ? stoppedAt : lastSeen;
+      const withinTtl = Number.isFinite(activityAt) && activityAt > 0 && now - activityAt <= ttl;
+      return {
+        ...node,
+        stopped: hasStoppedAt,
+        online: node.status === "online"
+          && !hasStoppedAt
+          && hasLastSeen
+          && now - lastSeen <= timeout,
+        timedOut: node.status === "online"
+          && withinTtl
+          && (hasStoppedAt || !hasLastSeen || now - lastSeen > timeout)
+      };
+    })
     .sort((left, right) => {
       if (left.online !== right.online) return left.online ? -1 : 1;
       return Number(right.lastSeen || right.lastEventAt || 0) - Number(left.lastSeen || left.lastEventAt || 0);
@@ -392,16 +401,17 @@ async function dashboardPageResponse(request, env) {
     const onlineCount = nodes.filter((node) => node.online).length;
     const timedOutCount = nodes.filter((node) => node.timedOut).length;
     const visibleCount = nodes.length;
+    const timeoutMinutes = Math.max(1, Math.round(heartbeatTimeoutMs(env) / 60000));
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
     const isOperational = onlineCount > 0 && timedOutCount === 0;
     const overviewLabel = timedOutCount > 0
       ? "部分节点心跳超时"
       : isOperational ? "全部系统运行正常" : "暂无在线机器";
     const overviewDetail = timedOutCount > 0
-      ? String(timedOutCount) + " 台机器已超时并标记为灰色；超过 " + String(ttlMinutes) + " 分钟未收到心跳后自动移除。"
+      ? String(timedOutCount) + " 台机器已标记为超时；超过 " + String(ttlMinutes) + " 分钟未恢复心跳后自动移除。"
       : isOperational
-        ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(ttlMinutes) + " 分钟内保持在线。"
-        : "等待机器发送心跳；超过 " + String(ttlMinutes) + " 分钟未收到心跳的机器会自动移出列表。";
+        ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(timeoutMinutes) + " 分钟内保持在线。"
+        : "等待机器发送心跳；超过 " + String(timeoutMinutes) + " 分钟后标记为超时，总计 " + String(ttlMinutes) + " 分钟后自动移出列表。";
     const overviewClass = isOperational ? "operational" : timedOutCount > 0 ? "attention" : "waiting";
     const overviewSymbol = isOperational ? "✓" : timedOutCount > 0 ? "!" : "…";
     const heartbeatDescription = timedOutCount > 0
@@ -410,7 +420,7 @@ async function dashboardPageResponse(request, env) {
     const heartbeatState = timedOutCount > 0 ? "有超时" : onlineCount > 0 ? "正常" : "等待中";
     const heartbeatStateClass = heartbeatState === "正常" ? "operational" : heartbeatState === "等待中" ? "waiting" : "attention";
     const nodeDescription = timedOutCount > 0
-      ? String(timedOutCount) + " 台节点暂时不可用，仍保留 5 分钟"
+      ? String(timedOutCount) + " 台节点暂时不可用，恢复心跳后会自动变绿"
       : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
     const nodeState = timedOutCount > 0 ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
     const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
@@ -523,12 +533,13 @@ async function dashboardPageResponse(request, env) {
     .service-state.operational { color: var(--green); }
     .service-state.attention { color: var(--amber); }
     .service-state.waiting { color: var(--muted); }
+    @property --node-border-angle { syntax: "<angle>"; inherits: false; initial-value: 0deg; }
     .node-card { overflow: visible; background: transparent; border: 0; border-radius: 0; }
     .node-list { display: grid; gap: 8px; padding: 0; background: transparent; }
     .node-list.node-cards { grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 12px; padding: 0; background: transparent; }
     .node-row { position: relative; isolation: isolate; min-width: 0; padding: 14px 18px; border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 10px; background: var(--surface); }
     .node-row > * { position: relative; z-index: 1; }
-    .node-row::after { position: absolute; z-index: 0; inset: -1px; padding: 2px; border-radius: inherit; content: ""; pointer-events: none; background: conic-gradient(from 0deg, transparent 0deg 300deg, var(--node-border-runner) 320deg 350deg, transparent 360deg); mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite: exclude; -webkit-mask-composite: xor; opacity: .78; animation: node-border-run 4.5s linear infinite; }
+    .node-row::after { position: absolute; z-index: 0; inset: 0; border: 2px solid transparent; border-radius: inherit; content: ""; pointer-events: none; background: linear-gradient(var(--surface), var(--surface)), conic-gradient(from var(--node-border-angle), transparent 0deg 300deg, var(--node-border-runner) 320deg 350deg, transparent 360deg); background-clip: padding-box, border-box; opacity: .78; animation: node-border-run 4.5s linear infinite; }
     .node-row-online { --node-border-runner: #22a652; border-color: #bfe8ce; border-left-color: #22a652; }
     .node-row-timed-out { --node-border-runner: #e05252; border-color: #f0caca; border-left-color: #e05252; }
     .node-row-offline { --node-border-runner: #9ca3af; border-color: #d9dde2; border-left-color: #9ca3af; }
@@ -560,7 +571,7 @@ async function dashboardPageResponse(request, env) {
     .pulse-ok { height: 24px; background: #44d483; }
     .pulse-timeout { height: 24px; background: #e05252; }
     .pulse-empty { background: #eef0f2; }
-    @keyframes node-border-run { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    @keyframes node-border-run { from { --node-border-angle: 0deg; } to { --node-border-angle: 360deg; } }
     @keyframes heartbeat-charge { 0% { opacity: 0; transform: translateX(0); } 12% { opacity: .45; } 82% { opacity: .45; } 100% { opacity: 0; transform: translateX(565%); } }
     .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 3px; color: var(--muted); font-size: 10px; }
     .node-fields { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid #f0f1f2; }
@@ -956,6 +967,7 @@ async function dashboardPageResponse(request, env) {
           const visibleNodes = data.nodes.filter((node) => node && (node.online || node.timedOut));
           const onlineNodes = visibleNodes.filter((node) => node.online);
           const timedOutNodes = visibleNodes.filter((node) => node.timedOut);
+          const timeoutMinutes = Math.max(1, Math.round(Number(data.heartbeatTimeoutMs || 300000) / 60000));
           const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
           const operational = onlineNodes.length > 0 && timedOutNodes.length === 0;
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
@@ -969,10 +981,10 @@ async function dashboardPageResponse(request, env) {
             ? "部分节点心跳超时"
             : operational ? "全部系统运行正常" : "暂无在线机器";
           overviewDetailElement.textContent = timedOutNodes.length > 0
-            ? timedOutNodes.length + " 台机器已超时并标记为灰色；超过 " + ttlMinutes + " 分钟未收到心跳后自动移除。"
+            ? timedOutNodes.length + " 台机器已标记为超时；超过 " + ttlMinutes + " 分钟未恢复心跳后自动移除。"
             : operational
-              ? onlineNodes.length + " 台机器正在发送心跳，最近 " + ttlMinutes + " 分钟内保持在线。"
-              : "等待机器发送心跳；超过 " + ttlMinutes + " 分钟未收到心跳的机器会自动移出列表。";
+              ? onlineNodes.length + " 台机器正在发送心跳，最近 " + timeoutMinutes + " 分钟内保持在线。"
+              : "等待机器发送心跳；超过 " + timeoutMinutes + " 分钟后标记为超时，总计 " + ttlMinutes + " 分钟后自动移出列表。";
           nodeCountElement.textContent = visibleNodes.length + " 台";
           heartbeatDescriptionElement.textContent = timedOutNodes.length > 0
             ? timedOutNodes.length + " 台机器心跳超时，恢复后会自动变绿"
@@ -980,7 +992,7 @@ async function dashboardPageResponse(request, env) {
           heartbeatStateElement.textContent = timedOutNodes.length > 0 ? "有超时" : onlineNodes.length > 0 ? "正常" : "等待中";
           heartbeatStateElement.className = "service-state " + (timedOutNodes.length > 0 ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
           nodeDescriptionElement.textContent = timedOutNodes.length > 0
-            ? timedOutNodes.length + " 台节点暂时不可用，仍保留 5 分钟"
+            ? timedOutNodes.length + " 台节点暂时不可用，恢复心跳后会自动变绿"
             : onlineNodes.length > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
           nodeStateElement.textContent = timedOutNodes.length > 0 ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
           nodeStateElement.className = "service-state " + (timedOutNodes.length > 0 ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
@@ -1170,12 +1182,28 @@ export class NodeRegistry {
       if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
 
       const key = `node:${uuid}`;
+      const previous = (await this.state.storage.get(key)) || {};
+
+      // 下线请求仍然会转发给 TeamNode，但不能让监控面板立即删除节点。
+      // 下线记录在下一次面板轮询时立即显示“超时”；没有下线通知时，
+      // 则依据最后一次真实心跳的 heartbeat timeout 判断，再经过 online TTL 清理记录。
       if (event.status === "offline") {
-        await this.state.storage.delete(key);
-        return json({ ok: true, removed: true });
+        if (!previous.lastSeen) {
+          return json({ ok: true, retained: false });
+        }
+        const stoppedAt = Number(event.stoppedAt || event.lastEventAt || Date.now());
+        const retainedRecord = {
+          ...previous,
+          status: "online",
+          eventPath: event.eventPath || previous.eventPath,
+          stoppedAt,
+          lastEventAt: Number(event.lastEventAt || Date.now()),
+          updatedAt: Number(event.updatedAt || Date.now())
+        };
+        await this.state.storage.put(key, retainedRecord);
+        return json({ ok: true, retained: true });
       }
 
-      const previous = (await this.state.storage.get(key)) || {};
       const lastSeen = Number(event.lastSeen || Date.now());
       const previousHistory = Array.isArray(previous.heartbeatHistory)
         ? previous.heartbeatHistory.filter((value) => Number.isFinite(Number(value)))
@@ -1189,6 +1217,7 @@ export class NodeRegistry {
         ...event,
         uuid,
         status: "online",
+        stoppedAt: null,
         lastSeen,
         lastEventAt: Number(event.lastEventAt || Date.now()),
         updatedAt: Number(event.updatedAt || Date.now()),
@@ -1207,7 +1236,9 @@ export class NodeRegistry {
 
       for (const [key, value] of entries) {
         const lastSeen = Number(value?.lastSeen || 0);
-        if (value?.status !== "online" || !lastSeen || now - lastSeen > ttl) {
+        const stoppedAt = Number(value?.stoppedAt || 0);
+        const retentionAt = stoppedAt || lastSeen;
+        if (value?.status !== "online" || !retentionAt || now - retentionAt > ttl) {
           await this.state.storage.delete(key);
           continue;
         }

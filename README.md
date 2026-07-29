@@ -131,7 +131,7 @@ https://install.lemon.vin/install.sh
 https://你的-worker.workers.dev/
 ```
 
-未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，不显示 UUID 或其他敏感配置。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；收到下线请求会立即删除。默认超过 5 分钟没有新心跳时，节点会变成灰色、心跳条变红；继续超过 5 分钟（总计 10 分钟）仍无心跳后，才会从 Durable Object 和前端列表中删除。机器恢复心跳后会自动恢复为绿色在线状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整超时阈值，最长不会超过自动删除阈值。
+未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，不显示 UUID 或其他敏感配置。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；下线请求会转发给 TeamNode，同时让监控面板在下一次轮询时立即标记为超时，但不会立即删除记录。默认没有停止通知的节点超过 5 分钟没有新心跳时，下一次轮询会标记为灰色、心跳条变红；节点从停止通知时刻或最后一次心跳开始累计超过 10 分钟仍未恢复，才会从 Durable Object 和前端列表中删除。机器恢复心跳后会自动恢复为绿色在线状态。Worker 不会主动替节点生成心跳，只有通过中继令牌认证且成功转发到 TeamNode 的节点请求才会更新面板状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整没有停止通知时的超时阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
 
 如果以后设置了 `DASHBOARD_PASSWORD`，根页面和 `/api/nodes` 会启用 Basic Auth，默认用户名为 `admin`。
 
@@ -192,8 +192,8 @@ env \
 
 ```bash
 env \
-  TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码' \
   ARGO_AUTH='你的 Tunnel Token' \
+  TEAMNODE_SYNC_ENROLL_PASSWORD='Worker 上配置的兑换密码' \
   ARGO_DOMAIN='你的域名' \
   CFIP='cdst.lemon.vin' \
   NAME='lemon' \
