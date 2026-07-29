@@ -194,7 +194,7 @@ validate_uuid() {
 
 restore_existing_uuid_if_missing() {
   # Preserve the node identity during an in-place upgrade. A new machine has
-  # no .env yet, so it continues to receive a newly generated UUID below.
+  # no .env yet, so it receives a newly generated UUID before token exchange.
   if [[ -n "${UUID:-}" ]]; then
     return 0
   fi
@@ -231,14 +231,36 @@ generate_uuid_if_missing() {
     return 0
   fi
 
-  UUID="$("${NODE_BIN}" -e '
+  local generated=""
+  if [[ -n "${NODE_BIN:-}" && -x "${NODE_BIN}" ]]; then
+    generated="$("${NODE_BIN}" -e '
     const crypto = require("crypto");
     const bytes = crypto.randomBytes(16);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const hex = bytes.toString("hex");
     process.stdout.write(`${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`);
-  ' 2>/dev/null)" || die "无法随机生成 UUID"
+  ' 2>/dev/null || true)"
+  fi
+
+  if [[ ! "${generated}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+      generated="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
+    elif has_command uuidgen; then
+      generated="$(uuidgen 2>/dev/null || true)"
+    elif has_command openssl; then
+      local random_hex=""
+      random_hex="$(openssl rand -hex 16 2>/dev/null | tr -d '[:space:]' || true)"
+      if [[ "${random_hex}" =~ ^[0-9a-fA-F]{32}$ ]]; then
+        random_hex="${random_hex,,}"
+        random_hex="${random_hex:0:12}4${random_hex:13}"
+        random_hex="${random_hex:0:16}8${random_hex:17}"
+        generated="${random_hex:0:8}-${random_hex:8:4}-${random_hex:12:4}-${random_hex:16:4}-${random_hex:20:12}"
+      fi
+    fi
+  fi
+
+  UUID="${generated}"
   [[ -n "${UUID}" ]] || die "无法随机生成 UUID"
   validate_uuid
   log "未设置 UUID，已随机生成：${UUID}（将保存到 .env）"
@@ -1437,6 +1459,7 @@ main() {
   NODE_BIN="$(command -v node || true)"
   NPM_BIN="$(command -v npm || true)"
   restore_existing_uuid_if_missing
+  generate_uuid_if_missing
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
   validate_local_port "SERVER_PORT" "${SERVER_PORT}"
@@ -1449,10 +1472,14 @@ main() {
   detect_service_backend
 
   if is_true "${DRY_RUN}"; then
+    local system_node_label="未找到系统 Node.js"
+    if has_command node; then
+      system_node_label="$(node --version)"
+    fi
     if (( SYSTEM_NODE_MAJOR < 14 )); then
-      log "dry-run 检查通过：系统 Node.js $(node --version)，实际安装将使用项目专用 Node.js v${NODE_RUNTIME_VERSION}；启动方式：${SERVICE_BACKEND}"
+      log "dry-run 检查通过：${system_node_label}，实际安装将使用项目专用 Node.js v${NODE_RUNTIME_VERSION}；启动方式：${SERVICE_BACKEND}"
     else
-      log "dry-run 检查通过：Node.js $(node --version)，启动方式：${SERVICE_BACKEND}"
+      log "dry-run 检查通过：Node.js ${system_node_label}，启动方式：${SERVICE_BACKEND}"
     fi
     return 0
   fi
@@ -1462,13 +1489,11 @@ main() {
 
   TMP_DIR="$(mktemp -d)"
   trap 'rm -rf -- "${TMP_DIR}"' EXIT
-  stage "兑换 TeamNode 中继令牌"
-  redeem_teamnode_relay_token
-
   install -d -m 0750 "${APP_DIR}" "${APP_DIR}/app" "${BIN_PATH}" "${FILE_PATH}"
   create_service_user
   ensure_project_node_runtime
-  generate_uuid_if_missing
+  stage "兑换 TeamNode 中继令牌"
+  redeem_teamnode_relay_token
 
   local machine_arch
   case "$(uname -m)" in
