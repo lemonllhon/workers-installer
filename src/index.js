@@ -11,6 +11,7 @@ const DEFAULT_TEAMNODE_UPSTREAM_BASE_URL = "https://teamnode.lemon.vin";
 const DEFAULT_TEAMNODE_KEY_ID = "nodejs-argo-prod";
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
 const DEFAULT_ONLINE_TTL_MS = 10 * 60 * 1000;
+const MIN_HEARTBEATS_FOR_RETENTION = 5;
 const HEARTBEAT_HISTORY_LIMIT = 72;
 const TIMEZONE_COLLAPSE_THRESHOLD_MINUTES = 15;
 const NODE_REGISTRY_NAME = "nodejs-argo";
@@ -164,7 +165,8 @@ async function listNodeEvents(env) {
 
   const query = new URLSearchParams({
     now: String(Date.now()),
-    ttl: String(onlineTtlMs(env))
+    ttl: String(onlineTtlMs(env)),
+    timeout: String(heartbeatTimeoutMs(env))
   });
   const response = await stub.fetch(`https://node-registry/online?${query}`);
   if (!response.ok) throw new Error("node_registry_unavailable");
@@ -1220,13 +1222,16 @@ export class NodeRegistry {
       const key = `node:${uuid}`;
       const previous = (await this.state.storage.get(key)) || {};
 
-      // 下线请求仍然会转发给 TeamNode，但不能让监控面板立即删除节点。
-      // 下线记录在下一次面板轮询时立即显示“超时”；没有下线通知时，
-      // 则依据最后一次真实心跳的 heartbeat timeout 判断，再经过 online TTL 清理记录。
-      if (event.status === "offline") {
-        if (!previous.lastSeen) {
-          return json({ ok: true, retained: false });
-        }
+       const previousHistory = Array.isArray(previous.heartbeatHistory)
+         ? previous.heartbeatHistory.filter((value) => Number.isFinite(Number(value)))
+         : [];
+
+       // 心跳次数不足的节点不进入超时/离线保留流程，避免短暂注册或半安装节点长期残留。
+       if (event.status === "offline") {
+         if (!previous.lastSeen || previousHistory.length < MIN_HEARTBEATS_FOR_RETENTION) {
+           await this.state.storage.delete(key);
+           return json({ ok: true, retained: false, deleted: true });
+         }
         const stoppedAt = Number(event.stoppedAt || event.lastEventAt || Date.now());
         const retainedRecord = {
           ...previous,
@@ -1241,10 +1246,7 @@ export class NodeRegistry {
       }
 
       const lastSeen = Number(event.lastSeen || Date.now());
-      const previousHistory = Array.isArray(previous.heartbeatHistory)
-        ? previous.heartbeatHistory.filter((value) => Number.isFinite(Number(value)))
-        : [];
-      const lastHistoryValue = previousHistory[previousHistory.length - 1];
+       const lastHistoryValue = previousHistory[previousHistory.length - 1];
       const heartbeatHistory = lastHistoryValue === lastSeen
         ? previousHistory
         : [...previousHistory, lastSeen].slice(-HEARTBEAT_HISTORY_LIMIT);
@@ -1267,6 +1269,7 @@ export class NodeRegistry {
     if (url.pathname === "/online" && request.method === "GET") {
       const now = Number.parseInt(url.searchParams.get("now") || "", 10) || Date.now();
       const ttl = Number.parseInt(url.searchParams.get("ttl") || "", 10) || DEFAULT_ONLINE_TTL_MS;
+      const timeout = Number.parseInt(url.searchParams.get("timeout") || "", 10) || DEFAULT_HEARTBEAT_TIMEOUT_MS;
       const entries = await this.state.storage.list({ prefix: "node:" });
       const nodes = [];
 
@@ -1275,7 +1278,17 @@ export class NodeRegistry {
         const stoppedAt = Number(value?.stoppedAt || 0);
         const retentionAt = stoppedAt || lastSeen;
         const recordStatus = String(value?.status || "online");
-        if (!["online", "offline"].includes(recordStatus) || !retentionAt || now - retentionAt > ttl) {
+        const heartbeatCount = Array.isArray(value?.heartbeatHistory)
+          ? value.heartbeatHistory.filter((heartbeat) => Number.isFinite(Number(heartbeat))).length
+          : 0;
+        const lowHeartbeatRecord = heartbeatCount < MIN_HEARTBEATS_FOR_RETENTION;
+        const heartbeatStale = !lastSeen || now - lastSeen > timeout;
+        if (
+          !["online", "offline"].includes(recordStatus)
+          || !retentionAt
+          || now - retentionAt > ttl
+          || (lowHeartbeatRecord && (recordStatus === "offline" || heartbeatStale))
+        ) {
           await this.state.storage.delete(key);
           continue;
         }
