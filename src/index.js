@@ -226,22 +226,27 @@ function decorateNodeStatus(nodes, env) {
       const stoppedAt = Number(node.stoppedAt);
       const hasLastSeen = Number.isFinite(lastSeen) && lastSeen > 0;
       const hasStoppedAt = Number.isFinite(stoppedAt) && stoppedAt > 0;
+      const offlineEvent = String(node.eventPath || "").endsWith("/offline");
+      const isOffline = node.status === "offline" || (hasStoppedAt && offlineEvent);
+      const isActiveRecord = node.status === "online" && !isOffline;
       const activityAt = hasStoppedAt ? stoppedAt : lastSeen;
+      const inactivityAge = Number.isFinite(activityAt) && activityAt > 0 ? Math.max(0, now - activityAt) : Number.POSITIVE_INFINITY;
       const withinTtl = Number.isFinite(activityAt) && activityAt > 0 && now - activityAt <= ttl;
       return {
         ...node,
-        stopped: hasStoppedAt,
-        online: node.status === "online"
-          && !hasStoppedAt
+        stopped: isOffline,
+        offline: withinTtl && inactivityAge > timeout,
+        online: isActiveRecord
           && hasLastSeen
-          && now - lastSeen <= timeout,
-        timedOut: node.status === "online"
-          && withinTtl
-          && (hasStoppedAt || !hasLastSeen || now - lastSeen > timeout)
+          && inactivityAge <= timeout,
+        timedOut: withinTtl
+          && inactivityAge <= timeout
+          && isOffline
       };
     })
     .sort((left, right) => {
-      if (left.online !== right.online) return left.online ? -1 : 1;
+      const statusRank = (node) => node.online ? 0 : node.timedOut ? 1 : node.offline ? 2 : 3;
+      if (statusRank(left) !== statusRank(right)) return statusRank(left) - statusRank(right);
       return Number(right.lastSeen || right.lastEventAt || 0) - Number(left.lastSeen || left.lastEventAt || 0);
     });
 }
@@ -380,14 +385,23 @@ function runtimeSummary(node) {
   };
 }
 
-function heartbeatSegments(node) {
+function heartbeatSegments(node, env) {
   const history = heartbeatHistoryValues(node);
-  const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
-  return Array.from({ length: HEARTBEAT_HISTORY_LIMIT }, (_, index) => {
-    const timestamp = history[index];
-    if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
-    return `<span class="pulse ${pulseClass}" title="${htmlEscape(dashboardTime(timestamp))}" aria-label="心跳 ${htmlEscape(dashboardTime(timestamp))}"></span>`;
-  }).join("");
+  const ttl = onlineTtlMs(env);
+  const latestActivity = Number(node?.stoppedAt || history[history.length - 1] || node?.lastSeen || 0);
+  const elapsed = node?.timedOut || node?.offline
+    ? Math.max(0, Date.now() - latestActivity)
+    : 0;
+  const segmentDuration = ttl / HEARTBEAT_HISTORY_LIMIT;
+  const invalidCount = elapsed > 0
+    ? Math.min(HEARTBEAT_HISTORY_LIMIT - 1, Math.max(1, Math.ceil(elapsed / segmentDuration)))
+    : 0;
+  const greenHistory = history.slice(-Math.max(0, HEARTBEAT_HISTORY_LIMIT - invalidCount));
+  const greenSegments = greenHistory.map((timestamp) => `<span class="pulse pulse-ok" title="${htmlEscape(dashboardTime(timestamp))}" aria-label="心跳 ${htmlEscape(dashboardTime(timestamp))}"></span>`);
+  const invalidSegments = Array.from({ length: invalidCount }, () => `<span class="pulse ${node?.offline ? "pulse-offline" : "pulse-timeout"}" title="心跳失效" aria-label="心跳失效"></span>`);
+  const emptyCount = Math.max(0, HEARTBEAT_HISTORY_LIMIT - greenSegments.length - invalidSegments.length);
+  const emptySegments = Array.from({ length: emptyCount }, () => '<span class="pulse pulse-empty" aria-hidden="true"></span>');
+  return [...greenSegments, ...invalidSegments, ...emptySegments].join("");
 }
 
 async function dashboardPageResponse(request, env) {
@@ -397,47 +411,51 @@ async function dashboardPageResponse(request, env) {
 
   try {
     const nodes = decorateNodeStatus(await listNodeEvents(env) || [], env)
-      .filter((node) => node.online || node.timedOut);
+      .filter((node) => node.online || node.timedOut || node.offline);
     const onlineCount = nodes.filter((node) => node.online).length;
     const timedOutCount = nodes.filter((node) => node.timedOut).length;
+    const offlineCount = nodes.filter((node) => node.offline).length;
     const visibleCount = nodes.length;
     const timeoutMinutes = Math.max(1, Math.round(heartbeatTimeoutMs(env) / 60000));
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
-    const isOperational = onlineCount > 0 && timedOutCount === 0;
-    const overviewLabel = timedOutCount > 0
-      ? "部分节点心跳超时"
+    const hasAttention = timedOutCount > 0 || offlineCount > 0;
+    const isOperational = onlineCount > 0 && !hasAttention;
+    const overviewLabel = hasAttention
+      ? "部分节点状态异常"
       : isOperational ? "全部系统运行正常" : "暂无在线机器";
-    const overviewDetail = timedOutCount > 0
-      ? String(timedOutCount) + " 台机器已标记为超时；超过 " + String(ttlMinutes) + " 分钟未恢复心跳后自动移除。"
+    const overviewDetail = hasAttention
+      ? String(offlineCount) + " 台机器离线，" + String(timedOutCount) + " 台机器超时；超过 " + String(ttlMinutes) + " 分钟未恢复后自动移除。"
       : isOperational
         ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(timeoutMinutes) + " 分钟内保持在线。"
         : "等待机器发送心跳；超过 " + String(timeoutMinutes) + " 分钟后标记为超时，总计 " + String(ttlMinutes) + " 分钟后自动移出列表。";
-    const overviewClass = isOperational ? "operational" : timedOutCount > 0 ? "attention" : "waiting";
-    const overviewSymbol = isOperational ? "✓" : timedOutCount > 0 ? "!" : "…";
-    const heartbeatDescription = timedOutCount > 0
-      ? String(timedOutCount) + " 台机器心跳超时，恢复后会自动变绿"
+    const overviewClass = isOperational ? "operational" : hasAttention ? "attention" : "waiting";
+    const overviewSymbol = isOperational ? "✓" : hasAttention ? "!" : "…";
+    const heartbeatDescription = hasAttention
+      ? String(offlineCount) + " 台离线，" + String(timedOutCount) + " 台超时，恢复后会自动变绿"
       : onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
-    const heartbeatState = timedOutCount > 0 ? "有超时" : onlineCount > 0 ? "正常" : "等待中";
+    const heartbeatState = hasAttention ? "有异常" : onlineCount > 0 ? "正常" : "等待中";
     const heartbeatStateClass = heartbeatState === "正常" ? "operational" : heartbeatState === "等待中" ? "waiting" : "attention";
-    const nodeDescription = timedOutCount > 0
-      ? String(timedOutCount) + " 台节点暂时不可用，恢复心跳后会自动变绿"
+    const nodeDescription = hasAttention
+      ? String(offlineCount + timedOutCount) + " 台节点暂时不可用，恢复后会自动变绿"
       : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
-    const nodeState = timedOutCount > 0 ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
+    const nodeState = hasAttention ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
     const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
     const rows = nodes.length > 0
       ? nodes.map((node) => {
         const runtime = runtimeSummary(node);
         const nodeStatusClass = node.online ? "online" : node.timedOut ? "timed-out" : "offline";
+        const nodeStatusLabel = node.online ? "在线" : node.offline ? "离线" : node.timedOut ? "超时" : "未知";
+        const nodeBadgeClass = node.online ? "online" : node.offline ? "offline" : "timed-out";
         return `
         <article class="node-row node-row-${nodeStatusClass}">
           <div class="node-row-header">
             <div class="node-identity">
-              <span class="badge ${node.online ? "online" : "offline"}">${node.online ? "在线" : node.status === "offline" ? "已下线" : "超时"}</span>
+              <span class="badge ${nodeBadgeClass}">${nodeStatusLabel}</span>
               <div class="node-title"><strong>${htmlEscape(node.label || "未命名节点")}</strong><span>${htmlEscape(node.argoDomain || "-")}</span></div>
             </div>
             <div class="node-last-seen">${heartbeatTimeMarkup(node, node.lastSeen || node.lastEventAt)}</div>
           </div>
-          <div class="heartbeat-strip${node.online ? " heartbeat-active" : ""}" aria-label="最近心跳记录">${heartbeatSegments(node)}</div>
+          <div class="heartbeat-strip${node.online ? " heartbeat-active" : ""}" aria-label="最近心跳记录">${heartbeatSegments(node, env)}</div>
           <div class="heartbeat-scale"><span>现在</span><span>${ttlMinutes} 分钟前</span></div>
           <div class="node-fields">
             <div><span>来源 IP</span><strong>${htmlEscape(node.sourceIp || "-")}</strong></div>
@@ -570,6 +588,7 @@ async function dashboardPageResponse(request, env) {
     .pulse { position: relative; z-index: 1; display: block; min-width: 0; height: 18px; border-radius: 3px; background: #dff4e6; }
     .pulse-ok { height: 24px; background: #44d483; }
     .pulse-timeout { height: 24px; background: #e05252; }
+    .pulse-offline { height: 24px; background: #9ca3af; }
     .pulse-empty { background: #eef0f2; }
     @keyframes node-border-run { from { --node-border-angle: 0deg; } to { --node-border-angle: 360deg; } }
     @keyframes heartbeat-charge { 0% { opacity: 0; transform: translateX(0); } 12% { opacity: .45; } 82% { opacity: .45; } 100% { opacity: 0; transform: translateX(565%); } }
@@ -582,6 +601,8 @@ async function dashboardPageResponse(request, env) {
     .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #22a652; }
     .badge.offline { color: #6b7280; }
     .badge.offline::before { background: #9ca3af; }
+    .badge.timed-out { color: #b42318; }
+    .badge.timed-out::before { background: #e05252; }
     .empty { padding: 34px; text-align: center; color: var(--muted); }
     .footer { margin: 18px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
     @media (max-width: 640px) {
@@ -673,6 +694,7 @@ async function dashboardPageResponse(request, env) {
             <button class="filter-status-option" type="button" data-status="all" aria-pressed="true">全部</button>
             <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
             <button class="filter-status-option" type="button" data-status="timedOut" aria-pressed="false">超时</button>
+            <button class="filter-status-option" type="button" data-status="offline" aria-pressed="false">离线</button>
           </div>
           <div id="node-filter-view" class="filter-status node-view-toggle" role="group" aria-label="节点视图">
             <button class="node-view-option" type="button" data-view="list" aria-pressed="true" aria-label="列表视图" title="列表视图">
@@ -817,13 +839,24 @@ async function dashboardPageResponse(request, env) {
           .map((value) => Number(value))
           .filter((value) => Number.isFinite(value) && value > 0)
           .slice(-segmentLimit);
-        const pulseClass = node?.timedOut ? "pulse-timeout" : "pulse-ok";
-        return Array.from({ length: segmentLimit }, (_, index) => {
-          const timestamp = history[index];
-          if (!timestamp) return '<span class="pulse pulse-empty" aria-hidden="true"></span>';
+        const ttl = Number(window.__onlineTtlMs || 600000);
+        const latestActivity = Number(node?.stoppedAt || history[history.length - 1] || node?.lastSeen || 0);
+        const elapsed = node?.timedOut || node?.offline
+          ? Math.max(0, Date.now() - latestActivity)
+          : 0;
+        const segmentDuration = ttl / segmentLimit;
+        const invalidCount = elapsed > 0
+          ? Math.min(segmentLimit - 1, Math.max(1, Math.ceil(elapsed / segmentDuration)))
+          : 0;
+        const greenHistory = history.slice(-Math.max(0, segmentLimit - invalidCount));
+        const greenSegments = greenHistory.map((timestamp) => {
           const formatted = escapeHtml(formatTime(timestamp));
-          return '<span class="pulse ' + pulseClass + '" title="心跳 ' + formatted + '" aria-label="心跳 ' + formatted + '"></span>';
-        }).join("");
+          return '<span class="pulse pulse-ok" title="心跳 ' + formatted + '" aria-label="心跳 ' + formatted + '"></span>';
+        });
+        const invalidSegments = Array.from({ length: invalidCount }, () => '<span class="pulse ' + (node?.offline ? "pulse-offline" : "pulse-timeout") + '" title="心跳失效" aria-label="心跳失效"></span>');
+        const emptyCount = Math.max(0, segmentLimit - greenSegments.length - invalidSegments.length);
+        const emptySegments = Array.from({ length: emptyCount }, () => '<span class="pulse pulse-empty" aria-hidden="true"></span>');
+        return [...greenSegments, ...invalidSegments, ...emptySegments].join("");
       }
 
       function runtimeSummary(node) {
@@ -876,7 +909,7 @@ async function dashboardPageResponse(request, env) {
       }
 
       function setStatusFilter(status) {
-        selectedStatus = ["all", "online", "timedOut"].includes(status) ? status : "all";
+        selectedStatus = ["all", "online", "timedOut", "offline"].includes(status) ? status : "all";
         filterStatusElement.querySelectorAll("[data-status]").forEach((button) => {
           button.setAttribute("aria-pressed", String(button.dataset.status === selectedStatus));
         });
@@ -894,6 +927,7 @@ async function dashboardPageResponse(request, env) {
         return currentNodes.filter((node) => {
           if (selectedStatus === "online" && !node.online) return false;
           if (selectedStatus === "timedOut" && !node.timedOut) return false;
+          if (selectedStatus === "offline" && !node.offline) return false;
           return fuzzySearchMatch(nodeSearchText(node), query);
         });
       }
@@ -926,8 +960,8 @@ async function dashboardPageResponse(request, env) {
         }
 
         return nodes.map((node) => {
-          const status = node.online ? "在线" : (node.status === "offline" ? "已下线" : "超时");
-          const statusClass = node.online ? "online" : "offline";
+          const status = node.online ? "在线" : node.offline ? "离线" : node.timedOut ? "超时" : "未知";
+          const statusClass = node.online ? "online" : node.offline ? "offline" : "timed-out";
           const nodeStatusClass = node.online ? "online" : node.timedOut ? "timed-out" : "offline";
           const runtime = runtimeSummary(node);
           const heartbeatLimit = selectedView === "cards" ? 24 : 72;
@@ -964,38 +998,40 @@ async function dashboardPageResponse(request, env) {
           const data = await response.json();
           if (!data || !Array.isArray(data.nodes)) throw new Error("invalid_dashboard_response");
 
-          const visibleNodes = data.nodes.filter((node) => node && (node.online || node.timedOut));
+          const visibleNodes = data.nodes.filter((node) => node && (node.online || node.timedOut || node.offline));
           const onlineNodes = visibleNodes.filter((node) => node.online);
           const timedOutNodes = visibleNodes.filter((node) => node.timedOut);
+          const offlineNodes = visibleNodes.filter((node) => node.offline);
           const timeoutMinutes = Math.max(1, Math.round(Number(data.heartbeatTimeoutMs || 300000) / 60000));
           const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
-          const operational = onlineNodes.length > 0 && timedOutNodes.length === 0;
+          const hasAttention = timedOutNodes.length > 0 || offlineNodes.length > 0;
+          const operational = onlineNodes.length > 0 && !hasAttention;
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
           currentNodes = visibleNodes;
           renderFilteredNodes();
-          const overviewStatus = operational ? "operational" : timedOutNodes.length > 0 ? "attention" : "waiting";
+          const overviewStatus = operational ? "operational" : hasAttention ? "attention" : "waiting";
           overviewIconElement.className = "hero-icon " + overviewStatus;
-          overviewIconElement.textContent = operational ? "✓" : timedOutNodes.length > 0 ? "!" : "…";
-          overviewIconElement.setAttribute("aria-label", timedOutNodes.length > 0 ? "部分节点心跳超时" : operational ? "全部系统运行正常" : "等待机器心跳");
-          overviewLabelElement.textContent = timedOutNodes.length > 0
-            ? "部分节点心跳超时"
+          overviewIconElement.textContent = operational ? "✓" : hasAttention ? "!" : "…";
+          overviewIconElement.setAttribute("aria-label", hasAttention ? "部分节点状态异常" : operational ? "全部系统运行正常" : "等待机器心跳");
+          overviewLabelElement.textContent = hasAttention
+            ? "部分节点状态异常"
             : operational ? "全部系统运行正常" : "暂无在线机器";
-          overviewDetailElement.textContent = timedOutNodes.length > 0
-            ? timedOutNodes.length + " 台机器已标记为超时；超过 " + ttlMinutes + " 分钟未恢复心跳后自动移除。"
+          overviewDetailElement.textContent = hasAttention
+            ? offlineNodes.length + " 台机器离线，" + timedOutNodes.length + " 台机器超时；超过 " + ttlMinutes + " 分钟未恢复后自动移除。"
             : operational
               ? onlineNodes.length + " 台机器正在发送心跳，最近 " + timeoutMinutes + " 分钟内保持在线。"
               : "等待机器发送心跳；超过 " + timeoutMinutes + " 分钟后标记为超时，总计 " + ttlMinutes + " 分钟后自动移出列表。";
           nodeCountElement.textContent = visibleNodes.length + " 台";
-          heartbeatDescriptionElement.textContent = timedOutNodes.length > 0
-            ? timedOutNodes.length + " 台机器心跳超时，恢复后会自动变绿"
+          heartbeatDescriptionElement.textContent = hasAttention
+            ? offlineNodes.length + " 台离线，" + timedOutNodes.length + " 台超时，恢复后会自动变绿"
             : onlineNodes.length > 0 ? onlineNodes.length + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
-          heartbeatStateElement.textContent = timedOutNodes.length > 0 ? "有超时" : onlineNodes.length > 0 ? "正常" : "等待中";
-          heartbeatStateElement.className = "service-state " + (timedOutNodes.length > 0 ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
-          nodeDescriptionElement.textContent = timedOutNodes.length > 0
-            ? timedOutNodes.length + " 台节点暂时不可用，恢复心跳后会自动变绿"
+          heartbeatStateElement.textContent = hasAttention ? "有异常" : onlineNodes.length > 0 ? "正常" : "等待中";
+          heartbeatStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
+          nodeDescriptionElement.textContent = hasAttention
+            ? (offlineNodes.length + timedOutNodes.length) + " 台节点暂时不可用，恢复后会自动变绿"
             : onlineNodes.length > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
-          nodeStateElement.textContent = timedOutNodes.length > 0 ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
-          nodeStateElement.className = "service-state " + (timedOutNodes.length > 0 ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
+          nodeStateElement.textContent = hasAttention ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
+          nodeStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
           lastUpdatedElement.textContent = "刚刚更新";
           statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP，如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。";
         } catch (error) {
@@ -1194,7 +1230,7 @@ export class NodeRegistry {
         const stoppedAt = Number(event.stoppedAt || event.lastEventAt || Date.now());
         const retainedRecord = {
           ...previous,
-          status: "online",
+          status: "offline",
           eventPath: event.eventPath || previous.eventPath,
           stoppedAt,
           lastEventAt: Number(event.lastEventAt || Date.now()),
@@ -1238,7 +1274,8 @@ export class NodeRegistry {
         const lastSeen = Number(value?.lastSeen || 0);
         const stoppedAt = Number(value?.stoppedAt || 0);
         const retentionAt = stoppedAt || lastSeen;
-        if (value?.status !== "online" || !retentionAt || now - retentionAt > ttl) {
+        const recordStatus = String(value?.status || "online");
+        if (!["online", "offline"].includes(recordStatus) || !retentionAt || now - retentionAt > ttl) {
           await this.state.storage.delete(key);
           continue;
         }
