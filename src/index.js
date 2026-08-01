@@ -573,7 +573,7 @@ async function dashboardPageResponse(request, env) {
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
             <div><span>系统架构</span><strong>${htmlEscape(runtime.arch)}</strong></div>
             <div><span>CPU / 内存</span><strong>${htmlEscape(runtime.resources)}</strong></div>
-            <div><span>Cloudflare Tunnel</span>${tunnelConnectivityMarkup(node)}</div>
+            <div class="tunnel-row"><span>Cloudflare Tunnel</span>${tunnelConnectivityMarkup(node)}</div>
           </div>
         </article>`;
       }).join("")
@@ -708,9 +708,11 @@ async function dashboardPageResponse(request, env) {
     .node-fields div { display: grid; min-width: 0; gap: 5px; }
     .node-fields span { color: var(--muted); font-size: 11px; }
     .node-fields strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 600; }
-    .tunnel-field { display: grid; gap: 3px; }
+    .node-fields .tunnel-row { grid-column: 1 / -1; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
+    .node-fields .tunnel-row > span { flex: 0 0 auto; }
+    .tunnel-field { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 7px; min-width: 0; }
     .tunnel-field > span { color: inherit; font-size: 13px; font-weight: 650; }
-    .tunnel-field small { color: var(--muted); font-size: 10px; font-weight: 500; line-height: 1.35; }
+    .tunnel-field small { color: var(--muted); font-size: 11px; font-weight: 500; line-height: 1.35; }
     .tunnel-connected { color: var(--green); }
     .tunnel-degraded, .tunnel-offline { color: #b42318; }
     .tunnel-unknown, .tunnel-not_applicable { color: var(--muted); }
@@ -1157,7 +1159,7 @@ async function dashboardPageResponse(request, env) {
             + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
             + '<div><span>系统架构</span><strong>' + escapeHtml(runtime.arch) + '</strong></div>'
             + '<div><span>CPU / 内存</span><strong>' + escapeHtml(runtime.resources) + '</strong></div>'
-            + '<div><span>Cloudflare Tunnel</span>' + renderTunnelConnectivity(node) + '</div>'
+            + '<div class="tunnel-row"><span>Cloudflare Tunnel</span>' + renderTunnelConnectivity(node) + '</div>'
             + '</div></article>';
         }).join("");
       }
