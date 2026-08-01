@@ -37,7 +37,7 @@ Workers & Pages
 | --- | --- | --- |
 | `TEAMNODE_SYNC_SECRET` | Secret | TeamNode 主密钥，只在 Worker 代理请求时使用 |
 | `TEAMNODE_SYNC_ENROLL_PASSWORD` | Secret | 目标机器安装时输入的兑换密码 |
-| `CLOUDFLARE_API_KEY` | Secret，可选 | 直连回退时用于更新 `ARGO_DOMAIN` 的 Cloudflare Zone DNS；安装兑换时按请求下发到目标机器的 0600 `.env` |
+| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 DNS-only A 记录；安装兑换时按请求下发到目标机器的 0600 `.env` |
 
 如果需要根页面在线机器面板，再添加：
 
@@ -145,13 +145,22 @@ https://你的-worker.workers.dev/
 必须设置：
 
 - `ARGO_AUTH`：Cloudflare Tunnel Token 或 JSON；
-- `ARGO_DOMAIN`：固定 Tunnel 域名。
+- `ARGO_DOMAIN`：固定 Tunnel 域名，例如 `boxd06.openlemon.cyou`；始终预留给 cloudflared，不再被直连 A 记录覆盖。
+
+直连域名不需要手动传入。安装器会在 `ARGO_DOMAIN` 最左侧标签前自动加上固定前缀 `zhilian`，例如：
+
+```text
+Tunnel：boxd06.openlemon.cyou
+直连： zhilianboxd06.openlemon.cyou
+```
+
+切换直连后，Cloudflare DNS、Let's Encrypt 证书、Nginx `server_name`、Worker 最终回访以及 VLESS/VMess/Trojan 的 `add`、`host`、`sni` 都使用直连域名；`ARGO_DOMAIN` 继续保留给原 Cloudflare Tunnel。每台机器仍必须使用唯一的 `ARGO_DOMAIN`，以免两台机器派生出同一个直连域名。
 
 常用可选参数：
 
 - `ARGO_PORT`：Tunnel 连接的本地端口，默认 `8001`；
 - `CLOUDFLARED_PROTOCOL`：Tunnel 传输协议，可选 `http2`、`quic`、`auto`，默认 `http2`；
-- `AUTO_CONFIGURE_FIREWALL`：root 安装时是否自动配置已启用的主机防火墙，默认 `true`；仅配置出站 Tunnel 端口，不会打开入站端口；
+- `AUTO_CONFIGURE_FIREWALL`：root 安装时是否自动配置已启用的主机防火墙，默认 `true`；Tunnel 模式配置出站 7844，直连探测还会放行 `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT`、`DIRECT_HTTP_PORT` 和 `DIRECT_PORT_SCAN_PORTS` 中明确列出的入站 TCP 端口；
 - `CFIP`：节点连接地址，例如 `cdst.lemon.vin`；
 - `NAME`：节点名称前缀；
 - `UUID`：新机器不设置时自动随机生成；覆盖已有安装且不设置时，自动复用旧 `.env` 中的 UUID；显式指定时优先使用指定值；
@@ -377,13 +386,13 @@ env \
 | Cloudflare Edge `7844/TCP` | 本机出站 | `http2` 或 `auto` 时做 TCP 连接心跳 | 确认 Tunnel 的 HTTP/2 传输路径 |
 | Cloudflare Edge `7844/UDP` | 本机出站 | `quic` 或 `auto` 时做最佳努力 UDP 心跳 | 提前发现明显的 UDP 阻断；最终以 cloudflared 的 QUIC 握手为准 |
 | `SERVER_PORT`（默认 3000）和 `ARGO_PORT`（默认 8001） | 本机监听 | 服务启动后用 `ss` 检查 | 应用内部端口，不属于公网入口，不会交给 Worker 探测 |
-| `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT_SCAN_PORTS`、`DIRECT_PORT_SCAN_RANGE` | 公网入站 | 服务启动后临时监听，Worker 从公网建立 TCP/HTTP(S) 心跳 | 覆盖云安全组、上游网络和运营商入口限制，决定直连端口 |
+| `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT_SCAN_PORTS`、`DIRECT_PORT_SCAN_RANGE` | 公网入站 | 服务启动后临时监听，Worker 通过节点本次请求的公网 IPv4 分批回访 TCP 端口 | 覆盖云安全组、上游网络和运营商入口限制，决定直连端口；3000/8001 不参与 |
 
 阶段 1 的 7844 预检会逐项显示协议、Edge 地址、端口和序号，每个 Edge 使用 6 秒硬超时，因此不会在空白状态下无限等待。所选协议的 7844 被明确判定为阻断后，安装器会跳过 cloudflared 下载、Tunnel 防火墙配置和 Tunnel 启动，节点直接进入 Worker 直连端口心跳；只有结果可用或无法可靠判断时才保留 Tunnel 路线。阶段 1 不能提前判断直连入站端口，因为此时节点还没有监听这些端口；直连端口必须在启动后的 Worker 外部回访中确认。即使扫描范围包含 `SERVER_PORT` 或 `ARGO_PORT`，安装器和节点也会把这两个本机端口从直连探测及直连防火墙候选中排除。安装器只有在本机服务监听检查和最终公网路线检查都通过后才完成安装。
 
 启动阶段的 Tunnel 路由心跳默认最多重试 5 次、每次间隔 4 秒；可用 `STARTUP_TUNNEL_PROBE_ATTEMPTS` 和 `STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS` 调整。Tunnel 心跳包括节点到 Cloudflare Edge 的 7844 出站连通性，以及 Worker 对最终 `ARGO_DOMAIN` 的回访；Worker 不会把 `install.lemon.vin:7844` 当作 Tunnel 目标，因为 7844 是节点到 Cloudflare Edge 的传输端口。
 
-安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES` 的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会让 `install.lemon.vin` 从公网向本机临时监听的候选端口建立 TCP 连接，这一步能够覆盖云平台安全组、上游防火墙和运营商入口策略。如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时将 `ARGO_DOMAIN` 更新为 DNS-only A 记录；如果证书组件不可用或这两个端口不同时可达，则选择可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多扫描 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。直连网关启动后，Worker 还会从公网向最终域名发起一次 HTTP/HTTPS 请求；只有 TCP 和最终请求都通过，节点才会注册到面板。
+安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES`、当前直连端口以及 `DIRECT_PORT_SCAN_PORTS` 明确列出的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会为当前一批候选端口建立临时 IPv4 TCP 监听，再通过 IPv4 请求 `install.lemon.vin`，使 Worker 回访本次请求对应的公网 IPv4。这一步能够覆盖云平台安全组、上游防火墙和运营商入口策略，避免节点通过 IPv6 访问 Worker 时误探测 IPv6。如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时把自动派生的 `zhilian...` 直连域名创建为 DNS-only A 记录；证书申请默认最多尝试 3 次、每次失败后等待 30 秒，最终仍失败则自动改用 HTTP。如果 `443` 和 `80` 不同时可达，则选择第一个可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。能够从 `ARGO_AUTH` 解析固定 Tunnel ID 时，安装器还会保留或恢复 `ARGO_DOMAIN -> <Tunnel-ID>.cfargotunnel.com` 的代理 CNAME；旧版本遗留在 `ARGO_DOMAIN` 上的直连 A/AAAA 记录会被迁移掉。直连网关启动后，Worker 会从公网向 `zhilian...` 最终域名发起一次 HTTP/HTTPS 请求；只有 TCP 和最终请求都通过，节点才会注册到面板。
 
 如果 Tunnel 和直连都探测不到可用路线，程序不会继续空转重启：会在数据目录写入 `.no-route`，以退出码 `78` 停止，systemd、Supervisor 和 PM2 也会停止拉起。修复云平台安全组、上游防火墙或运营商网络后，重新运行安装器会清除该标记并再次按 Tunnel 优先顺序探测。直连模式下不会启动 Cloudflare Tunnel，也不会删除 Cloudflare 控制台中的远端 Tunnel 资源；仅清理本机运行进程和凭据文件，避免误删共享 Tunnel。
 
@@ -395,7 +404,22 @@ DIRECT_PORT_SCAN_RANGE=1024-65535
 DIRECT_PORT_SCAN_MAX=256
 ```
 
-探测顺序是先检查默认候选端口，再检查 `DIRECT_PORT_SCAN_PORTS`，最后按 `DIRECT_PORT_SCAN_RANGE` 扩展扫描；每批最多探测 12 个端口。将 `DIRECT_PORT_SCAN_MAX` 设置为 `0` 可关闭扩展扫描，最大值为 `4096`。这些变量应写入目标机器的 `/opt/nodejs-argo-no-docker/.env`，不需要配置为 Worker Secret。
+实际探测顺序如下：
+
+1. 第一批只并发检查标准入口 `80,443`。如果两者都开放且证书组件可用，则选择 HTTPS 443；如果只开放其中一个，则直接选择该端口的 HTTP。
+2. 标准入口都不可用时，按默认顺序检查 `8080,8443,8880,2053,2083,2087,2096`，每批最多 4 个端口。
+3. 初始候选全部失败后，先检查 `DIRECT_PORT_SCAN_PORTS` 明确列出的端口，再从 `DIRECT_PORT_SCAN_RANGE` 中均匀抽样补足到 `DIRECT_PORT_SCAN_MAX`，仍然每批最多 4 个端口。范围扫描不是逐个检查 `1024-65535` 的全部端口。
+4. 同一批端口在节点上并发建立临时监听，Worker 也并发回访；批次之间串行执行。单端口公网 TCP 回访硬超时为 3.5 秒，发现首个可用端口后立即停止后续批次，并在 `finally` 阶段关闭整批临时监听。
+
+Worker 接口最多接受每批 4 个端口，为 Cloudflare Worker 的并发外连限制保留余量。默认选择顺序是 `80,8080,8443,8880,2053,2083,2087,2096,443`，然后才是其余自定义或扩展结果；非标准端口被选中时使用普通 HTTP。`SERVER_PORT`（默认 3000）和 `ARGO_PORT`（默认 8001）始终排除，扩展扫描还会排除 `22,25,53,110,143,587,3306,3389`。
+
+将 `DIRECT_PORT_SCAN_MAX` 设置为 `0` 可关闭扩展扫描，最大值为 `4096`。默认 256 个端口在全部表现为超时的理论最坏情况下约需 `256 / 4 × 3.5 = 224` 秒，加上批次请求开销可能超过安装器默认的 180 秒等待时间。需要大范围探测时建议同时设置：
+
+```bash
+PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS=600
+```
+
+这些变量应写入目标机器的 `/opt/nodejs-argo-no-docker/.env`，或在首次安装命令的 `env` 中传入，不需要配置为 Worker Secret。自动防火墙配置会放行 `DIRECT_PORT_SCAN_PORTS` 中明确列出的端口，但不会把整个 `DIRECT_PORT_SCAN_RANGE` 全量开放；使用范围抽样时，云安全组和已启用的主机防火墙必须允许对应端口，否则 Worker 会正确报告为不可达。
 
 安装器只能修改目标机器上的 UFW、firewalld、nftables 或 iptables；云厂商安全组、上游防火墙和运营商网络仍需在厂商控制台放行。当前使用的 Cloudflare API Token 只应授予目标 Zone 的 DNS Read/Edit 权限，不要把 Token 放入 GitHub、公开安装命令或日志；如果曾经暴露过 Token，应先在 Cloudflare 中撤销并重新创建。
 

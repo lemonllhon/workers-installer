@@ -54,6 +54,7 @@ TEAMNODE_SYNC_ENABLED="${TEAMNODE_SYNC_ENABLED:-true}"
 CLOUDFLARE_API_KEY="${CLOUDFLARE_API_KEY:-}"
 AUTO_DIRECT_FALLBACK="${AUTO_DIRECT_FALLBACK:-true}"
 DIRECT_MODE="${DIRECT_MODE:-false}"
+DIRECT_DOMAIN=""
 DIRECT_TLS_ENABLED="${DIRECT_TLS_ENABLED:-true}"
 # These are public-ingress candidates. They are only probed by the Worker
 # after the node creates temporary listeners for direct-route discovery.
@@ -143,7 +144,7 @@ auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后�
 如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
 CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
 AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
-AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳，443+80 都可达时申请 Let's Encrypt，否则使用发现到的 HTTP 端口。
+AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；ARGO_DOMAIN 只供 Tunnel 使用，直连自动使用 zhilian+ARGO_DOMAIN。节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳，443+80 都可达时为直连域名申请 Let's Encrypt，否则使用发现到的 HTTP 端口。
 阶段 1 会先检查 TeamNode Worker HTTPS 和按协议选择的 Cloudflare Edge 7844 出站心跳；3000/8001 只在节点启动后检查本机监听，直连候选端口只在节点启动临时监听后由 Worker 从公网心跳确认。
 候选端口全部失败后，会按 DIRECT_PORT_SCAN_PORTS 和 DIRECT_PORT_SCAN_RANGE 扩展进行端口发现；DIRECT_PORT_SCAN_MAX 默认 256，避免一次性检查全部端口。
 Tunnel 和直连都没有可用路线时，节点会写入 `.no-route` 标记并以退出码 78 停止，systemd、Supervisor 和 PM2 不会继续反复拉起；修复云安全组/上游网络后重新运行安装器即可清除标记并重新探测。
@@ -218,6 +219,10 @@ require_root() {
 require_config() {
   [[ -n "${ARGO_DOMAIN:-}" ]] || die "必须设置 ARGO_DOMAIN"
   [[ -n "${ARGO_AUTH:-}" ]] || die "必须设置 ARGO_AUTH"
+  # ARGO_DOMAIN 永远预留给 Cloudflare Tunnel。所有直连入口使用独立的
+  # zhilian 前缀，避免直连 A 记录覆盖 Tunnel CNAME。
+  DIRECT_DOMAIN="zhilian$(printf '%s' "${ARGO_DOMAIN}" | tr '[:upper:]' '[:lower:]')"
+  CF_DNS_RECORD_NAME="${DIRECT_DOMAIN}"
   if is_true "${TEAMNODE_SYNC_ENABLED}"; then
     if [[ -n "${TEAMNODE_SYNC_SECRET}" && -n "${TEAMNODE_SYNC_RELAY_TOKEN}" ]]; then
       die "不要同时设置 TEAMNODE_SYNC_SECRET 和 TEAMNODE_SYNC_RELAY_TOKEN；Worker 代理模式只设置中继令牌"
@@ -895,6 +900,7 @@ write_env_file() {
   write_env_value "BIN_PATH" "${BIN_PATH}"
   write_env_value "ARGO_PORT" "${ARGO_PORT}"
   write_env_value "ARGO_DOMAIN" "${ARGO_DOMAIN}"
+  write_env_value "DIRECT_DOMAIN" "${DIRECT_DOMAIN}"
   write_env_value "ARGO_AUTH" "${ARGO_AUTH}"
   write_env_value "CFIP" "${CFIP:-}"
   write_env_value "CFPORT" "${CFPORT}"
@@ -2317,6 +2323,7 @@ main() {
 
   require_root
   require_config
+  log "域名规划：Tunnel=${ARGO_DOMAIN}；直连=${DIRECT_DOMAIN}"
   validate_worker_placeholders
   check_dependencies
   validate_cloudflared_protocol
