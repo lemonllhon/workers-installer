@@ -79,6 +79,8 @@ const DIRECT_FALLBACK_FAILURE_THRESHOLD = Number.parseInt(process.env.DIRECT_FAL
 const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
 const DIRECT_KEY_FILE = process.env.DIRECT_KEY_FILE || "";
 const DIRECT_LETSENCRYPT_EMAIL = process.env.DIRECT_LETSENCRYPT_EMAIL || "admin@lemon.vin";
+const DIRECT_CERTIFICATE_ATTEMPTS = Math.max(1, Math.min(5, Number.parseInt(process.env.DIRECT_CERTIFICATE_ATTEMPTS || "3", 10) || 3));
+const DIRECT_CERTIFICATE_RETRY_DELAY_MS = Math.max(5000, Number.parseInt(process.env.DIRECT_CERTIFICATE_RETRY_DELAY_MS || "30000", 10) || 30000);
 const CF_DNS_ENABLED = parseBoolean(process.env.CF_DNS_ENABLED, false);
 const CF_API_TOKEN = process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_KEY || "";
 const CF_DNS_ZONE_ID = process.env.CF_DNS_ZONE_ID || "";
@@ -2123,6 +2125,7 @@ async function ensureDirectCertificate() {
 
   writeDirectNginxConfig({ httpOnly: true });
   await startNginx();
+  let certificateError = null;
   try {
     const webroot = path.resolve(directAcmePath);
     const certbotArgs = [
@@ -2145,9 +2148,30 @@ async function ensureDirectCertificate() {
       "--keep-until-expiring",
       "--no-eff-email"
     ].map(shellQuote).join(" ");
-    await exec(`${shellQuote(CERTBOT_BIN)} ${certbotArgs}`);
+    for (let attempt = 1; attempt <= DIRECT_CERTIFICATE_ATTEMPTS; attempt += 1) {
+      appendRouteProbeProgress(`Let's Encrypt 证书申请 ${attempt}/${DIRECT_CERTIFICATE_ATTEMPTS}：${ARGO_DOMAIN}`);
+      try {
+        await exec(`${shellQuote(CERTBOT_BIN)} ${certbotArgs}`);
+        certificateError = null;
+        appendRouteProbeProgress(`Let's Encrypt 证书申请成功：${ARGO_DOMAIN}`);
+        break;
+      } catch (error) {
+        certificateError = error;
+        appendRouteProbeProgress(
+          `Let's Encrypt 证书申请失败 ${attempt}/${DIRECT_CERTIFICATE_ATTEMPTS}：${String(error?.message || "certbot_failed").slice(0, 160)}`
+        );
+        if (attempt < DIRECT_CERTIFICATE_ATTEMPTS) {
+          appendRouteProbeProgress(`等待 ${Math.ceil(DIRECT_CERTIFICATE_RETRY_DELAY_MS / 1000)} 秒后重试证书，等待 DNS 缓存更新`);
+          await new Promise((resolve) => setTimeout(resolve, DIRECT_CERTIFICATE_RETRY_DELAY_MS));
+        }
+      }
+    }
   } finally {
     await stopDirectNginx();
+  }
+
+  if (certificateError) {
+    throw new Error(`Let's Encrypt 证书申请失败：${String(certificateError?.message || "certbot_failed").slice(0, 240)}`);
   }
 
   if (!fs.existsSync(certificate.certificateFile) || !fs.existsSync(certificate.keyFile)) {
@@ -2341,12 +2365,34 @@ async function startDirectGateway() {
     writeDirectNginxConfig({ tlsEnabled: false });
     await startNginx();
     console.log(`直连 HTTP 模式已启动：${ARGO_DOMAIN}:${DIRECT_PORT}`);
-    return;
+    return false;
   }
-  const certificate = await ensureDirectCertificate();
+  let certificate;
+  try {
+    certificate = await ensureDirectCertificate();
+  } catch (error) {
+    const fallbackPort = Number.parseInt(String(DIRECT_HTTP_PORT), 10);
+    if (
+      !AUTO_DIRECT_FALLBACK
+      || !NODEJS_ARGO_ENV_FILE
+      || !Number.isInteger(fallbackPort)
+      || fallbackPort < 1
+      || fallbackPort > 65535
+      || LOCAL_SERVICE_PORTS.has(fallbackPort)
+    ) {
+      throw error;
+    }
+    writeDirectFallbackEnv({ tlsEnabled: false, port: fallbackPort, httpPort: fallbackPort });
+    appendRouteProbeProgress(
+      `证书申请最终失败，按回退规则切换为 HTTP ${fallbackPort}；正在重启服务应用配置`
+    );
+    console.warn(`证书申请最终失败，自动降级为直连 HTTP ${fallbackPort}：${error.message}`);
+    return true;
+  }
   writeDirectNginxConfig(certificate);
   await startNginx();
   startDirectCertificateRenewal();
+  return false;
 }
 
 function writeArgoGatewayResponse(socket, statusCode, message) {
@@ -2593,7 +2639,12 @@ async function startProcesses() {
 
   if (DIRECT_MODE) {
     try {
-      await startDirectGateway();
+      const restartForHttpFallback = await startDirectGateway();
+      if (restartForHttpFallback) {
+        await stopRuntimeProcesses();
+        setTimeout(() => process.exit(0), 100);
+        return true;
+      }
       console.log(`直连模式已启动：${ARGO_DOMAIN}:${DIRECT_PORT}，HTTP ${DIRECT_HTTP_PORT} 用于证书验证和跳转`);
     } catch (error) {
       console.error(`直连网关启动失败：${error.message}`);
@@ -2617,6 +2668,7 @@ async function startProcesses() {
   }
 
   await new Promise((resolve) => setTimeout(resolve, 5000));
+  return false;
 }
 
 // 生成固定隧道配置文件
@@ -2966,7 +3018,7 @@ async function startserver() {
     cleanupOldFiles();
     argoType();
     await generateConfig();
-    await startProcesses();
+    if (await startProcesses()) return;
     if (await prepareTunnelStartup()) return;
     if (DIRECT_MODE) {
       await verifyPublicRouteAtStartup();
