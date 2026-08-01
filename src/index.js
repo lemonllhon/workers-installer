@@ -726,8 +726,8 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .system-status-overview { display: grid; grid-template-columns: 32px minmax(0, 1fr); align-items: center; justify-content: start; gap: 10px; min-width: 0; padding: 0; }
-    .system-status-overview-copy { display: grid; min-width: 0; gap: 2px; align-content: center; text-align: left; }
+    .system-status-overview { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; justify-content: start; gap: 8px; min-width: 0; padding: 0; }
+    .system-status-overview-copy { display: grid; width: 100%; min-width: 0; gap: 2px; align-content: start; text-align: left; }
     .system-status-summary { display: grid; justify-items: start; gap: 2px; min-width: 0; text-align: left; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
     .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
@@ -840,6 +840,9 @@ async function dashboardPageResponse(request, env) {
     .badge.timed-out::before { background: #e05252; }
     .empty { padding: 34px; text-align: center; color: var(--muted); }
     .footer { margin: 18px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+    @media (max-width: 1180px) and (min-width: 641px) {
+      .system-status-layout { grid-template-columns: 1fr; }
+    }
     @media (max-width: 640px) {
       main { width: min(100% - 28px, 1600px); padding-top: 14px; }
       .topbar { align-items: flex-start; padding-bottom: 8px; }
