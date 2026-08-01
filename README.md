@@ -131,7 +131,7 @@ https://install.lemon.vin/install.sh
 https://你的-worker.workers.dev/
 ```
 
-未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，不显示 UUID 或其他敏感配置。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；累计心跳少于 5 次的节点，在明确下线或 Worker 确认其超过心跳检测阈值后直接删除，不进入超时/离线保留流程。累计达到 5 次心跳的节点，明确下线后的前 5 分钟显示“超时”，第 5–10 分钟显示“离线”，超过 10 分钟后自动删除。没有明确下线通知的节点，Worker 会在下一次轮询发现其超过 5 分钟没有心跳时显示“离线”，并在最后一次活动超过 10 分钟后自动删除；恢复心跳后自动回到“在线”。Worker 不会主动替节点生成心跳，只有通过中继令牌认证且成功转发到 TeamNode 的节点请求才会更新面板状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整心跳阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
+未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，以及节点实际上报的 Cloudflare Tunnel 连通性、传输协议、所需端口、HTTP 状态码、失败原因和最后检查时间；不显示 UUID 或其他敏感配置。Tunnel 连通性由节点先探测 Cloudflare Tunnel 传输端口，再访问 `ARGO_DOMAIN` 检查边缘返回，不把 TeamNode 心跳直接当作 Tunnel 在线。当前 HTTP/2 配置通常显示需要放行出站 TCP `7844`；QUIC 显示 UDP `7844`；自动协议显示 TCP/UDP `7844`。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；累计心跳少于 5 次的节点，在明确下线或 Worker 确认其超过心跳检测阈值后直接删除，不进入超时/离线保留流程。累计达到 5 次心跳的节点，明确下线后的前 5 分钟显示“超时”，第 5–10 分钟显示“离线”，超过 10 分钟后自动删除。没有明确下线通知的节点，Worker 会在下一次轮询发现其超过 5 分钟没有心跳时显示“离线”，并在最后一次活动超过 10 分钟后自动删除；恢复心跳后自动回到“在线”。Worker 不会主动替节点生成心跳，只有通过中继令牌认证且成功转发到 TeamNode 的节点请求才会更新面板状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整心跳阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
 
 如果以后设置了 `DASHBOARD_PASSWORD`，根页面和 `/api/nodes` 会启用 Basic Auth，默认用户名为 `admin`。
 
@@ -149,6 +149,8 @@ https://你的-worker.workers.dev/
 常用可选参数：
 
 - `ARGO_PORT`：Tunnel 连接的本地端口，默认 `8001`；
+- `CLOUDFLARED_PROTOCOL`：Tunnel 传输协议，可选 `http2`、`quic`、`auto`，默认 `http2`；
+- `AUTO_CONFIGURE_FIREWALL`：root 安装时是否自动配置已启用的主机防火墙，默认 `true`；仅配置出站 Tunnel 端口，不会打开入站端口；
 - `CFIP`：节点连接地址，例如 `cdst.lemon.vin`；
 - `NAME`：节点名称前缀；
 - `UUID`：新机器不设置时自动随机生成；覆盖已有安装且不设置时，自动复用旧 `.env` 中的 UUID；显式指定时优先使用指定值；
@@ -360,6 +362,8 @@ env \
 不要把真实兑换密码写入公开脚本、README、GitHub 或 Shell 历史。
 
 `ARGO_PORT` 默认是 `8001`，通常不需要填写。`FORCE_KILL_PORTS=true` 只在覆盖旧安装、确认其他程序占用节点端口且需要强制清理时添加；新机器安装不建议默认开启。
+
+安装器会检测已启用的 UFW、firewalld、nftables 或 iptables，并按 `CLOUDFLARED_PROTOCOL` 尝试幂等放行出站 `7844`：`http2` 为 TCP，`quic` 为 UDP，`auto` 为 TCP 和 UDP。Cloudflare Tunnel 是出站连接，不需要为了 Tunnel 打开入站 `7844`。云平台安全组、VPS 上游防火墙或服务商网络策略不在机器内部，安装器无法代为修改；面板会通过节点探测结果显示端口是否仍被阻断。
 
 ### 安装完成后检查心跳
 

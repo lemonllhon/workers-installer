@@ -82,6 +82,39 @@ function normalizeRuntimeInfo(value) {
   };
 }
 
+function normalizeTunnelConnectivity(value) {
+  if (!value || typeof value !== "object") return null;
+
+  const statusValues = ["connected", "degraded", "offline", "unknown", "not_applicable"];
+  const portStatusValues = ["open", "blocked", "not_checked", "unknown"];
+  const status = statusValues.includes(String(value.status || "")) ? String(value.status) : "unknown";
+  const portStatus = portStatusValues.includes(String(value.portStatus || ""))
+    ? String(value.portStatus)
+    : "unknown";
+  const checkedAt = Number(value.checkedAt);
+  const port = Number.parseInt(String(value.port || ""), 10);
+  const httpStatus = Number.parseInt(String(value.httpStatus || ""), 10);
+  const latencyMs = Number.parseInt(String(value.latencyMs || ""), 10);
+  const requiredProtocols = Array.isArray(value.requiredProtocols)
+    ? value.requiredProtocols
+      .map((protocol) => String(protocol || "").toUpperCase())
+      .filter((protocol) => ["TCP", "UDP"].includes(protocol))
+      .slice(0, 2)
+    : [];
+
+  return {
+    status,
+    checkedAt: Number.isFinite(checkedAt) && checkedAt > 0 ? checkedAt : null,
+    protocol: String(value.protocol || "").slice(0, 16),
+    requiredProtocols,
+    port: Number.isFinite(port) && port > 0 && port <= 65535 ? port : 7844,
+    portStatus,
+    httpStatus: Number.isFinite(httpStatus) && httpStatus > 0 && httpStatus <= 999 ? httpStatus : null,
+    latencyMs: Number.isFinite(latencyMs) && latencyMs >= 0 && latencyMs <= 120000 ? latencyMs : null,
+    reason: String(value.reason || "unknown").slice(0, 64)
+  };
+}
+
 async function hmacSha256Hex(secret, value) {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -148,6 +181,7 @@ async function recordNodeEvent(request, env, payload, eventPath) {
     timezone: String(payload?.timezone || "").slice(0, 64),
     runtimeStatus: String(payload?.runtimeStatus || "").slice(0, 32),
     runtimeInfo: normalizeRuntimeInfo(payload?.runtimeInfo),
+    tunnelConnectivity: normalizeTunnelConnectivity(payload?.tunnelConnectivity),
     contentIncluded: Boolean(payload?.contentBase64),
     updatedAt: Date.now()
   };
@@ -406,6 +440,62 @@ function heartbeatSegments(node, env) {
   return [...greenSegments, ...invalidSegments, ...emptySegments].join("");
 }
 
+function tunnelPortRequirement(info = {}) {
+  const protocols = Array.isArray(info.requiredProtocols) && info.requiredProtocols.length > 0
+    ? info.requiredProtocols.join("/")
+    : info.protocol === "quic" ? "UDP" : info.protocol === "http2" ? "TCP" : "TCP/UDP";
+  const port = Number(info.port) > 0 ? Number(info.port) : 7844;
+  return `${protocols} ${port}`;
+}
+
+function tunnelConnectivityView(node) {
+  const info = node?.tunnelConnectivity || {};
+  const status = ["connected", "degraded", "offline", "unknown", "not_applicable"].includes(info.status)
+    ? info.status
+    : "unknown";
+  const statusLabels = {
+    connected: "已连接",
+    degraded: "部分异常",
+    offline: "未连接",
+    unknown: "未检测",
+    not_applicable: "不适用"
+  };
+  const reasonLabels = {
+    edge_reachable: "Cloudflare Edge 已响应",
+    tunnel_inactive: "Tunnel 未连接（530/1033）",
+    port_blocked: "出站端口被阻断",
+    edge_timeout: "访问 Tunnel 超时",
+    edge_request_failed: "访问 Tunnel 失败",
+    dns_error: "Tunnel 域名解析失败",
+    origin_error: "Tunnel 已到达，但源站异常",
+    endpoint_missing: "未配置 Tunnel 域名",
+    not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
+    not_checked: "等待节点上报检查结果",
+    unknown: "暂无检查结果"
+  };
+  const portRequirement = tunnelPortRequirement(info);
+  const portLabel = info.portStatus === "open"
+    ? `${portRequirement} 已放行`
+    : info.portStatus === "blocked"
+      ? `需放行出站 ${portRequirement}`
+      : portRequirement;
+  const reason = reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
+  const checkedAt = Number(info.checkedAt) > 0 ? dashboardTime(info.checkedAt) : "未检查";
+  const httpStatus = Number(info.httpStatus) > 0 ? ` · HTTP ${Number(info.httpStatus)}` : "";
+  return {
+    status,
+    label: statusLabels[status],
+    detail: `${portLabel} · ${reason}${httpStatus}`,
+    checkedAt,
+    title: `最后检查：${checkedAt}`
+  };
+}
+
+function tunnelConnectivityMarkup(node) {
+  const view = tunnelConnectivityView(node);
+  return `<strong class="tunnel-field tunnel-${htmlEscape(view.status)}" title="${htmlEscape(view.title)}"><span>${htmlEscape(view.label)}</span><small>${htmlEscape(view.detail)}</small></strong>`;
+}
+
 async function dashboardPageResponse(request, env) {
   const authError = dashboardAuthResponse(request, env);
   if (authError) return authError;
@@ -417,6 +507,9 @@ async function dashboardPageResponse(request, env) {
     const onlineCount = nodes.filter((node) => node.online).length;
     const timedOutCount = nodes.filter((node) => node.timedOut).length;
     const offlineCount = nodes.filter((node) => node.offline).length;
+    const tunnelConnectedCount = nodes.filter((node) => node.tunnelConnectivity?.status === "connected").length;
+    const tunnelProblemCount = nodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status)).length;
+    const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)).length;
     const visibleCount = nodes.length;
     const timeoutMinutes = Math.max(1, Math.round(heartbeatTimeoutMs(env) / 60000));
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
@@ -442,6 +535,20 @@ async function dashboardPageResponse(request, env) {
       : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
     const nodeState = hasAttention ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
     const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
+    const tunnelState = tunnelProblemCount > 0
+      ? "有异常"
+      : tunnelConnectedCount > 0 && tunnelUnknownCount === 0
+        ? "正常"
+        : "等待中";
+    const tunnelStateClass = tunnelState === "正常" ? "operational" : tunnelState === "等待中" ? "waiting" : "attention";
+    const tunnelPortText = nodes.length > 0
+      ? tunnelPortRequirement(nodes[0].tunnelConnectivity || {})
+      : "TCP/UDP 7844";
+    const tunnelDescription = tunnelProblemCount > 0
+      ? `${tunnelProblemCount} 台 Tunnel 未正常连接；请放行出站 ${tunnelPortText}。`
+      : tunnelConnectedCount > 0
+        ? `${tunnelConnectedCount} 台 Tunnel 已连接；端口状态随节点心跳更新。`
+        : `等待节点上报 Tunnel 连通性；需要放行出站 ${tunnelPortText}。`;
     const rows = nodes.length > 0
       ? nodes.map((node) => {
         const runtime = runtimeSummary(node);
@@ -466,6 +573,7 @@ async function dashboardPageResponse(request, env) {
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
             <div><span>系统架构</span><strong>${htmlEscape(runtime.arch)}</strong></div>
             <div><span>CPU / 内存</span><strong>${htmlEscape(runtime.resources)}</strong></div>
+            <div><span>Cloudflare Tunnel</span>${tunnelConnectivityMarkup(node)}</div>
           </div>
         </article>`;
       }).join("")
@@ -543,7 +651,7 @@ async function dashboardPageResponse(request, env) {
     .node-view-option svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
     .filter-status-option:focus-visible, .node-view-option:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
     .filter-result { flex: 0 0 72px; min-width: 72px; color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
-    .service-list { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+    .service-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); overflow: hidden; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
     .service-row { display: flex; align-items: center; justify-content: center; gap: 14px; min-width: 0; padding: 16px; border-right: 1px solid var(--line); }
     .service-row:last-child { border-right: 0; }
     .service-main { display: flex; flex: 1; align-items: center; justify-content: center; gap: 10px; min-width: 0; text-align: center; }
@@ -600,6 +708,12 @@ async function dashboardPageResponse(request, env) {
     .node-fields div { display: grid; min-width: 0; gap: 5px; }
     .node-fields span { color: var(--muted); font-size: 11px; }
     .node-fields strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 600; }
+    .tunnel-field { display: grid; gap: 3px; }
+    .tunnel-field > span { color: inherit; font-size: 13px; font-weight: 650; }
+    .tunnel-field small { color: var(--muted); font-size: 10px; font-weight: 500; line-height: 1.35; }
+    .tunnel-connected { color: var(--green); }
+    .tunnel-degraded, .tunnel-offline { color: #b42318; }
+    .tunnel-unknown, .tunnel-not_applicable { color: var(--muted); }
     .badge { display: inline-flex; align-items: center; gap: 7px; color: var(--green); font-size: 13px; font-weight: 650; }
     .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #22a652; }
     .badge.offline { color: #6b7280; }
@@ -675,6 +789,9 @@ async function dashboardPageResponse(request, env) {
             <div class="service-main"><span id="node-state" class="service-state ${nodeStateClass}">${nodeState}</span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
           </div>
           <div class="service-row">
+            <div class="service-main"><span id="tunnel-state" class="service-state ${tunnelStateClass}">${tunnelState}</span><span class="service-copy"><span class="service-name">Cloudflare Tunnel</span><span class="service-description" id="tunnel-description">${tunnelDescription}</span></span></div>
+          </div>
+          <div class="service-row">
             <div class="service-main"><span class="service-state operational">正常</span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
           </div>
         </div>
@@ -730,6 +847,8 @@ async function dashboardPageResponse(request, env) {
       const heartbeatStateElement = document.getElementById("heartbeat-state");
       const nodeDescriptionElement = document.getElementById("node-description");
       const nodeStateElement = document.getElementById("node-state");
+      const tunnelDescriptionElement = document.getElementById("tunnel-description");
+      const tunnelStateElement = document.getElementById("tunnel-state");
       const lastUpdatedElement = document.getElementById("last-updated");
       const statusElement = document.getElementById("dashboard-status");
       let refreshing = false;
@@ -872,6 +991,61 @@ async function dashboardPageResponse(request, env) {
         return { system, arch: info.arch || "-", resources };
       }
 
+      function tunnelPortRequirement(info) {
+        const protocols = Array.isArray(info?.requiredProtocols) && info.requiredProtocols.length > 0
+          ? info.requiredProtocols.join("/")
+          : info?.protocol === "quic" ? "UDP" : info?.protocol === "http2" ? "TCP" : "TCP/UDP";
+        const port = Number(info?.port) > 0 ? Number(info.port) : 7844;
+        return protocols + " " + port;
+      }
+
+      function tunnelConnectivityView(node) {
+        const info = node?.tunnelConnectivity || {};
+        const statuses = ["connected", "degraded", "offline", "unknown", "not_applicable"];
+        const status = statuses.includes(info.status) ? info.status : "unknown";
+        const statusLabels = {
+          connected: "已连接",
+          degraded: "部分异常",
+          offline: "未连接",
+          unknown: "未检测",
+          not_applicable: "不适用"
+        };
+        const reasonLabels = {
+          edge_reachable: "Cloudflare Edge 已响应",
+          tunnel_inactive: "Tunnel 未连接（530/1033）",
+          port_blocked: "出站端口被阻断",
+          edge_timeout: "访问 Tunnel 超时",
+          edge_request_failed: "访问 Tunnel 失败",
+          dns_error: "Tunnel 域名解析失败",
+          origin_error: "Tunnel 已到达，但源站异常",
+          endpoint_missing: "未配置 Tunnel 域名",
+          not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
+          not_checked: "等待节点上报检查结果",
+          unknown: "暂无检查结果"
+        };
+        const portRequirement = tunnelPortRequirement(info);
+        const portLabel = info.portStatus === "open"
+          ? portRequirement + " 已放行"
+          : info.portStatus === "blocked"
+            ? "需放行出站 " + portRequirement
+            : portRequirement;
+        const reason = reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
+        const checkedAt = Number(info.checkedAt) > 0 ? formatTime(info.checkedAt) : "未检查";
+        const httpStatus = Number(info.httpStatus) > 0 ? " · HTTP " + Number(info.httpStatus) : "";
+        return {
+          status,
+          label: statusLabels[status],
+          detail: portLabel + " · " + reason + httpStatus,
+          checkedAt,
+          title: "最后检查：" + checkedAt
+        };
+      }
+
+      function renderTunnelConnectivity(node) {
+        const view = tunnelConnectivityView(node);
+        return '<strong class="tunnel-field tunnel-' + escapeHtml(view.status) + '" title="' + escapeHtml(view.title) + '"><span>' + escapeHtml(view.label) + '</span><small>' + escapeHtml(view.detail) + '</small></strong>';
+      }
+
       function nodeSearchText(node) {
         const info = node?.runtimeInfo || {};
         return [
@@ -983,6 +1157,7 @@ async function dashboardPageResponse(request, env) {
             + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
             + '<div><span>系统架构</span><strong>' + escapeHtml(runtime.arch) + '</strong></div>'
             + '<div><span>CPU / 内存</span><strong>' + escapeHtml(runtime.resources) + '</strong></div>'
+            + '<div><span>Cloudflare Tunnel</span>' + renderTunnelConnectivity(node) + '</div>'
             + '</div></article>';
         }).join("");
       }
@@ -1005,6 +1180,12 @@ async function dashboardPageResponse(request, env) {
           const onlineNodes = visibleNodes.filter((node) => node.online);
           const timedOutNodes = visibleNodes.filter((node) => node.timedOut);
           const offlineNodes = visibleNodes.filter((node) => node.offline);
+          const tunnelConnectedNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.status === "connected");
+          const tunnelProblemNodes = visibleNodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status));
+          const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status));
+          const tunnelPortText = visibleNodes.length > 0
+            ? tunnelPortRequirement(visibleNodes[0].tunnelConnectivity || {})
+            : "TCP/UDP 7844";
           const timeoutMinutes = Math.max(1, Math.round(Number(data.heartbeatTimeoutMs || 300000) / 60000));
           const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
           const hasAttention = timedOutNodes.length > 0 || offlineNodes.length > 0;
@@ -1035,6 +1216,18 @@ async function dashboardPageResponse(request, env) {
             : onlineNodes.length > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
           nodeStateElement.textContent = hasAttention ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
           nodeStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
+          const tunnelState = tunnelProblemNodes.length > 0
+            ? "有异常"
+            : tunnelConnectedNodes.length > 0 && tunnelUnknownNodes.length === 0
+              ? "正常"
+              : "等待中";
+          tunnelDescriptionElement.textContent = tunnelProblemNodes.length > 0
+            ? tunnelProblemNodes.length + " 台 Tunnel 未正常连接；请放行出站 " + tunnelPortText + "。"
+            : tunnelConnectedNodes.length > 0
+              ? tunnelConnectedNodes.length + " 台 Tunnel 已连接；端口状态随节点心跳更新。"
+              : "等待节点上报 Tunnel 连通性；需要放行出站 " + tunnelPortText + "。";
+          tunnelStateElement.textContent = tunnelState;
+          tunnelStateElement.className = "service-state " + (tunnelState === "有异常" ? "attention" : tunnelState === "正常" ? "operational" : "waiting");
           lastUpdatedElement.textContent = "刚刚更新";
           statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP，如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。";
         } catch (error) {

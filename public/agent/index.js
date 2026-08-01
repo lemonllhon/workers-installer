@@ -30,6 +30,13 @@ const XRAY_ACCESS_LOG_ENABLED = parseBoolean(process.env.XRAY_ACCESS_LOG_ENABLED
 const XRAY_SNIFFING_ENABLED = parseBoolean(process.env.XRAY_SNIFFING_ENABLED, false);
 const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
 const CLOUDFLARED_PROTOCOL = process.env.CLOUDFLARED_PROTOCOL || "http2";
+const CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS = Number.parseInt(process.env.CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS || "3000", 10);
+const CLOUDFLARED_CONNECTIVITY_CACHE_MS = Number.parseInt(process.env.CLOUDFLARED_CONNECTIVITY_CACHE_MS || "30000", 10);
+const CLOUDFLARED_TUNNEL_PORT = 7844;
+const CLOUDFLARED_EDGE_HOSTS = [
+  "region1.v2.argotunnel.com",
+  "region2.v2.argotunnel.com"
+];
 const NGINX_LOG_LEVEL = process.env.NGINX_LOG_LEVEL || "warn";
 const DIRECT_NGINX_ACCESS_LOG_ENABLED = parseBoolean(process.env.DIRECT_NGINX_ACCESS_LOG_ENABLED, false);
 const UUID = process.env.UUID || "9afd1229-b893-40c1-84dd-51e7ce204913"; // 用户 UUID
@@ -123,6 +130,7 @@ let teamnodeShutdownPromise = null;
 let directCertificateRenewalTimer = null;
 let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
+let tunnelConnectivityCache = null;
 let bootInstanceId = createRandomToken();
 const PROVIDER_CODE_OVERRIDES = {
   SG: "sin"
@@ -407,6 +415,167 @@ function getRuntimeInfo() {
   };
 }
 
+function tunnelConnectivityProtocols(protocol = getCloudflaredProtocol()) {
+  if (protocol === "quic") return ["UDP"];
+  if (protocol === "http2") return ["TCP"];
+  return ["TCP", "UDP"];
+}
+
+function normalizeTunnelConnectivityReason(error) {
+  const code = String(error?.code || "").toUpperCase();
+  if (["ENOTFOUND", "EAI_AGAIN", "EAI_FAIL"].includes(code)) return "dns_error";
+  if (["ECONNABORTED", "ETIMEDOUT"].includes(code)) return "edge_timeout";
+  return "edge_request_failed";
+}
+
+function probeTcpPort(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({
+        ...result,
+        host,
+        port,
+        latencyMs: Math.max(0, Date.now() - startedAt)
+      });
+    };
+
+    socket.setTimeout(timeoutMs, () => finish({ ok: false, error: "timeout" }));
+    socket.once("connect", () => finish({ ok: true }));
+    socket.once("error", (error) => finish({
+      ok: false,
+      error: String(error?.code || error?.message || "connect_error").slice(0, 64)
+    }));
+  });
+}
+
+async function probeCloudflareTunnelPort(protocol) {
+  if (protocol === "quic") {
+    return {
+      status: "not_checked",
+      host: null,
+      port: CLOUDFLARED_TUNNEL_PORT,
+      latencyMs: null
+    };
+  }
+
+  const timeoutMs = Number.isFinite(CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS)
+    && CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS > 0
+    ? CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS
+    : 3000;
+  const probes = await Promise.all(
+    CLOUDFLARED_EDGE_HOSTS.map((host) => probeTcpPort(host, CLOUDFLARED_TUNNEL_PORT, timeoutMs))
+  );
+  const successfulProbe = probes.find((probe) => probe.ok);
+  if (successfulProbe) {
+    return {
+      status: "open",
+      host: successfulProbe.host,
+      port: CLOUDFLARED_TUNNEL_PORT,
+      latencyMs: successfulProbe.latencyMs
+    };
+  }
+
+  return {
+    status: "blocked",
+    host: probes[0]?.host || null,
+    port: CLOUDFLARED_TUNNEL_PORT,
+    latencyMs: probes.reduce((lowest, probe) => Math.min(lowest, probe.latencyMs), Number.POSITIVE_INFINITY)
+  };
+}
+
+async function checkCloudflareTunnelConnectivity(argoDomain) {
+  const checkedAt = Date.now();
+  const protocol = getCloudflaredProtocol();
+  const requiredProtocols = tunnelConnectivityProtocols(protocol);
+  const baseResult = {
+    status: "unknown",
+    checkedAt,
+    protocol,
+    port: CLOUDFLARED_TUNNEL_PORT,
+    requiredProtocols,
+    portStatus: "unknown",
+    httpStatus: null,
+    latencyMs: null,
+    reason: "not_checked"
+  };
+  const domain = String(argoDomain || "").trim();
+
+  if (DIRECT_MODE || PLATFORM_PROXY_MODE) {
+    return { ...baseResult, status: "not_applicable", reason: "not_cloudflare_tunnel" };
+  }
+  if (!domain) {
+    return { ...baseResult, reason: "endpoint_missing" };
+  }
+
+  const cacheKey = `${domain}|${protocol}`;
+  const cacheAge = tunnelConnectivityCache
+    ? checkedAt - Number(tunnelConnectivityCache.value?.checkedAt || 0)
+    : Number.POSITIVE_INFINITY;
+  if (tunnelConnectivityCache?.key === cacheKey && cacheAge >= 0 && cacheAge < CLOUDFLARED_CONNECTIVITY_CACHE_MS) {
+    return tunnelConnectivityCache.value;
+  }
+
+  const portProbe = await probeCloudflareTunnelPort(protocol);
+  const portResult = {
+    port: portProbe.port,
+    portStatus: portProbe.status,
+    portHost: portProbe.host,
+    latencyMs: portProbe.latencyMs
+  };
+  if (protocol === "http2" && portProbe.status === "blocked") {
+    const value = {
+      ...baseResult,
+      ...portResult,
+      status: "offline",
+      reason: "port_blocked"
+    };
+    tunnelConnectivityCache = { key: cacheKey, value };
+    return value;
+  }
+
+  const startedAt = Date.now();
+  try {
+    const response = await axios.get(`https://${domain}/`, {
+      headers: { "User-Agent": "nodejs-argo-tunnel-health/1.0" },
+      timeout: Number.isFinite(CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS) && CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS > 0
+        ? CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS
+        : 3000,
+      maxContentLength: 64 * 1024,
+      maxBodyLength: 64 * 1024,
+      validateStatus: () => true
+    });
+    const bodyText = typeof response.data === "string" ? response.data.slice(0, 512) : "";
+    const isTunnelInactive = response.status === 530 || /error\s*code:\s*1033/i.test(bodyText);
+    const value = {
+      ...baseResult,
+      ...portResult,
+      status: isTunnelInactive ? "offline" : response.status >= 500 ? "degraded" : "connected",
+      httpStatus: Number.isFinite(Number(response.status)) ? Number(response.status) : null,
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      reason: isTunnelInactive ? "tunnel_inactive" : response.status >= 500 ? "origin_error" : "edge_reachable"
+    };
+    tunnelConnectivityCache = { key: cacheKey, value };
+    return value;
+  } catch (error) {
+    const value = {
+      ...baseResult,
+      ...portResult,
+      status: "offline",
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      reason: normalizeTunnelConnectivityReason(error)
+    };
+    tunnelConnectivityCache = { key: cacheKey, value };
+    return value;
+  }
+}
+
 async function postTeamNodeSync(relativePath, payload, eventPrefix) {
   const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
   if (!baseUrl) return null;
@@ -448,6 +617,7 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
     ispName: context.meta?.ispName || null,
     timezone: context.ipRisk?.location?.timezone || context.meta?.timezone || null,
     runtimeInfo: getRuntimeInfo(),
+    tunnelConnectivity: context.tunnelConnectivity || null,
     bootId: bootInstanceId,
     metadata: {
       cfip: CFIP,
@@ -540,13 +710,19 @@ async function syncNodeToTeamNode(context) {
     return null;
   }
 
-  const ipRisk = context.ipRisk && !teamnodeSyncRegistered
-    ? context.ipRisk
-    : await resolveTeamNodeIpRiskInfo();
+  const [ipRisk, tunnelConnectivity] = await Promise.all([
+    context.ipRisk && !teamnodeSyncRegistered
+      ? context.ipRisk
+      : resolveTeamNodeIpRiskInfo(),
+    checkCloudflareTunnelConnectivity(context.argoDomain)
+  ]);
   const syncContext = {
     ...context,
-    ipRisk
+    ipRisk,
+    tunnelConnectivity
   };
+
+  console.log(`Cloudflare Tunnel 连通性：${tunnelConnectivity.status}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port} ${tunnelConnectivity.portStatus}`);
 
   teamnodeSyncContext = syncContext;
 

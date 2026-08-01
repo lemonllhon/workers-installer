@@ -14,6 +14,7 @@ readonly DEFAULT_CLOUDFLARED_VERSION="latest"
 readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/releases"
 readonly DEFAULT_XRAY_VERSION="v26.3.27"
 readonly DEFAULT_PM2_VERSION="5.4.3"
+readonly CLOUDFLARED_TUNNEL_PORT="7844"
 # Keep the fallback runtime inside this installation directory.  It is only
 # used when the host's Node.js is missing or older than the application's
 # minimum, so other applications can continue using their own Node.js.
@@ -36,6 +37,7 @@ NODE_RUNTIME_VERSION="${NODE_RUNTIME_VERSION:-${DEFAULT_NODE_RUNTIME_VERSION}}"
 NODE_RUNTIME_SHA256="${NODE_RUNTIME_SHA256:-}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
 FORCE_KILL_PORTS="${FORCE_KILL_PORTS:-false}"
+AUTO_CONFIGURE_FIREWALL="${AUTO_CONFIGURE_FIREWALL:-true}"
 
 TEAMNODE_SYNC_BASE_URL="${TEAMNODE_SYNC_BASE_URL:-${DEFAULT_TEAMNODE_SYNC_BASE_URL}}"
 TEAMNODE_SYNC_KEY_ID="${TEAMNODE_SYNC_KEY_ID:-nodejs-argo-prod}"
@@ -51,6 +53,7 @@ TEAMNODE_SYNC_ENABLED="${TEAMNODE_SYNC_ENABLED:-true}"
 ARGO_PORT="${ARGO_PORT:-8001}"
 CFPORT="${CFPORT:-443}"
 SERVER_PORT="${SERVER_PORT:-3000}"
+CLOUDFLARED_PROTOCOL="${CLOUDFLARED_PROTOCOL:-http2}"
 FILE_PATH="${FILE_PATH:-}"
 BIN_PATH="${BIN_PATH:-}"
 
@@ -75,6 +78,8 @@ RUN_AS_ROOT=false
 CURRENT_USER=""
 CURRENT_USER_HOME=""
 TMP_DIR=""
+TUNNEL_FIREWALL_PROTOCOLS=()
+TUNNEL_FIREWALL_PROTOCOL_LABEL=""
 STAGE_CURRENT=0
 readonly STAGE_TOTAL=10
 
@@ -107,6 +112,8 @@ UUID 可选；新机器未设置时会随机生成。覆盖已有安装且未设
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、supervisor、rc.local、cron、none。
 auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
 如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
+CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
+AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
 USAGE
 }
 
@@ -852,7 +859,7 @@ write_env_file() {
   write_env_value "TEAMNODE_SYNC_TIMEOUT_MS" "${TEAMNODE_SYNC_TIMEOUT_MS}"
   write_env_value "TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS" "${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}"
   write_env_value "TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT" "${TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT}"
-  write_env_value "CLOUDFLARED_PROTOCOL" "${CLOUDFLARED_PROTOCOL:-http2}"
+  write_env_value "CLOUDFLARED_PROTOCOL" "${CLOUDFLARED_PROTOCOL}"
   write_env_value "CLOUDFLARED_LOG_LEVEL" "${CLOUDFLARED_LOG_LEVEL:-info}"
   write_env_value "XRAY_LOG_LEVEL" "${XRAY_LOG_LEVEL:-warning}"
   write_env_value "XRAY_ACCESS_LOG_ENABLED" "${XRAY_ACCESS_LOG_ENABLED:-false}"
@@ -1190,6 +1197,218 @@ validate_local_port() {
   (( value >= 1 && value <= 65535 )) || die "${name} 端口范围无效：${value}"
 }
 
+validate_cloudflared_protocol() {
+  case "${CLOUDFLARED_PROTOCOL,,}" in
+    http2|quic|auto) CLOUDFLARED_PROTOCOL="${CLOUDFLARED_PROTOCOL,,}" ;;
+    *) die "CLOUDFLARED_PROTOCOL 无效：${CLOUDFLARED_PROTOCOL}（可选 http2、quic、auto）" ;;
+  esac
+}
+
+set_tunnel_firewall_protocols() {
+  case "${CLOUDFLARED_PROTOCOL}" in
+    http2) TUNNEL_FIREWALL_PROTOCOLS=(tcp); TUNNEL_FIREWALL_PROTOCOL_LABEL="TCP" ;;
+    quic) TUNNEL_FIREWALL_PROTOCOLS=(udp); TUNNEL_FIREWALL_PROTOCOL_LABEL="UDP" ;;
+    auto) TUNNEL_FIREWALL_PROTOCOLS=(tcp udp); TUNNEL_FIREWALL_PROTOCOL_LABEL="TCP/UDP" ;;
+    *) die "无法为未知 Cloudflare Tunnel 协议配置防火墙：${CLOUDFLARED_PROTOCOL}" ;;
+  esac
+}
+
+ufw_is_active() {
+  has_command ufw || return 1
+  ufw status 2>/dev/null | grep -Eiq '^Status:[[:space:]]+active'
+}
+
+firewalld_is_active() {
+  has_command firewall-cmd || return 1
+  [[ "$(firewall-cmd --state 2>/dev/null || true)" == "running" ]]
+}
+
+nftables_is_active() {
+  has_command nft || return 1
+  if has_command systemctl && systemctl is-active --quiet nftables 2>/dev/null; then
+    return 0
+  fi
+
+  local ruleset
+  ruleset="$(nft list ruleset 2>/dev/null || true)"
+  printf '%s\n' "${ruleset}" | grep -Eq 'hook[[:space:]]+(input|output|forward)'
+}
+
+iptables_is_active() {
+  has_command iptables || return 1
+  local ruleset
+  ruleset="$(iptables -S 2>/dev/null || true)"
+  printf '%s\n' "${ruleset}" | grep -Eq '^-P[[:space:]]+(INPUT|OUTPUT|FORWARD)[[:space:]]+DROP|[[:space:]]-j[[:space:]]+(DROP|REJECT)([[:space:]]|$)'
+}
+
+configure_ufw_tunnel_firewall() {
+  local protocol
+  local status
+  status="$(ufw status 2>/dev/null || true)"
+  for protocol in "${TUNNEL_FIREWALL_PROTOCOLS[@]}"; do
+    if printf '%s\n' "${status}" | grep -Eiq "^${CLOUDFLARED_TUNNEL_PORT}/${protocol}[[:space:]]+ALLOW[[:space:]]+OUT"; then
+      log "ufw 已放行出站 ${protocol^^} ${CLOUDFLARED_TUNNEL_PORT}"
+      continue
+    fi
+    ufw allow out "${CLOUDFLARED_TUNNEL_PORT}/${protocol}" >/dev/null || return 1
+    log "ufw 已添加出站 ${protocol^^} ${CLOUDFLARED_TUNNEL_PORT}"
+    status="$(ufw status 2>/dev/null || true)"
+  done
+}
+
+firewalld_direct_rule_exists() {
+  local permanent="$1"
+  local family="$2"
+  local protocol="$3"
+  local rules
+  if is_true "${permanent}"; then
+    rules="$(firewall-cmd --permanent --direct --get-all-rules 2>/dev/null || true)"
+  else
+    rules="$(firewall-cmd --direct --get-all-rules 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${rules}" |
+    grep -F "${family} filter OUTPUT 0 -p ${protocol} --dport ${CLOUDFLARED_TUNNEL_PORT}" |
+    grep -Fq -- "-j ACCEPT"
+}
+
+configure_firewalld_tunnel_firewall() {
+  local family
+  local protocol
+  local runtime_changed=false
+  for family in ipv4 ipv6; do
+    for protocol in "${TUNNEL_FIREWALL_PROTOCOLS[@]}"; do
+      if ! firewalld_direct_rule_exists false "${family}" "${protocol}"; then
+        firewall-cmd --direct --add-rule "${family}" filter OUTPUT 0 -p "${protocol}" --dport "${CLOUDFLARED_TUNNEL_PORT}" -j ACCEPT >/dev/null || return 1
+        runtime_changed=true
+      fi
+      if ! firewalld_direct_rule_exists true "${family}" "${protocol}"; then
+        firewall-cmd --permanent --direct --add-rule "${family}" filter OUTPUT 0 -p "${protocol}" --dport "${CLOUDFLARED_TUNNEL_PORT}" -j ACCEPT >/dev/null || return 1
+      fi
+      log "firewalld 已配置出站 ${protocol^^} ${CLOUDFLARED_TUNNEL_PORT}（${family}）"
+    done
+  done
+
+  if [[ "${runtime_changed}" == true ]]; then
+    firewall-cmd --reload >/dev/null || return 1
+  fi
+}
+
+nft_tunnel_rule_exists() {
+  local protocol="$1"
+  nft list chain inet nodejs_argo_tunnel output 2>/dev/null |
+    grep -Fq -- "${protocol} dport ${CLOUDFLARED_TUNNEL_PORT} accept"
+}
+
+persist_nft_tunnel_rules() {
+  local config_file="/etc/nftables.conf"
+  local fragment="/etc/nftables.d/nodejs-argo-tunnel.nft"
+  if [[ -f "${config_file}" ]] && grep -Eq '^[[:space:]]*include[[:space:]]+"/etc/nftables\.d/(\*\.nft|\*)"' "${config_file}"; then
+    install -d -m 0755 /etc/nftables.d
+    {
+      printf '%s\n' 'table inet nodejs_argo_tunnel {'
+      printf '%s\n' '  chain output {'
+      printf '%s\n' '    type filter hook output priority -50; policy accept;'
+      local protocol
+      for protocol in "${TUNNEL_FIREWALL_PROTOCOLS[@]}"; do
+        printf '    %s dport %s accept comment "nodejs-argo cloudflare tunnel"\n' "${protocol}" "${CLOUDFLARED_TUNNEL_PORT}"
+      done
+      printf '%s\n' '  }'
+      printf '%s\n' '}'
+    } > "${fragment}"
+    chmod 0644 "${fragment}"
+    log "nftables 规则已写入持久化配置：${fragment}"
+    return 0
+  fi
+
+  warn "nftables 当前运行时规则已添加，但未找到 /etc/nftables.conf 对 /etc/nftables.d/*.nft 的 include；重启后可能需要重新加载规则"
+  return 0
+}
+
+configure_nftables_tunnel_firewall() {
+  if ! nft list table inet nodejs_argo_tunnel >/dev/null 2>&1; then
+    nft add table inet nodejs_argo_tunnel || return 1
+  fi
+  if ! nft list chain inet nodejs_argo_tunnel output >/dev/null 2>&1; then
+    nft add chain inet nodejs_argo_tunnel output '{ type filter hook output priority -50; policy accept; }' || return 1
+  fi
+
+  local protocol
+  for protocol in "${TUNNEL_FIREWALL_PROTOCOLS[@]}"; do
+    if ! nft_tunnel_rule_exists "${protocol}"; then
+      nft add rule inet nodejs_argo_tunnel output "${protocol}" dport "${CLOUDFLARED_TUNNEL_PORT}" accept || return 1
+    fi
+    log "nftables 已配置出站 ${protocol^^} ${CLOUDFLARED_TUNNEL_PORT}"
+  done
+  persist_nft_tunnel_rules
+}
+
+iptables_tunnel_rule_exists() {
+  local firewall_bin="$1"
+  local protocol="$2"
+  "${firewall_bin}" -C OUTPUT -p "${protocol}" --dport "${CLOUDFLARED_TUNNEL_PORT}" -j ACCEPT >/dev/null 2>&1
+}
+
+configure_iptables_tunnel_firewall() {
+  local firewall_bin
+  local protocol
+  local configured=false
+  for firewall_bin in iptables ip6tables; do
+    has_command "${firewall_bin}" || continue
+    for protocol in "${TUNNEL_FIREWALL_PROTOCOLS[@]}"; do
+      if ! iptables_tunnel_rule_exists "${firewall_bin}" "${protocol}"; then
+        if "${firewall_bin}" -I OUTPUT 1 -p "${protocol}" --dport "${CLOUDFLARED_TUNNEL_PORT}" -j ACCEPT >/dev/null 2>&1; then
+          configured=true
+        else
+          warn "${firewall_bin} 无法添加出站 ${protocol^^} ${CLOUDFLARED_TUNNEL_PORT} 规则"
+          continue
+        fi
+      else
+        configured=true
+      fi
+      log "${firewall_bin} 已配置出站 ${protocol^^} ${CLOUDFLARED_TUNNEL_PORT}"
+    done
+  done
+
+  [[ "${configured}" == true ]] || return 1
+  if has_command netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 || warn "iptables 运行时规则已添加，但 netfilter-persistent 保存失败"
+  else
+    warn "iptables 运行时规则已添加，但未找到 netfilter-persistent；重启后可能需要重新加载规则"
+  fi
+}
+
+configure_tunnel_firewall() {
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    warn "非 root 安装无法修改系统防火墙；请手动放行出站 ${CLOUDFLARED_PROTOCOL} ${CLOUDFLARED_TUNNEL_PORT}"
+    return 0
+  fi
+  if ! is_true "${AUTO_CONFIGURE_FIREWALL}"; then
+    log "已关闭防火墙自动配置（AUTO_CONFIGURE_FIREWALL=${AUTO_CONFIGURE_FIREWALL}）；需要放行出站 ${CLOUDFLARED_PROTOCOL} ${CLOUDFLARED_TUNNEL_PORT}"
+    return 0
+  fi
+
+  set_tunnel_firewall_protocols
+  log "检查主机防火墙：Cloudflare Tunnel 使用出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}"
+  if ufw_is_active; then
+    if ! configure_ufw_tunnel_firewall; then warn "ufw 自动配置失败；请手动放行出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}"; fi
+    return 0
+  fi
+  if firewalld_is_active; then
+    if ! configure_firewalld_tunnel_firewall; then warn "firewalld 自动配置失败；请手动放行出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}"; fi
+    return 0
+  fi
+  if nftables_is_active; then
+    if ! configure_nftables_tunnel_firewall; then warn "nftables 自动配置失败；请手动放行出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}"; fi
+    return 0
+  fi
+  if iptables_is_active; then
+    if ! configure_iptables_tunnel_firewall; then warn "iptables 自动配置失败；请手动放行出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}"; fi
+    return 0
+  fi
+
+  log "未检测到启用的主机防火墙，未添加规则；如果端口仍不通，请检查云平台安全组或上游网络"
+}
+
 cleanup_owned_port_processes() {
   local ports=()
   local port
@@ -1456,6 +1675,7 @@ main() {
   require_config
   validate_worker_placeholders
   check_dependencies
+  validate_cloudflared_protocol
   NODE_BIN="$(command -v node || true)"
   NPM_BIN="$(command -v npm || true)"
   restore_existing_uuid_if_missing
@@ -1510,6 +1730,7 @@ main() {
   write_runtime_files
   stage "写入环境变量和启动配置"
   write_env_file
+  configure_tunnel_firewall
   set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"
   chmod 0600 "${ENV_FILE}"
