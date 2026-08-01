@@ -668,7 +668,6 @@ async function dashboardPageResponse(request, env) {
         ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(timeoutMinutes) + " 分钟内保持在线。"
         : "等待机器发送心跳；超过 " + String(timeoutMinutes) + " 分钟后标记为超时，总计 " + String(ttlMinutes) + " 分钟后自动移出列表。";
     const overviewClass = isOperational ? "operational" : hasAttention ? "attention" : "waiting";
-    const overviewSymbol = isOperational ? "✓" : hasAttention ? "!" : "…";
     const heartbeatDescription = hasAttention
       ? String(offlineCount) + " 台离线，" + String(timedOutCount) + " 台超时，恢复后会自动变绿"
       : onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
@@ -760,20 +759,20 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .system-status-title-block { display: flex; flex-direction: column; align-self: stretch; justify-content: center; align-items: stretch; gap: 12px; min-width: 0; }
-    .system-status-overview { display: grid; place-items: center; width: 100%; min-width: 0; min-height: 32px; padding-top: 0; }
+    .system-status-title-block { display: flex; flex-direction: column; align-self: stretch; justify-content: center; align-items: stretch; min-width: 0; padding-left: 12px; border-left: 4px solid var(--status-color); }
     .system-status-overview-copy { display: grid; width: 100%; min-width: 0; gap: 2px; align-content: center; text-align: left; }
     .system-status-summary { display: grid; justify-items: start; gap: 2px; min-width: 0; text-align: left; }
-    .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
-    .hero-icon.attention { color: var(--amber); background: var(--amber-soft); }
-    .hero-icon.waiting { color: var(--muted); background: #f0f2f4; }
     .eyebrow { margin: 0 0 2px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
     h1 { margin: 0; font-size: clamp(16px, 2vw, 20px); letter-spacing: -.025em; line-height: 1.25; }
     .system-status-summary h1 { font-size: 13px; font-weight: 650; letter-spacing: 0; line-height: 1.35; }
     .hero-detail { max-width: 220px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
     .section { margin-top: 12px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
-    .system-status-layout { display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr); align-items: stretch; gap: 18px; padding: 14px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
+    .system-status-layout { --status-color: var(--accent); display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr); align-items: stretch; gap: 18px; padding: 14px; background: var(--soft-surface); border: 1px solid var(--line); border-left: 4px solid var(--status-color); border-radius: 12px; }
+    .system-status-layout.operational { --status-color: var(--green); background: #f1faf4; border-color: #bfe8ce; }
+    .system-status-layout.attention { --status-color: var(--amber); background: #fff9e8; border-color: #f1d28b; }
+    .system-status-layout.waiting { --status-color: var(--accent); background: #f2f7fd; border-color: #c9def4; }
+    .system-status-layout .eyebrow, .system-status-layout h2, .system-status-layout .system-status-summary h1 { color: var(--status-color); }
     .system-status-heading { display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: stretch; gap: 14px; min-width: 0; padding: 0 2px; }
     .system-status-heading > div:first-child { min-width: 0; }
     .section-title { display: flex; align-items: baseline; gap: 10px; }
@@ -884,9 +883,7 @@ async function dashboardPageResponse(request, env) {
       .brand-context { display: block; margin: 3px 0 0; }
       .live-meta { padding-top: 7px; }
       .system-status-layout { padding: 14px; }
-      .system-status-overview { padding-top: 0; }
       .system-status-heading { grid-template-columns: 1fr; gap: 10px; }
-      .system-status-title-block { gap: 8px; }
       .system-status-overview-copy { gap: 3px; }
       .system-status-summary { display: grid; text-align: center; }
       .hero-detail { margin-top: 4px; }
@@ -925,15 +922,12 @@ async function dashboardPageResponse(request, env) {
     </header>
 
     <section class="section">
-      <div class="system-status-layout">
+      <div class="system-status-layout ${overviewClass}">
         <div class="system-status-heading">
           <div class="system-status-title-block">
             <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
-            <div class="system-status-overview" aria-live="polite">
-              <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
-            </div>
           </div>
-          <div class="system-status-overview-copy">
+          <div class="system-status-overview-copy" aria-live="polite">
             <div class="system-status-summary">
               <h1 id="overview-label">${overviewLabel}</h1>
               <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
@@ -994,7 +988,7 @@ async function dashboardPageResponse(request, env) {
   <script>
     (() => {
       const rowsElement = document.getElementById("node-rows");
-      const overviewIconElement = document.getElementById("overview-icon");
+      const systemStatusLayoutElement = document.querySelector(".system-status-layout");
       const overviewLabelElement = document.getElementById("overview-label");
       const overviewDetailElement = document.getElementById("overview-detail");
       const nodeCountElement = document.getElementById("node-count");
@@ -1440,9 +1434,7 @@ async function dashboardPageResponse(request, env) {
           currentNodes = visibleNodes;
           renderFilteredNodes();
           const overviewStatus = operational ? "operational" : hasAttention ? "attention" : "waiting";
-          overviewIconElement.className = "hero-icon " + overviewStatus;
-          overviewIconElement.textContent = operational ? "✓" : hasAttention ? "!" : "…";
-          overviewIconElement.setAttribute("aria-label", hasAttention ? "部分节点状态异常" : operational ? "全部系统运行正常" : "等待机器心跳");
+          systemStatusLayoutElement.className = "system-status-layout " + overviewStatus;
           overviewLabelElement.textContent = hasAttention
             ? "部分节点状态异常"
             : operational ? "全部系统运行正常" : "暂无在线机器";
