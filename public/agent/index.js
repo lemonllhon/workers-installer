@@ -64,6 +64,12 @@ const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 1
 const DIRECT_TLS_ENABLED = parseBoolean(process.env.DIRECT_TLS_ENABLED, true);
 const DIRECT_IPV4_ENABLED = parseBoolean(process.env.DIRECT_IPV4_ENABLED, true);
 const DIRECT_IPV6_ENABLED = parseBoolean(process.env.DIRECT_IPV6_ENABLED, true);
+const DIRECT_REUSE_ENABLED = parseBoolean(process.env.DIRECT_REUSE_ENABLED, false);
+const DIRECT_REUSE_TLS_ENABLED = parseBoolean(process.env.DIRECT_REUSE_TLS_ENABLED, true);
+const DIRECT_REUSE_IPV4_ENABLED = parseBoolean(process.env.DIRECT_REUSE_IPV4_ENABLED, false);
+const DIRECT_REUSE_IPV6_ENABLED = parseBoolean(process.env.DIRECT_REUSE_IPV6_ENABLED, false);
+const DIRECT_REUSE_PORT = Number.parseInt(process.env.DIRECT_REUSE_PORT || "443", 10);
+const DIRECT_REUSE_HTTP_PORT = Number.parseInt(process.env.DIRECT_REUSE_HTTP_PORT || "80", 10);
 const AUTO_DIRECT_FALLBACK = parseBoolean(process.env.AUTO_DIRECT_FALLBACK, true);
 const NODEJS_ARGO_ENV_FILE = process.env.NODEJS_ARGO_ENV_FILE || "";
 const DIRECT_PORT_CANDIDATES = [...new Set(
@@ -779,18 +785,27 @@ async function syncNodeRegistrationToTeamNode(context) {
   const payload = buildTeamNodePayload(context, { includeContent: true, runtimeStatus: "starting" });
   if (!payload) return null;
 
-  const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload, "nodejs_argo_register");
-  if (response && response.status === 200) {
-    teamnodeSyncRegistered = true;
-    console.log(response.data?.forwarded === false
-      ? "节点公网路线异常：UUID 已隔离，不进入监控面板，也未向 TeamNode 推送"
-      : "TeamNode 注册成功");
-    return response.data || null;
+  try {
+    const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload, "nodejs_argo_register");
+    if (response && response.status === 200) {
+      teamnodeSyncRegistered = true;
+      console.log(response.data?.forwarded === false
+        ? "节点公网路线异常：UUID 已隔离，不进入监控面板，也未向 TeamNode 推送"
+        : "TeamNode 注册成功");
+      return response.data || null;
+    }
+    return null;
+  } catch (error) {
+    if (error?.response?.status === 409) {
+      teamnodeSyncRegistered = true;
+      console.log("TeamNode 已存在相同 UUID，改用心跳复用原节点");
+      return syncNodeHeartbeatToTeamNode(context, { reRegisterOnMissing: false });
+    }
+    throw error;
   }
-  return null;
 }
 
-async function syncNodeHeartbeatToTeamNode(context) {
+async function syncNodeHeartbeatToTeamNode(context, { reRegisterOnMissing = true } = {}) {
   if (!isTeamNodeSyncConfigured() || !context) return null;
   const payload = buildTeamNodePayload(context, {
     includeContent: TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
@@ -811,6 +826,10 @@ async function syncNodeHeartbeatToTeamNode(context) {
   } catch (error) {
     if (error?.response?.status === 404) {
       teamnodeSyncRegistered = false;
+      if (!reRegisterOnMissing) {
+        console.log("TeamNode 原 UUID 注册记录与心跳状态不一致，等待下次同步重试");
+        return null;
+      }
       console.log("TeamNode 未找到来源节点，自动重新注册");
       return syncNodeRegistrationToTeamNode(context);
     }
@@ -1292,6 +1311,56 @@ function selectDirectFallbackPlan(results, { addressFamilies = configuredDirectA
   };
 }
 
+async function probeReusableDirectPlan(publicAddresses) {
+  if (!DIRECT_REUSE_ENABLED) return null;
+
+  const addressFamilies = [
+    ...(DIRECT_REUSE_IPV4_ENABLED && publicAddresses.ipv4 ? [4] : []),
+    ...(DIRECT_REUSE_IPV6_ENABLED && publicAddresses.ipv6 ? [6] : [])
+  ];
+  const expectedFamilyCount = Number(DIRECT_REUSE_IPV4_ENABLED) + Number(DIRECT_REUSE_IPV6_ENABLED);
+  const validPorts = [DIRECT_REUSE_PORT, ...(DIRECT_REUSE_TLS_ENABLED ? [DIRECT_REUSE_HTTP_PORT] : [])]
+    .every((port) => Number.isInteger(port) && port >= 1 && port <= 65535 && !LOCAL_SERVICE_PORTS.has(port));
+  if (!validPorts || !addressFamilies.length || addressFamilies.length !== expectedFamilyCount) {
+    appendRouteProbeProgress("上次直连路线的地址族或端口已不可用，改为执行完整端口发现");
+    return null;
+  }
+
+  const ports = [...new Set([
+    DIRECT_REUSE_PORT,
+    ...(DIRECT_REUSE_TLS_ENABLED ? [DIRECT_REUSE_HTTP_PORT] : [])
+  ])];
+  const familyLabel = addressFamilies.map((family) => directFamilyName(family).toUpperCase()).join("/");
+  appendRouteProbeProgress(
+    `优先复验上次成功的直连路线：${familyLabel} ${DIRECT_REUSE_TLS_ENABLED ? "HTTPS" : "HTTP"} ${DIRECT_REUSE_PORT}`
+    + `${DIRECT_REUSE_TLS_ENABLED ? `/HTTP ${DIRECT_REUSE_HTTP_PORT}` : ""}`
+  );
+  const probe = await probeDirectPortCandidates(ports, addressFamilies);
+  const candidate = selectDirectFallbackPlan(probe.results, {
+    addressFamilies,
+    requireAllFamilies: true
+  });
+  const matchesPreviousRoute = candidate
+    && candidate.tlsEnabled === DIRECT_REUSE_TLS_ENABLED
+    && candidate.port === DIRECT_REUSE_PORT
+    && candidate.httpPort === DIRECT_REUSE_HTTP_PORT
+    && candidate.addressFamilies.length === addressFamilies.length;
+  if (!matchesPreviousRoute) {
+    appendRouteProbeProgress("上次直连路线复验失败，改为执行完整端口发现");
+    return null;
+  }
+
+  const plan = {
+    ...candidate,
+    reason: "reused_previous_direct_route",
+    publicAddresses
+  };
+  appendRouteProbeProgress(
+    `上次直连路线复验通过，立即复用 ${familyLabel} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
+  );
+  return { plan, results: probe.results, error: probe.error || "" };
+}
+
 async function discoverDirectPortPlan() {
   const publicAddresses = await resolveNodePublicAddresses({ force: true });
   const addressFamilies = [
@@ -1307,6 +1376,8 @@ async function discoverDirectPortPlan() {
     `直连公网地址：${publicAddresses.ipv4 ? `IPv4 ${publicAddresses.ipv4}` : "IPv4 不可用"}；`
     + `${publicAddresses.ipv6 ? `IPv6 ${publicAddresses.ipv6}` : "IPv6 不可用"}`
   );
+  const reusedRoute = await probeReusableDirectPlan(publicAddresses);
+  if (reusedRoute?.plan) return reusedRoute;
   appendRouteProbeProgress(
     `开始直连初始候选端口心跳：${DIRECT_PORT_CANDIDATES.join(",") || "无"}；本机端口 ${[...LOCAL_SERVICE_PORTS].join(",")} 已排除`
   );
@@ -1324,6 +1395,20 @@ async function discoverDirectPortPlan() {
     plan = { ...plan, publicAddresses };
     appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
     return { plan, results: allResults };
+  }
+  if (requireAllFamilies) {
+    const singleFamilyStandardPlan = selectDirectFallbackPlan(allResults, {
+      addressFamilies,
+      requireAllFamilies: false
+    });
+    if (singleFamilyStandardPlan?.tlsEnabled) {
+      plan = { ...singleFamilyStandardPlan, publicAddresses };
+      appendRouteProbeProgress(
+        `标准 HTTPS 已在 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} 通过公网回访，`
+        + "立即使用 443/80；不会为不可达地址族继续扫描非标准端口"
+      );
+      return { plan, results: allResults };
+    }
   }
 
   let lastError = priorityProbe.error || "";
@@ -1404,6 +1489,12 @@ function writeDirectFallbackEnv(plan) {
     DIRECT_HTTP_PORT: String(plan.httpPort),
     DIRECT_IPV4_ENABLED: planFamilies.includes("ipv4") ? "true" : "false",
     DIRECT_IPV6_ENABLED: planFamilies.includes("ipv6") ? "true" : "false",
+    DIRECT_REUSE_ENABLED: "true",
+    DIRECT_REUSE_TLS_ENABLED: plan.tlsEnabled ? "true" : "false",
+    DIRECT_REUSE_IPV4_ENABLED: planFamilies.includes("ipv4") ? "true" : "false",
+    DIRECT_REUSE_IPV6_ENABLED: planFamilies.includes("ipv6") ? "true" : "false",
+    DIRECT_REUSE_PORT: String(plan.port),
+    DIRECT_REUSE_HTTP_PORT: String(plan.httpPort),
     CFPORT: String(plan.port),
     CFIP: DIRECT_DOMAIN,
     CF_DNS_ENABLED: CF_API_TOKEN ? "true" : "false",

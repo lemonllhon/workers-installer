@@ -58,6 +58,15 @@ DIRECT_DOMAIN=""
 DIRECT_TLS_ENABLED="${DIRECT_TLS_ENABLED:-true}"
 DIRECT_IPV4_ENABLED="${DIRECT_IPV4_ENABLED:-true}"
 DIRECT_IPV6_ENABLED="${DIRECT_IPV6_ENABLED:-true}"
+# An in-place reinstall may reuse the last route that reached the final
+# Worker verification. These values are hints only: the agent must probe the
+# exact address families and ports again before it can reactivate the route.
+DIRECT_REUSE_ENABLED=false
+DIRECT_REUSE_TLS_ENABLED=true
+DIRECT_REUSE_IPV4_ENABLED=false
+DIRECT_REUSE_IPV6_ENABLED=false
+DIRECT_REUSE_PORT=443
+DIRECT_REUSE_HTTP_PORT=80
 # These are public-ingress candidates. They are only probed by the Worker
 # after the node creates temporary listeners for direct-route discovery.
 DIRECT_PORT="${DIRECT_PORT:-443}"
@@ -240,28 +249,71 @@ validate_uuid() {
   [[ "${UUID}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]] || die "UUID 格式无效：${UUID}"
 }
 
-restore_existing_uuid_if_missing() {
-  # Preserve the node identity during an in-place upgrade. A new machine has
-  # no .env yet, so it receives a newly generated UUID before token exchange.
-  if [[ -n "${UUID:-}" ]]; then
-    return 0
-  fi
+read_existing_env_value() {
+  local env_file="$1"
+  local key="$2"
+  [[ "${key}" =~ ^[A-Z][A-Z0-9_]*$ ]] || return 1
+  sed -n "s/^${key}=//p" "${env_file}" 2>/dev/null | head -n 1 || true
+}
 
+restore_existing_install_state() {
+  # Preserve the node identity and the last verified direct route during an
+  # in-place upgrade. The route is never trusted blindly: it is written to the
+  # new environment as a reuse hint and must pass a fresh Worker callback.
   local previous_env="${APP_DIR}/.env"
   [[ -r "${previous_env}" ]] || return 0
 
-  local previous_uuid
-  previous_uuid="$(sed -n 's/^UUID=//p' "${previous_env}" 2>/dev/null | head -n 1 || true)"
-  if [[ -z "${previous_uuid}" ]]; then
+  if [[ -z "${UUID:-}" ]]; then
+    local previous_uuid
+    previous_uuid="$(read_existing_env_value "${previous_env}" "UUID")"
+    if [[ "${previous_uuid}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
+      UUID="${previous_uuid}"
+      log "未指定 UUID，已从旧安装 .env 复用 UUID：${UUID}"
+    elif [[ -n "${previous_uuid}" ]]; then
+      warn "旧安装 .env 中的 UUID 格式无效，将生成新的 UUID"
+    fi
+  fi
+
+  local previous_direct_mode previous_file_path previous_tls
+  local previous_ipv4 previous_ipv6 previous_port previous_http_port
+  previous_direct_mode="$(read_existing_env_value "${previous_env}" "DIRECT_MODE")"
+  is_true "${previous_direct_mode}" || return 0
+
+  previous_file_path="$(read_existing_env_value "${previous_env}" "FILE_PATH")"
+  previous_file_path="${previous_file_path:-${APP_DIR}/data}"
+  [[ "${previous_file_path}" = /* && "${previous_file_path}" != *$'\n'* && "${previous_file_path}" != *$'\r'* && "${previous_file_path}" != *' '* ]] || return 0
+  [[ -f "${previous_file_path}/.route-ready" ]] || return 0
+
+  previous_tls="$(read_existing_env_value "${previous_env}" "DIRECT_TLS_ENABLED")"
+  previous_ipv4="$(read_existing_env_value "${previous_env}" "DIRECT_IPV4_ENABLED")"
+  previous_ipv6="$(read_existing_env_value "${previous_env}" "DIRECT_IPV6_ENABLED")"
+  previous_port="$(read_existing_env_value "${previous_env}" "DIRECT_PORT")"
+  previous_http_port="$(read_existing_env_value "${previous_env}" "DIRECT_HTTP_PORT")"
+  [[ "${previous_port}" =~ ^[0-9]+$ ]] || return 0
+  (( previous_port >= 1 && previous_port <= 65535 )) || return 0
+  previous_http_port="${previous_http_port:-${previous_port}}"
+  [[ "${previous_http_port}" =~ ^[0-9]+$ ]] || return 0
+  (( previous_http_port >= 1 && previous_http_port <= 65535 )) || return 0
+  if ! is_true "${previous_ipv4}" && ! is_true "${previous_ipv6}"; then
     return 0
   fi
 
-  if [[ "${previous_uuid}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$ ]]; then
-    UUID="${previous_uuid}"
-    log "未指定 UUID，已从旧安装 .env 复用 UUID：${UUID}"
-  else
-    warn "旧安装 .env 中的 UUID 格式无效，将生成新的 UUID"
+  DIRECT_REUSE_ENABLED=true
+  DIRECT_REUSE_TLS_ENABLED=false
+  is_true "${previous_tls}" && DIRECT_REUSE_TLS_ENABLED=true
+  DIRECT_REUSE_IPV4_ENABLED=false
+  is_true "${previous_ipv4}" && DIRECT_REUSE_IPV4_ENABLED=true
+  DIRECT_REUSE_IPV6_ENABLED=false
+  is_true "${previous_ipv6}" && DIRECT_REUSE_IPV6_ENABLED=true
+  DIRECT_REUSE_PORT="${previous_port}"
+  DIRECT_REUSE_HTTP_PORT="${previous_http_port}"
+
+  local previous_families=""
+  is_true "${DIRECT_REUSE_IPV4_ENABLED}" && previous_families="IPv4"
+  if is_true "${DIRECT_REUSE_IPV6_ENABLED}"; then
+    previous_families="${previous_families:+${previous_families}/}IPv6"
   fi
+  log "检测到上次已验证的直连路线：${previous_families} $([[ "${DIRECT_REUSE_TLS_ENABLED}" == true ]] && printf 'HTTPS' || printf 'HTTP') ${DIRECT_REUSE_PORT}$([[ "${DIRECT_REUSE_TLS_ENABLED}" == true ]] && printf '/HTTP %s' "${DIRECT_REUSE_HTTP_PORT}" || true)；本次将优先复验，失败后才执行完整端口发现"
 }
 
 resolve_source_checksum() {
@@ -937,6 +989,12 @@ write_env_file() {
   write_env_value "DIRECT_TLS_ENABLED" "${DIRECT_TLS_ENABLED}"
   write_env_value "DIRECT_IPV4_ENABLED" "${DIRECT_IPV4_ENABLED}"
   write_env_value "DIRECT_IPV6_ENABLED" "${DIRECT_IPV6_ENABLED}"
+  write_env_value "DIRECT_REUSE_ENABLED" "${DIRECT_REUSE_ENABLED}"
+  write_env_value "DIRECT_REUSE_TLS_ENABLED" "${DIRECT_REUSE_TLS_ENABLED}"
+  write_env_value "DIRECT_REUSE_IPV4_ENABLED" "${DIRECT_REUSE_IPV4_ENABLED}"
+  write_env_value "DIRECT_REUSE_IPV6_ENABLED" "${DIRECT_REUSE_IPV6_ENABLED}"
+  write_env_value "DIRECT_REUSE_PORT" "${DIRECT_REUSE_PORT}"
+  write_env_value "DIRECT_REUSE_HTTP_PORT" "${DIRECT_REUSE_HTTP_PORT}"
   write_env_value "DIRECT_PORT" "${DIRECT_PORT}"
   write_env_value "DIRECT_HTTP_PORT" "${DIRECT_HTTP_PORT}"
   write_env_value "DIRECT_PORT_CANDIDATES" "${DIRECT_PORT_CANDIDATES}"
@@ -2335,7 +2393,7 @@ main() {
   validate_cloudflared_protocol
   NODE_BIN="$(command -v node || true)"
   NPM_BIN="$(command -v npm || true)"
-  restore_existing_uuid_if_missing
+  restore_existing_install_state
   generate_uuid_if_missing
   BIN_PATH="${BIN_PATH:-${APP_DIR}/bin}"
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
