@@ -783,7 +783,7 @@ async function syncNodeRegistrationToTeamNode(context) {
   if (response && response.status === 200) {
     teamnodeSyncRegistered = true;
     console.log(response.data?.forwarded === false
-      ? "节点公网路线异常：状态仅保存到本地监控面板，未向 TeamNode 推送"
+      ? "节点公网路线异常：UUID 已隔离，不进入监控面板，也未向 TeamNode 推送"
       : "TeamNode 注册成功");
     return response.data || null;
   }
@@ -803,7 +803,7 @@ async function syncNodeHeartbeatToTeamNode(context) {
     if (response && response.status === 200) {
       teamnodeSyncRegistered = true;
       console.log(response.data?.forwarded === false
-        ? "节点公网路线仍异常：心跳仅更新本地监控面板，未向 TeamNode 推送"
+        ? "节点 UUID 仍处于隔离状态：本次心跳已丢弃，未向 TeamNode 推送"
         : "TeamNode 心跳成功");
       return response.data || null;
     }
@@ -835,7 +835,7 @@ async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
     if (response && response.status === 200) {
       teamnodeSyncRegistered = false;
       console.log(response.data?.forwarded === false
-        ? "异常节点下线状态已更新到本地监控面板，未向 TeamNode 推送"
+        ? "隔离节点下线通知已丢弃，未进入监控面板，也未向 TeamNode 推送"
         : "TeamNode 下线通知成功");
       return response.data || null;
     }
