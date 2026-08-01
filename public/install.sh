@@ -54,6 +54,8 @@ CLOUDFLARE_API_KEY="${CLOUDFLARE_API_KEY:-}"
 AUTO_DIRECT_FALLBACK="${AUTO_DIRECT_FALLBACK:-true}"
 DIRECT_MODE="${DIRECT_MODE:-false}"
 DIRECT_TLS_ENABLED="${DIRECT_TLS_ENABLED:-true}"
+# These are public-ingress candidates. They are only probed by the Worker
+# after the node creates temporary listeners for direct-route discovery.
 DIRECT_PORT="${DIRECT_PORT:-443}"
 DIRECT_HTTP_PORT="${DIRECT_HTTP_PORT:-80}"
 DIRECT_PORT_CANDIDATES="${DIRECT_PORT_CANDIDATES:-80,443,8080,8443,8880,2053,2083,2087,2096}"
@@ -68,9 +70,14 @@ CF_DNS_PUBLIC_IP="${CF_DNS_PUBLIC_IP:-}"
 CF_DNS_TTL="${CF_DNS_TTL:-120}"
 CF_DNS_REPLACE_CNAME="${CF_DNS_REPLACE_CNAME:-true}"
 
+# These are local application listeners. They are checked with ss after the
+# service starts and are never used as public ingress heartbeat targets.
 ARGO_PORT="${ARGO_PORT:-8001}"
 CFPORT="${CFPORT:-443}"
 SERVER_PORT="${SERVER_PORT:-3000}"
+# This is an outbound Cloudflare Edge transport heartbeat, not an inbound
+# listener on the node. The protocol decides whether TCP, UDP, or both are
+# checked during the stage-1 network preflight.
 CLOUDFLARED_PROTOCOL="${CLOUDFLARED_PROTOCOL:-http2}"
 FILE_PATH="${FILE_PATH:-}"
 BIN_PATH="${BIN_PATH:-}"
@@ -133,6 +140,7 @@ auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后�
 CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
 AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
 AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳，443+80 都可达时申请 Let's Encrypt，否则使用发现到的 HTTP 端口。
+阶段 1 会先检查 TeamNode Worker HTTPS 和按协议选择的 Cloudflare Edge 7844 出站心跳；3000/8001 只在节点启动后检查本机监听，直连候选端口只在节点启动临时监听后由 Worker 从公网心跳确认。
 候选端口全部失败后，会按 DIRECT_PORT_SCAN_PORTS 和 DIRECT_PORT_SCAN_RANGE 扩展进行端口发现；DIRECT_PORT_SCAN_MAX 默认 256，避免一次性检查全部端口。
 Tunnel 和直连都没有可用路线时，节点会写入 `.no-route` 标记并以退出码 78 停止，systemd、Supervisor 和 PM2 不会继续反复拉起；修复云安全组/上游网络后重新运行安装器即可清除标记并重新探测。
 USAGE
@@ -1273,19 +1281,36 @@ validate_local_port() {
   (( value >= 1 && value <= 65535 )) || die "${name} 端口范围无效：${value}"
 }
 
+is_local_service_port() {
+  local port="$1"
+  [[ "${port}" == "${SERVER_PORT}" || "${port}" == "${ARGO_PORT}" ]]
+}
+
+validate_port_roles() {
+  [[ "${SERVER_PORT}" != "${ARGO_PORT}" ]] || die "SERVER_PORT 和 ARGO_PORT 不能使用同一个端口：${SERVER_PORT}"
+  [[ "${DIRECT_PORT}" != "${SERVER_PORT}" && "${DIRECT_PORT}" != "${ARGO_PORT}" ]] ||
+    die "DIRECT_PORT 不能复用本机服务端口：${DIRECT_PORT}"
+  [[ "${DIRECT_HTTP_PORT}" != "${SERVER_PORT}" && "${DIRECT_HTTP_PORT}" != "${ARGO_PORT}" ]] ||
+    die "DIRECT_HTTP_PORT 不能复用本机服务端口：${DIRECT_HTTP_PORT}"
+}
+
 validate_direct_port_candidates() {
   local candidate
   local seen=","
+  local usable=false
   [[ -n "${DIRECT_PORT_CANDIDATES}" ]] || die "DIRECT_PORT_CANDIDATES 不能为空"
   IFS=',' read -r -a candidates <<<"${DIRECT_PORT_CANDIDATES}"
   for candidate in "${candidates[@]}"; do
     candidate="${candidate//[[:space:]]/}"
     validate_local_port "DIRECT_PORT_CANDIDATES" "${candidate}"
+    is_local_service_port "${candidate}" && continue
+    usable=true
     if [[ "${seen}" != *",${candidate},"* ]]; then
       seen+="${candidate},"
     fi
   done
-  [[ "${seen}" != "," ]] || die "DIRECT_PORT_CANDIDATES 未包含有效端口"
+  [[ "${usable}" == true && "${seen}" != "," ]] ||
+    die "DIRECT_PORT_CANDIDATES 未包含可用于公网直连的端口（已排除 SERVER_PORT/ARGO_PORT）"
 }
 
 validate_direct_port_scan_config() {
@@ -1341,6 +1366,174 @@ set_tunnel_firewall_protocols() {
     auto) TUNNEL_FIREWALL_PROTOCOLS=(tcp udp); TUNNEL_FIREWALL_PROTOCOL_LABEL="TCP/UDP" ;;
     *) die "无法为未知 Cloudflare Tunnel 协议配置防火墙：${CLOUDFLARED_PROTOCOL}" ;;
   esac
+}
+
+heartbeat_http_endpoint() {
+  local endpoint="$1"
+  local response_code
+
+  response_code="$(curl \
+    --silent --show-error --location \
+    --connect-timeout 5 --max-time 10 \
+    --output /dev/null --write-out '%{http_code}' \
+    "${endpoint}" 2>/dev/null || true)"
+  if [[ "${response_code}" =~ ^[1-4][0-9][0-9]$ ]]; then
+    log "HTTPS 心跳通过：${endpoint}（HTTP ${response_code}）"
+    return 0
+  fi
+
+  warn "HTTPS 心跳失败：${endpoint}（${response_code:-无响应}）"
+  return 1
+}
+
+heartbeat_tcp_port() {
+  local host="$1"
+  local port="$2"
+
+  if has_command nc; then
+    nc -z -w 5 "${host}" "${port}" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+
+  # Keep netcat optional. util-linux/coreutils provide timeout on the
+  # supported distributions, and bash's /dev/tcp gives us a real TCP
+  # connect without adding another package just for the preflight.
+  if has_command timeout; then
+    timeout 5 "${BASH_BIN:-bash}" -c \
+      'exec 3<>"/dev/tcp/$1/$2"' _ "${host}" "${port}" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+
+  return 2
+}
+
+heartbeat_udp_port() {
+  local host="$1"
+  local port="$2"
+  local netcat_bin=""
+
+  if has_command nc; then
+    netcat_bin="$(command -v nc)"
+  elif has_command ncat; then
+    netcat_bin="$(command -v ncat)"
+  else
+    return 2
+  fi
+
+  # UDP has no universally reliable "closed" response. This is deliberately
+  # reported as best-effort; the real cloudflared QUIC handshake remains the
+  # authoritative check after cloudflared is installed and started.
+  "${netcat_bin}" -u -z -w 5 "${host}" "${port}" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+preflight_cloudflare_tcp_heartbeat() {
+  local host
+  local result
+  local attempted=false
+
+  for host in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    if heartbeat_tcp_port "${host}" "${CLOUDFLARED_TUNNEL_PORT}"; then
+      log "Cloudflare Edge TCP 心跳通过：${host}:${CLOUDFLARED_TUNNEL_PORT}"
+      return 0
+    else
+      result=$?
+    fi
+    if (( result == 1 )); then
+      attempted=true
+    fi
+  done
+
+  if [[ "${attempted}" != true ]]; then
+    return 2
+  fi
+  return 1
+}
+
+preflight_cloudflare_udp_heartbeat() {
+  local host
+  local result
+  local attempted=false
+
+  for host in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    if heartbeat_udp_port "${host}" "${CLOUDFLARED_TUNNEL_PORT}"; then
+      log "Cloudflare Edge UDP 心跳（最佳努力）通过：${host}:${CLOUDFLARED_TUNNEL_PORT}"
+      return 0
+    else
+      result=$?
+    fi
+    if (( result == 1 )); then
+      attempted=true
+    fi
+  done
+
+  if [[ "${attempted}" != true ]]; then
+    return 2
+  fi
+  return 1
+}
+
+preflight_network_heartbeats() {
+  local worker_endpoint="${TEAMNODE_SYNC_BASE_URL%/}/"
+  local tunnel_result
+
+  log "安装前网络心跳：检查控制面 ${worker_endpoint}"
+  if ! heartbeat_http_endpoint "${worker_endpoint}"; then
+    die "无法连接 TeamNode Worker；安装前无法兑换令牌或执行公网路由心跳，请检查 DNS、HTTPS、代理和上游出口网络"
+  fi
+
+  set_tunnel_firewall_protocols
+  case "${CLOUDFLARED_PROTOCOL}" in
+    http2)
+      if preflight_cloudflare_tcp_heartbeat; then
+        :
+      else
+        tunnel_result=$?
+        if (( tunnel_result == 2 )); then
+          warn "无法执行 Cloudflare Edge TCP 7844 预检（缺少 nc 和 timeout）；安装后仍会由 cloudflared 和 Worker 做最终验证"
+        else
+          warn "Cloudflare Edge TCP 7844 预检失败；将继续安装，启动后自动尝试直连回退"
+        fi
+      fi
+      ;;
+    quic)
+      if preflight_cloudflare_udp_heartbeat; then
+        :
+      else
+        tunnel_result=$?
+        if (( tunnel_result == 2 )); then
+          warn "无法执行 Cloudflare Edge UDP 7844 预检（未找到 nc/ncat）；QUIC 真实性能仍由 cloudflared 启动握手决定"
+        else
+          warn "Cloudflare Edge UDP 7844 预检失败；将继续安装，启动后自动尝试直连回退"
+        fi
+      fi
+      ;;
+    auto)
+      if preflight_cloudflare_tcp_heartbeat; then
+        :
+      else
+        tunnel_result=$?
+        if (( tunnel_result == 2 )); then
+          warn "无法执行 Cloudflare Edge TCP 7844 预检（缺少 nc 和 timeout）"
+        else
+          warn "Cloudflare Edge TCP 7844 预检失败"
+        fi
+      fi
+      if preflight_cloudflare_udp_heartbeat; then
+        :
+      else
+        tunnel_result=$?
+        if (( tunnel_result == 2 )); then
+          warn "无法执行 Cloudflare Edge UDP 7844 预检（未找到 nc/ncat）；继续依赖 cloudflared 的 QUIC/HTTP2 实际握手"
+        else
+          warn "Cloudflare Edge UDP 7844 预检失败；cloudflared 仍会按 auto 协议尝试"
+        fi
+      fi
+      ;;
+  esac
+
+  log "安装前网络心跳完成：本机 HTTP ${SERVER_PORT}/ARGO ${ARGO_PORT} 尚未启动，不参与公网探测"
+  log "直连入站候选端口将在节点启动并临时监听后，由 Worker 从公网执行端口心跳"
 }
 
 ufw_is_active() {
@@ -1621,6 +1814,7 @@ direct_firewall_ports() {
   candidates+=("${DIRECT_PORT}" "${DIRECT_HTTP_PORT}")
   for port in "${candidates[@]}"; do
     port="${port//[[:space:]]/}"
+    is_local_service_port "${port}" && continue
     [[ -n "${port}" && "${seen}" != *",${port},"* ]] || continue
     seen+="${port},"
     printf '%s\n' "${port}"
@@ -1634,12 +1828,14 @@ direct_firewall_ports() {
       range_start="${BASH_REMATCH[1]}"
       range_end="${BASH_REMATCH[2]}"
       for ((port = range_start; port <= range_end; port += 1)); do
+        is_local_service_port "${port}" && continue
         [[ "${seen}" != *",${port},"* ]] || continue
         seen+="${port},"
         printf '%s\n' "${port}"
       done
     else
       port="${item}"
+      is_local_service_port "${port}" && continue
       [[ -n "${port}" && "${seen}" != *",${port},"* ]] || continue
       seen+="${port},"
       printf '%s\n' "${port}"
@@ -2070,7 +2266,7 @@ main() {
   parse_args "$@"
   configure_install_context
   resolve_source_checksum
-  stage "检查安装参数和源码校验"
+  stage "检查参数、源码校验和网络心跳"
   validate_app_dir
   if is_true "${UNINSTALL}"; then
     uninstall
@@ -2092,9 +2288,11 @@ main() {
   validate_local_port "ARGO_PORT" "${ARGO_PORT}"
   validate_local_port "DIRECT_PORT" "${DIRECT_PORT}"
   validate_local_port "DIRECT_HTTP_PORT" "${DIRECT_HTTP_PORT}"
+  validate_port_roles
   validate_direct_port_candidates
   validate_direct_port_scan_config
   validate_runtime_paths
+  preflight_network_heartbeats
   ENV_FILE="${APP_DIR}/.env"
   RUNNER_SCRIPT="${APP_DIR}/run.sh"
   PID_FILE="${APP_DIR}/service.pid"

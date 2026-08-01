@@ -45,6 +45,13 @@ const ARGO_DOMAIN = process.env.ARGO_DOMAIN || (PLATFORM_PROXY_MODE ? PLATFORM_P
 const ARGO_AUTH = process.env.ARGO_AUTH || ""; // 固定隧道密钥 JSON 或 token，留空则启用临时隧道
 const ARGO_PORT = process.env.ARGO_PORT || 8001; // 固定隧道端口，使用 token 时需和 Cloudflare 后台一致
 const ARGO_GATEWAY_HOST = process.env.ARGO_GATEWAY_HOST || "127.0.0.1";
+// These listeners are internal application ports. They must never be offered
+// to the Worker as direct public-ingress heartbeat candidates.
+const LOCAL_SERVICE_PORTS = new Set(
+  [PORT, ARGO_PORT]
+    .map((value) => Number.parseInt(String(value), 10))
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535)
+);
 const DIRECT_MODE = parseBoolean(process.env.DIRECT_MODE, false);
 const PLATFORM_PUBLIC_PORT = Number.parseInt(process.env.PLATFORM_PUBLIC_PORT || "443", 10);
 const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
@@ -56,7 +63,7 @@ const DIRECT_PORT_CANDIDATES = [...new Set(
   String(process.env.DIRECT_PORT_CANDIDATES || "80,443,8080,8443,8880,2053,2083,2087,2096")
     .split(",")
     .map((value) => Number.parseInt(value.trim(), 10))
-    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535)
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535 && !LOCAL_SERVICE_PORTS.has(port))
 )].slice(0, 12);
 const DIRECT_PORT_SCAN_PORTS = String(
   process.env.DIRECT_PORT_SCAN_PORTS || "8000,8008,8081,8088,8090,8181,8444,8888,9000,9443,10000,11550-11570,20000,30000,40000,50000,60000"
@@ -821,6 +828,7 @@ function buildDirectPortScanCandidates() {
 
   const excluded = new Set([
     ...DIRECT_PORT_CANDIDATES,
+    ...LOCAL_SERVICE_PORTS,
     22,
     25,
     53,
@@ -986,7 +994,7 @@ function closeDirectPortListener(server) {
 async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES) {
   const normalizedPorts = [...new Set((Array.isArray(ports) ? ports : [])
     .map((port) => Number.parseInt(String(port), 10))
-    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535))];
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535 && !LOCAL_SERVICE_PORTS.has(port)))];
   if (!normalizedPorts.length) {
     return { results: [], error: "direct_port_candidates_empty" };
   }
@@ -1053,7 +1061,8 @@ function selectDirectFallbackPlan(results) {
   const resultPorts = (Array.isArray(results) ? results : [])
     .map((result) => Number(result?.port))
     .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535);
-  const fallbackOrder = [80, 8080, 8443, 8880, 2053, 2083, 2087, 2096, 443, ...DIRECT_PORT_CANDIDATES, ...resultPorts];
+  const fallbackOrder = [80, 8080, 8443, 8880, 2053, 2083, 2087, 2096, 443, ...DIRECT_PORT_CANDIDATES, ...resultPorts]
+    .filter((candidate) => !LOCAL_SERVICE_PORTS.has(candidate));
   const port = [...new Set(fallbackOrder)].find((candidate) => isOpen(candidate));
   if (!port) return null;
 
