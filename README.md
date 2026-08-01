@@ -132,11 +132,11 @@ https://install.lemon.vin/install.sh
 https://你的-worker.workers.dev/
 ```
 
-未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板显示来源 IP、节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，以及节点实际上报的 Cloudflare Tunnel 连通性、传输协议、所需端口、HTTP 状态码、失败原因和最后检查时间；不显示 UUID 或其他敏感配置。Tunnel 连通性由节点先探测 Cloudflare Tunnel 传输端口，再访问 `ARGO_DOMAIN` 检查边缘返回，不把 TeamNode 心跳直接当作 Tunnel 在线。当前 HTTP/2 配置通常显示需要放行出站 TCP `7844`；QUIC 显示 UDP `7844`；自动协议显示 TCP/UDP `7844`。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；累计心跳少于 5 次的节点，在明确下线或 Worker 确认其超过心跳检测阈值后直接删除，不进入超时/离线保留流程。累计达到 5 次心跳的节点，明确下线后的前 5 分钟显示“超时”，第 5–10 分钟显示“离线”，超过 10 分钟后自动删除。没有明确下线通知的节点，Worker 会在下一次轮询发现其超过 5 分钟没有心跳时显示“离线”，并在最后一次活动超过 10 分钟后自动删除；恢复心跳后自动回到“在线”。Worker 不会主动替节点生成心跳，只有通过中继令牌认证且成功转发到 TeamNode 的节点请求才会更新面板状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整心跳阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
+未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板会分别显示可用的公网 IPv4、IPv6，以及节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，并显示节点实际上报的 Cloudflare Tunnel 连通性、传输协议、所需端口、HTTP 状态码、失败原因和最后检查时间；不显示 UUID 或其他敏感配置。Tunnel 连通性由节点先探测 Cloudflare Tunnel 传输端口，再访问 `ARGO_DOMAIN` 检查边缘返回，不把 TeamNode 心跳直接当作 Tunnel 在线。当前 HTTP/2 配置通常显示需要放行出站 TCP `7844`；QUIC 显示 UDP `7844`；自动协议显示 TCP/UDP `7844`。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；累计心跳少于 5 次的节点，在明确下线或 Worker 确认其超过心跳检测阈值后直接删除，不进入超时/离线保留流程。累计达到 5 次心跳的节点，明确下线后的前 5 分钟显示“超时”，第 5–10 分钟显示“离线”，超过 10 分钟后自动删除。没有明确下线通知的节点，Worker 会在下一次轮询发现其超过 5 分钟没有心跳时显示“离线”，并在最后一次活动超过 10 分钟后自动删除；恢复心跳后自动回到“在线”。Worker 不会主动替节点生成心跳，只有通过中继令牌认证且成功转发到 TeamNode 的节点请求才会更新面板状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整心跳阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
 
 如果以后设置了 `DASHBOARD_PASSWORD`，根页面和 `/api/nodes` 会启用 Basic Auth，默认用户名为 `admin`。
 
-在线状态由 Cloudflare Durable Object 持久化，多台机器可以同时注册，不会因为 Worker 实例切换而互相覆盖。来源 IP 是 Cloudflare 看到的设备出口 IP；如果目标机器经过 NAT 或代理，显示的可能是 NAT 或代理出口地址。
+在线状态由 Cloudflare Durable Object 持久化，多台机器可以同时注册，不会因为 Worker 实例切换而互相覆盖。节点每 5 分钟分别检测一次公网 IPv4/IPv6，Worker 还会用 `CF-Connecting-IP` 补充当前心跳的出口地址，并保留已知的两种地址；如果目标机器经过 NAT 或代理，显示的可能是 NAT 或代理出口地址。
 
 ## 二、安装无 Docker 节点
 

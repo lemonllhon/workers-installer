@@ -93,6 +93,25 @@ function normalizeRuntimeInfo(value) {
   };
 }
 
+function normalizeIpv6(value) {
+  const candidate = String(value || "").trim().toLowerCase();
+  if (!candidate.includes(":") || candidate.length > 64 || !/^[0-9a-f:.]+$/.test(candidate)) return "";
+  try {
+    const hostname = new URL(`http://[${candidate}]/`).hostname;
+    return hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function nodeIpAddresses(node = {}) {
+  const legacyIp = String(node.sourceIp || "").trim();
+  return {
+    ipv4: normalizeIpv4(node.sourceIpv4) || normalizeIpv4(legacyIp) || "",
+    ipv6: normalizeIpv6(node.sourceIpv6) || normalizeIpv6(legacyIp) || ""
+  };
+}
+
 function normalizeTunnelConnectivity(value) {
   if (!value || typeof value !== "object") return null;
 
@@ -219,13 +238,16 @@ async function recordNodeEvent(request, env, payload, eventPath) {
   if (!uuid) return;
 
   const status = eventPath.endsWith("/offline") ? "offline" : "online";
+  const observedSourceIp = String(request.headers.get("CF-Connecting-IP") || "").trim();
   const event = {
     uuid,
     status,
     eventPath,
     lastSeen: status === "online" ? Date.now() : null,
     lastEventAt: Date.now(),
-    sourceIp: request.headers.get("CF-Connecting-IP") || null,
+    sourceIp: observedSourceIp || null,
+    sourceIpv4: normalizeIpv4(payload?.sourceIpv4 || payload?.metadata?.sourceIpv4) || normalizeIpv4(observedSourceIp) || null,
+    sourceIpv6: normalizeIpv6(payload?.sourceIpv6 || payload?.metadata?.sourceIpv6) || normalizeIpv6(observedSourceIp) || null,
     country: request.cf?.country || null,
     colo: request.cf?.colo || null,
     label: String(payload?.label || "").slice(0, 128),
@@ -364,8 +386,11 @@ function decorateNodeStatus(nodes, env) {
       const tunnelTestExpired = tunnelTest
         && ["queued", "running"].includes(tunnelTest.status)
         && now - Number(tunnelTest.requestedAt || now) > TUNNEL_TEST_QUEUE_TTL_MS;
+      const addresses = nodeIpAddresses(node);
       return {
         ...node,
+        sourceIpv4: addresses.ipv4 || null,
+        sourceIpv6: addresses.ipv6 || null,
         ...(tunnelTestExpired
           ? { tunnelTest: { ...tunnelTest, status: "expired", updatedAt: now, reason: "node_response_timeout" } }
           : {}),
@@ -627,6 +652,17 @@ function tunnelConnectivityView(node) {
   };
 }
 
+function nodeAddressMarkup(node) {
+  const addresses = nodeIpAddresses(node);
+  const rows = [
+    addresses.ipv4 ? `<span class="node-address-line"><b>IPv4</b><code>${htmlEscape(addresses.ipv4)}</code></span>` : "",
+    addresses.ipv6 ? `<span class="node-address-line"><b>IPv6</b><code>${htmlEscape(addresses.ipv6)}</code></span>` : ""
+  ].filter(Boolean);
+  return rows.length > 0
+    ? `<div class="node-address-list">${rows.join("")}</div>`
+    : "<strong>-</strong>";
+}
+
 function tunnelConnectivityMarkup(node) {
   const view = tunnelConnectivityView(node);
   const uuid = safeNodeId(node?.uuid);
@@ -713,7 +749,7 @@ async function dashboardPageResponse(request, env) {
           <div class="heartbeat-strip${node.online ? " heartbeat-active" : ""}" aria-label="最近心跳记录">${heartbeatSegments(node, env)}</div>
           <div class="heartbeat-scale"><span>现在</span><span>${ttlMinutes} 分钟前</span></div>
           <div class="node-fields">
-            <div><span>来源 IP</span><strong>${htmlEscape(node.sourceIp || "-")}</strong></div>
+            <div><span>IP 地址</span>${nodeAddressMarkup(node)}</div>
             <div><span>地区</span><strong>${htmlEscape(node.country || node.countryName || "-")}</strong></div>
             <div><span>Provider</span><strong>${htmlEscape(node.provider || "-")}</strong></div>
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
@@ -855,6 +891,10 @@ async function dashboardPageResponse(request, env) {
     .node-fields div { display: grid; min-width: 0; gap: 5px; }
     .node-fields span { color: var(--muted); font-size: 11px; }
     .node-fields strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 600; }
+    .node-fields .node-address-list { display: grid; gap: 3px; }
+    .node-fields .node-address-line { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: baseline; gap: 5px; min-width: 0; }
+    .node-address-line b { color: var(--muted); font-size: 10px; font-weight: 700; }
+    .node-address-line code { overflow-wrap: anywhere; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; font-weight: 600; }
     .node-fields .tunnel-row { grid-column: 1 / -1; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
     .node-fields .tunnel-row > span { flex: 0 0 auto; }
     .tunnel-field { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 7px; min-width: 0; }
@@ -984,7 +1024,7 @@ async function dashboardPageResponse(request, env) {
         <div id="node-rows" class="node-list">${rows}</div>
       </div>
     </section>
-    <p id="dashboard-status" class="footer">每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP；如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。</p>
+    <p id="dashboard-status" class="footer">每 30 秒自动更新节点内容，不会刷新整个页面。IPv4/IPv6 来自节点公网检测，并以 Cloudflare 看到的心跳出口地址补充；经过 NAT 或代理时可能显示对应出口地址。</p>
   </main>
   <script>
     (() => {
@@ -1145,6 +1185,19 @@ async function dashboardPageResponse(request, env) {
         return { system, arch: info.arch || "-", resources };
       }
 
+      function renderNodeAddresses(node) {
+        const legacyIp = String(node?.sourceIp || "").trim();
+        const ipv4 = String(node?.sourceIpv4 || (!legacyIp.includes(":") ? legacyIp : "")).trim();
+        const ipv6 = String(node?.sourceIpv6 || (legacyIp.includes(":") ? legacyIp : "")).trim();
+        const rows = [
+          ipv4 ? '<span class="node-address-line"><b>IPv4</b><code>' + escapeHtml(ipv4) + '</code></span>' : '',
+          ipv6 ? '<span class="node-address-line"><b>IPv6</b><code>' + escapeHtml(ipv6) + '</code></span>' : ''
+        ].filter(Boolean);
+        return rows.length > 0
+          ? '<div class="node-address-list">' + rows.join('') + '</div>'
+          : '<strong>-</strong>';
+      }
+
       function tunnelPortRequirement(info) {
         const protocols = Array.isArray(info?.requiredProtocols) && info.requiredProtocols.length > 0
           ? info.requiredProtocols.join("/")
@@ -1248,6 +1301,8 @@ async function dashboardPageResponse(request, env) {
         return [
           node?.label,
           node?.sourceIp,
+          node?.sourceIpv4,
+          node?.sourceIpv6,
           node?.argoDomain,
           node?.country,
           node?.countryName,
@@ -1391,7 +1446,7 @@ async function dashboardPageResponse(request, env) {
             + '<div class="heartbeat-strip' + (node.online ? " heartbeat-active" : "") + (heartbeatLimit < 72 ? " heartbeat-short" : "") + '" aria-label="最近心跳记录">' + renderHeartbeatSegments(node, heartbeatLimit) + '</div>'
             + '<div class="heartbeat-scale"><span>现在</span><span>' + heartbeatWindowMinutes + ' 分钟前</span></div>'
             + '<div class="node-fields">'
-            + '<div><span>来源 IP</span><strong>' + escapeHtml(node.sourceIp || "-") + '</strong></div>'
+            + '<div><span>IP 地址</span>' + renderNodeAddresses(node) + '</div>'
             + '<div><span>地区</span><strong>' + escapeHtml(node.country || node.countryName || "-") + '</strong></div>'
             + '<div><span>Provider</span><strong>' + escapeHtml(node.provider || "-") + '</strong></div>'
             + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
@@ -1470,7 +1525,7 @@ async function dashboardPageResponse(request, env) {
           tunnelStateElement.textContent = tunnelState;
           tunnelStateElement.className = "service-state " + (tunnelState === "有异常" ? "attention" : tunnelState === "正常" ? "operational" : "waiting");
           lastUpdatedElement.textContent = "刚刚更新";
-          statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；每 30 秒自动更新节点内容，不会刷新整个页面。来源 IP 为 Cloudflare 看到的设备出口 IP，如果设备经过 NAT 或代理，这可能是 NAT/代理出口地址。";
+          statusElement.textContent = "最后更新：" + new Date().toLocaleString() + "；每 30 秒自动更新节点内容，不会刷新整个页面。IPv4/IPv6 来自节点公网检测，并以 Cloudflare 看到的心跳出口地址补充；经过 NAT 或代理时可能显示对应出口地址。";
         } catch (error) {
           statusElement.textContent = "内容刷新失败（" + String(error?.message || error) + "），保留上次数据显示。";
         } finally {
@@ -1948,10 +2003,13 @@ export class NodeRegistry {
       const heartbeatHistory = lastHistoryValue === lastSeen
         ? previousHistory
         : [...previousHistory, lastSeen].slice(-HEARTBEAT_HISTORY_LIMIT);
+      const previousAddresses = nodeIpAddresses(previous);
       const record = {
         ...previous,
         ...event,
         uuid,
+        sourceIpv4: normalizeIpv4(event.sourceIpv4) || previousAddresses.ipv4 || null,
+        sourceIpv6: normalizeIpv6(event.sourceIpv6) || previousAddresses.ipv6 || null,
         status: "online",
         stoppedAt: null,
         lastSeen,
@@ -2091,7 +2149,14 @@ export class NodeRegistry {
       if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
       const current = await this.state.storage.get(`node:${uuid}`);
       if (!current) return json({ error: "node_not_found" }, 404);
-      return json({ ok: true, sourceIp: current.sourceIp || null, lastSeen: current.lastSeen || null });
+      const addresses = nodeIpAddresses(current);
+      return json({
+        ok: true,
+        sourceIp: current.sourceIp || null,
+        sourceIpv4: addresses.ipv4 || null,
+        sourceIpv6: addresses.ipv6 || null,
+        lastSeen: current.lastSeen || null
+      });
     }
 
     if (url.pathname === "/online" && request.method === "GET") {

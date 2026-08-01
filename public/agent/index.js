@@ -114,6 +114,8 @@ const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
 // 直连入口最终写入 Cloudflare A 记录，并由 Nginx 监听 IPv4。直连探测请求
 // 必须从本机 IPv4 出口访问 Worker，确保 CF-Connecting-IP 与实际入口一致。
 const TEAMNODE_IPV4_HTTPS_AGENT = new https.Agent({ family: 4, keepAlive: false });
+const TEAMNODE_IPV6_HTTPS_AGENT = new https.Agent({ family: 6, keepAlive: false });
+const NODE_PUBLIC_ADDRESS_CACHE_MS = 5 * 60 * 1000;
 const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
 const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
 const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
@@ -189,6 +191,7 @@ let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
 let tunnelConnectivityCache = null;
 let publicRouteProbeCache = null;
+let nodePublicAddressCache = null;
 let tunnelFailureStreak = 0;
 let directFallbackPromise = null;
 let xrayProcessId = null;
@@ -745,6 +748,8 @@ function buildTeamNodePayload(context, { includeContent = true, runtimeStatus = 
       nodeName: context.nodeName || "",
       projectUrl: PROJECT_URL || "",
       subPath: SUB_PATH || "",
+      sourceIpv4: context.publicAddresses?.ipv4 || null,
+      sourceIpv6: context.publicAddresses?.ipv6 || null,
       ipRisk: context.ipRisk || null
     }
   };
@@ -1490,7 +1495,7 @@ async function syncNodeToTeamNode(context) {
     return null;
   }
 
-  const [ipRisk, tunnelConnectivity, publicProbe] = await Promise.all([
+  const [ipRisk, tunnelConnectivity, publicProbe, detectedPublicAddresses] = await Promise.all([
     context.ipRisk && !teamnodeSyncRegistered
       ? context.ipRisk
       : resolveTeamNodeIpRiskInfo(),
@@ -1500,12 +1505,19 @@ async function syncNodeToTeamNode(context) {
       mode: DIRECT_MODE ? "direct" : "tunnel",
       port: DIRECT_MODE ? DIRECT_PORT : 7844,
       tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
-    })
+    }),
+    resolveNodePublicAddresses()
   ]);
+  const publicAddresses = { ...detectedPublicAddresses };
+  const riskIp = String(ipRisk?.ip || context.ipRisk?.ip || "").trim();
+  const riskIpVersion = net.isIP(riskIp);
+  if (!publicAddresses.ipv4 && riskIpVersion === 4) publicAddresses.ipv4 = riskIp;
+  if (!publicAddresses.ipv6 && riskIpVersion === 6) publicAddresses.ipv6 = riskIp;
   const verifiedTunnelConnectivity = mergePublicRouteProbe(tunnelConnectivity, publicProbe);
   const syncContext = {
     ...context,
     ipRisk,
+    publicAddresses,
     tunnelConnectivity: verifiedTunnelConnectivity
   };
 
@@ -2343,6 +2355,39 @@ async function resolveCloudflareZoneId(client) {
   }
 
   return zones[0].id;
+}
+
+async function requestPublicIp(url, family, httpsAgent) {
+  try {
+    const response = await axios.get(url, {
+      timeout: 4000,
+      httpsAgent,
+      headers: { "User-Agent": "nodejs-argo-public-address/1.0" }
+    });
+    const address = String(response.data?.ip || "").trim();
+    return net.isIP(address) === family ? address : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolveNodePublicAddresses({ force = false } = {}) {
+  const now = Date.now();
+  if (
+    !force
+    && nodePublicAddressCache
+    && now - Number(nodePublicAddressCache.checkedAt || 0) < NODE_PUBLIC_ADDRESS_CACHE_MS
+  ) {
+    return { ...nodePublicAddressCache };
+  }
+
+  const [ipv4, ipv6] = await Promise.all([
+    requestPublicIp("https://api.ipify.org?format=json", 4, TEAMNODE_IPV4_HTTPS_AGENT),
+    requestPublicIp("https://api6.ipify.org?format=json", 6, TEAMNODE_IPV6_HTTPS_AGENT)
+  ]);
+  nodePublicAddressCache = { ipv4, ipv6, checkedAt: now };
+  console.log(`公网地址检测：IPv4=${ipv4 || "不可用"}，IPv6=${ipv6 || "不可用"}`);
+  return { ...nodePublicAddressCache };
 }
 
 async function resolvePublicIpv4() {
