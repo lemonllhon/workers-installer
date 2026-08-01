@@ -159,6 +159,7 @@ https://你的-worker.workers.dev/
 - `NODE_RUNTIME_VERSION`：仅当系统 Node.js 低于 14 时使用的项目专用 Node.js 版本，默认 `20.20.2`；不会升级或替换系统 Node.js。
 - `NODE_RUNTIME_SHA256`：仅在自定义 `NODE_RUNTIME_VERSION` 且该版本没有内置校验值时，填写对应 Node.js 官方 Linux 压缩包的 64 位 SHA256。
 - `TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS`：节点轮询面板检测指令的间隔，默认 `15000` 毫秒，允许范围为 5–60 秒。
+- `PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS`：安装器等待 Tunnel/直连公网路线心跳的时间，默认 `180` 秒，允许范围为 30–600 秒。
 
 如果目标机已有 Node.js 12，安装器不会把它升级成全局版本，也不会影响其他项目；它会在
 安装目录内的 `node-runtime/` 安装并使用项目专用 Node.js 20.20.2。已有 Node.js 14 或更高版本
@@ -378,7 +379,7 @@ env \
 | `SERVER_PORT`（默认 3000）和 `ARGO_PORT`（默认 8001） | 本机监听 | 服务启动后用 `ss` 检查 | 应用内部端口，不属于公网入口，不会交给 Worker 探测 |
 | `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT_SCAN_PORTS`、`DIRECT_PORT_SCAN_RANGE` | 公网入站 | 服务启动后临时监听，Worker 从公网建立 TCP/HTTP(S) 心跳 | 覆盖云安全组、上游网络和运营商入口限制，决定直连端口 |
 
-阶段 1 的 7844 预检失败不会直接把安装判定为失败，因为机器仍可能通过直连模式运行；它会在启动 Tunnel 失败后进入直连端口发现。阶段 1 不能提前判断直连入站端口，因为此时节点还没有监听这些端口；直连端口必须在启动后的 Worker 外部回访中确认。即使扫描范围包含 `SERVER_PORT` 或 `ARGO_PORT`，安装器和节点也会把这两个本机端口从直连探测及直连防火墙候选中排除。安装器只有在本机服务监听检查和最终公网路线检查都通过后才完成安装。
+阶段 1 的 7844 预检会逐项显示协议、Edge 地址、端口和序号，每个 Edge 使用 6 秒硬超时，因此不会在空白状态下无限等待。所选协议的 7844 被明确判定为阻断后，安装器会跳过 cloudflared 下载、Tunnel 防火墙配置和 Tunnel 启动，节点直接进入 Worker 直连端口心跳；只有结果可用或无法可靠判断时才保留 Tunnel 路线。阶段 1 不能提前判断直连入站端口，因为此时节点还没有监听这些端口；直连端口必须在启动后的 Worker 外部回访中确认。即使扫描范围包含 `SERVER_PORT` 或 `ARGO_PORT`，安装器和节点也会把这两个本机端口从直连探测及直连防火墙候选中排除。安装器只有在本机服务监听检查和最终公网路线检查都通过后才完成安装。
 
 启动阶段的 Tunnel 路由心跳默认最多重试 5 次、每次间隔 4 秒；可用 `STARTUP_TUNNEL_PROBE_ATTEMPTS` 和 `STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS` 调整。Tunnel 心跳包括节点到 Cloudflare Edge 的 7844 出站连通性，以及 Worker 对最终 `ARGO_DOMAIN` 的回访；Worker 不会把 `install.lemon.vin:7844` 当作 Tunnel 目标，因为 7844 是节点到 Cloudflare Edge 的传输端口。
 

@@ -1792,7 +1792,7 @@ async function directPortProbeResponse(request, env) {
   if (!host) return json({ error: "node_public_ip_unavailable" }, 409);
 
   const results = await Promise.all(ports.map((port) => probePublicTcpPort(host, port)));
-  return json({ ok: true, checkedAt: Date.now(), results });
+  return json({ ok: true, checkedAt: Date.now(), host, results });
 }
 
 async function relayTeamNodeRequest(request, env, ctx) {

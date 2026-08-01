@@ -15,6 +15,7 @@ readonly CLOUDFLARED_RELEASE_PAGE="https://github.com/cloudflare/cloudflared/rel
 readonly DEFAULT_XRAY_VERSION="v26.3.27"
 readonly DEFAULT_PM2_VERSION="5.4.3"
 readonly CLOUDFLARED_TUNNEL_PORT="7844"
+readonly NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS="6"
 # Keep the fallback runtime inside this installation directory.  It is only
 # used when the host's Node.js is missing or older than the application's
 # minimum, so other applications can continue using their own Node.js.
@@ -75,6 +76,7 @@ CF_DNS_REPLACE_CNAME="${CF_DNS_REPLACE_CNAME:-true}"
 ARGO_PORT="${ARGO_PORT:-8001}"
 CFPORT="${CFPORT:-443}"
 SERVER_PORT="${SERVER_PORT:-3000}"
+PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS="${PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS:-180}"
 # This is an outbound Cloudflare Edge transport heartbeat, not an inbound
 # listener on the node. The protocol decides whether TCP, UDP, or both are
 # checked during the stage-1 network preflight.
@@ -105,6 +107,8 @@ CURRENT_USER_HOME=""
 TMP_DIR=""
 TUNNEL_FIREWALL_PROTOCOLS=()
 TUNNEL_FIREWALL_PROTOCOL_LABEL=""
+TUNNEL_PREFLIGHT_BLOCKED=false
+TUNNEL_PREFLIGHT_STATUS="unknown"
 STAGE_CURRENT=0
 readonly STAGE_TOTAL=10
 
@@ -441,12 +445,13 @@ create_service_user() {
 }
 
 check_dependencies() {
-  if ! has_command bash || ! has_command curl || ! has_command sha256sum || ! has_command ss || ! has_command tar || ! has_command unzip || ! has_command nohup || ([[ "${RUN_AS_ROOT}" == true ]] && (! has_command node || ! has_command npm || ! can_run_as_service_user)); then
+  if ! has_command bash || ! has_command curl || ! has_command timeout || ! has_command sha256sum || ! has_command ss || ! has_command tar || ! has_command unzip || ! has_command nohup || ([[ "${RUN_AS_ROOT}" == true ]] && (! has_command node || ! has_command npm || ! can_run_as_service_user)); then
     is_true "${DRY_RUN}" && die "缺少依赖（dry-run 不会安装依赖）"
     install_os_dependencies
   fi
 
   has_command bash || die "未找到 bash"
+  has_command timeout || die "未找到 timeout，无法为网络心跳设置硬超时"
   if [[ "${RUN_AS_ROOT}" == true ]]; then
     has_command node || die "未找到 node"
     has_command npm || die "未找到 npm"
@@ -914,6 +919,7 @@ write_env_file() {
   write_env_value "CLOUDFLARE_API_KEY" "${CLOUDFLARE_API_KEY}"
   write_env_value "AUTO_DIRECT_FALLBACK" "${AUTO_DIRECT_FALLBACK}"
   write_env_value "CLOUDFLARED_PROTOCOL" "${CLOUDFLARED_PROTOCOL}"
+  write_env_value "TUNNEL_PREFLIGHT_BLOCKED" "${TUNNEL_PREFLIGHT_BLOCKED}"
   write_env_value "CLOUDFLARED_LOG_LEVEL" "${CLOUDFLARED_LOG_LEVEL:-info}"
   write_env_value "XRAY_LOG_LEVEL" "${XRAY_LOG_LEVEL:-warning}"
   write_env_value "XRAY_ACCESS_LOG_ENABLED" "${XRAY_ACCESS_LOG_ENABLED:-false}"
@@ -1391,20 +1397,14 @@ heartbeat_tcp_port() {
   local port="$2"
 
   if has_command nc; then
-    nc -z -w 5 "${host}" "${port}" >/dev/null 2>&1 && return 0
+    timeout "${NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS}" nc -z -w 5 "${host}" "${port}" >/dev/null 2>&1 && return 0
     return 1
   fi
 
-  # Keep netcat optional. util-linux/coreutils provide timeout on the
-  # supported distributions, and bash's /dev/tcp gives us a real TCP
-  # connect without adding another package just for the preflight.
-  if has_command timeout; then
-    timeout 5 "${BASH_BIN:-bash}" -c \
-      'exec 3<>"/dev/tcp/$1/$2"' _ "${host}" "${port}" >/dev/null 2>&1 && return 0
-    return 1
-  fi
-
-  return 2
+  # bash's /dev/tcp gives us a real TCP connect. The outer timeout also
+  # covers slow DNS resolution and netcat variants with unreliable -w.
+  timeout "${NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS}" "${BASH_BIN:-bash}" -c 'exec 3<>"/dev/tcp/$1/$2"' _ "${host}" "${port}" >/dev/null 2>&1 && return 0
+  return 1
 }
 
 heartbeat_udp_port() {
@@ -1423,7 +1423,7 @@ heartbeat_udp_port() {
   # UDP has no universally reliable "closed" response. This is deliberately
   # reported as best-effort; the real cloudflared QUIC handshake remains the
   # authoritative check after cloudflared is installed and started.
-  "${netcat_bin}" -u -z -w 5 "${host}" "${port}" >/dev/null 2>&1 && return 0
+  timeout "${NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS}" "${netcat_bin}" -u -z -w 5 "${host}" "${port}" >/dev/null 2>&1 && return 0
   return 1
 }
 
@@ -1431,8 +1431,11 @@ preflight_cloudflare_tcp_heartbeat() {
   local host
   local result
   local attempted=false
+  local attempt=0
 
   for host in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    attempt=$((attempt + 1))
+    log "Cloudflare Edge TCP 心跳 ${attempt}/2：检查 ${host}:${CLOUDFLARED_TUNNEL_PORT}（最多 ${NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS} 秒）"
     if heartbeat_tcp_port "${host}" "${CLOUDFLARED_TUNNEL_PORT}"; then
       log "Cloudflare Edge TCP 心跳通过：${host}:${CLOUDFLARED_TUNNEL_PORT}"
       return 0
@@ -1441,6 +1444,9 @@ preflight_cloudflare_tcp_heartbeat() {
     fi
     if (( result == 1 )); then
       attempted=true
+      warn "Cloudflare Edge TCP 心跳未通过：${host}:${CLOUDFLARED_TUNNEL_PORT}"
+    else
+      warn "Cloudflare Edge TCP 心跳无法执行：${host}:${CLOUDFLARED_TUNNEL_PORT}"
     fi
   done
 
@@ -1454,8 +1460,11 @@ preflight_cloudflare_udp_heartbeat() {
   local host
   local result
   local attempted=false
+  local attempt=0
 
   for host in region1.v2.argotunnel.com region2.v2.argotunnel.com; do
+    attempt=$((attempt + 1))
+    log "Cloudflare Edge UDP 心跳 ${attempt}/2（最佳努力）：检查 ${host}:${CLOUDFLARED_TUNNEL_PORT}（最多 ${NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS} 秒）"
     if heartbeat_udp_port "${host}" "${CLOUDFLARED_TUNNEL_PORT}"; then
       log "Cloudflare Edge UDP 心跳（最佳努力）通过：${host}:${CLOUDFLARED_TUNNEL_PORT}"
       return 0
@@ -1464,6 +1473,9 @@ preflight_cloudflare_udp_heartbeat() {
     fi
     if (( result == 1 )); then
       attempted=true
+      warn "Cloudflare Edge UDP 心跳未通过：${host}:${CLOUDFLARED_TUNNEL_PORT}"
+    else
+      warn "Cloudflare Edge UDP 心跳无法执行：${host}:${CLOUDFLARED_TUNNEL_PORT}"
     fi
   done
 
@@ -1475,7 +1487,8 @@ preflight_cloudflare_udp_heartbeat() {
 
 preflight_network_heartbeats() {
   local worker_endpoint="${TEAMNODE_SYNC_BASE_URL%/}/"
-  local tunnel_result
+  local tcp_result=2
+  local udp_result=2
 
   log "安装前网络心跳：检查控制面 ${worker_endpoint}"
   if ! heartbeat_http_endpoint "${worker_endpoint}"; then
@@ -1483,54 +1496,61 @@ preflight_network_heartbeats() {
   fi
 
   set_tunnel_firewall_protocols
+  log "Tunnel 心跳计划：协议 ${CLOUDFLARED_PROTOCOL}，检查出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}；单个 Edge 最多 ${NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS} 秒"
   case "${CLOUDFLARED_PROTOCOL}" in
     http2)
       if preflight_cloudflare_tcp_heartbeat; then
-        :
+        tcp_result=0
       else
-        tunnel_result=$?
-        if (( tunnel_result == 2 )); then
-          warn "无法执行 Cloudflare Edge TCP 7844 预检（缺少 nc 和 timeout）；安装后仍会由 cloudflared 和 Worker 做最终验证"
-        else
-          warn "Cloudflare Edge TCP 7844 预检失败；将继续安装，启动后自动尝试直连回退"
-        fi
+        tcp_result=$?
+      fi
+      if (( tcp_result == 0 )); then
+        TUNNEL_PREFLIGHT_STATUS="available"
+      elif (( tcp_result == 1 )); then
+        TUNNEL_PREFLIGHT_STATUS="blocked"
       fi
       ;;
     quic)
       if preflight_cloudflare_udp_heartbeat; then
-        :
+        udp_result=0
       else
-        tunnel_result=$?
-        if (( tunnel_result == 2 )); then
-          warn "无法执行 Cloudflare Edge UDP 7844 预检（未找到 nc/ncat）；QUIC 真实性能仍由 cloudflared 启动握手决定"
-        else
-          warn "Cloudflare Edge UDP 7844 预检失败；将继续安装，启动后自动尝试直连回退"
-        fi
+        udp_result=$?
+      fi
+      if (( udp_result == 0 )); then
+        TUNNEL_PREFLIGHT_STATUS="available"
+      elif (( udp_result == 1 )); then
+        TUNNEL_PREFLIGHT_STATUS="blocked"
       fi
       ;;
     auto)
       if preflight_cloudflare_tcp_heartbeat; then
-        :
+        tcp_result=0
       else
-        tunnel_result=$?
-        if (( tunnel_result == 2 )); then
-          warn "无法执行 Cloudflare Edge TCP 7844 预检（缺少 nc 和 timeout）"
-        else
-          warn "Cloudflare Edge TCP 7844 预检失败"
-        fi
+        tcp_result=$?
       fi
       if preflight_cloudflare_udp_heartbeat; then
-        :
+        udp_result=0
       else
-        tunnel_result=$?
-        if (( tunnel_result == 2 )); then
-          warn "无法执行 Cloudflare Edge UDP 7844 预检（未找到 nc/ncat）；继续依赖 cloudflared 的 QUIC/HTTP2 实际握手"
-        else
-          warn "Cloudflare Edge UDP 7844 预检失败；cloudflared 仍会按 auto 协议尝试"
-        fi
+        udp_result=$?
+      fi
+      if (( tcp_result == 0 || udp_result == 0 )); then
+        TUNNEL_PREFLIGHT_STATUS="available"
+      elif (( tcp_result == 1 && udp_result == 1 )); then
+        TUNNEL_PREFLIGHT_STATUS="blocked"
       fi
       ;;
   esac
+
+  if [[ "${TUNNEL_PREFLIGHT_STATUS}" == "blocked" ]]; then
+    TUNNEL_PREFLIGHT_BLOCKED=true
+    warn "Tunnel 路线决策：出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT} 已确认被阻断；跳过 cloudflared，节点启动后直接进行直连端口心跳"
+  elif [[ "${TUNNEL_PREFLIGHT_STATUS}" == "available" ]]; then
+    TUNNEL_PREFLIGHT_BLOCKED=false
+    log "Tunnel 路线决策：出站 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT} 可用，保留 Cloudflare Tunnel 优先路线"
+  else
+    TUNNEL_PREFLIGHT_BLOCKED=false
+    warn "Tunnel 路线决策：无法可靠判断 ${TUNNEL_FIREWALL_PROTOCOL_LABEL} ${CLOUDFLARED_TUNNEL_PORT}，保留 Cloudflare Tunnel 并在启动后做最终验证"
+  fi
 
   log "安装前网络心跳完成：本机 HTTP ${SERVER_PORT}/ARGO ${ARGO_PORT} 尚未启动，不参与公网探测"
   log "直连入站候选端口将在节点启动并临时监听后，由 Worker 从公网执行端口心跳"
@@ -1772,6 +1792,10 @@ configure_iptables_tunnel_firewall() {
 }
 
 configure_tunnel_firewall() {
+  if is_true "${TUNNEL_PREFLIGHT_BLOCKED}"; then
+    log "阶段 1 已确认 Tunnel 7844 被阻断，跳过 Cloudflare Tunnel 防火墙配置"
+    return 0
+  fi
   if [[ "${RUN_AS_ROOT}" != true ]]; then
     warn "非 root 安装无法修改系统防火墙；请手动放行出站 ${CLOUDFLARED_PROTOCOL} ${CLOUDFLARED_TUNNEL_PORT}"
     return 0
@@ -2135,15 +2159,31 @@ verify_runtime() {
 verify_public_route() {
   local route_ready_marker="${FILE_PATH}/.route-ready"
   local no_route_marker="${FILE_PATH}/.no-route"
+  local route_progress_marker="${FILE_PATH}/.route-probe-progress"
   local no_route_reason=""
+  local progress_lines=0
+  local current_progress_lines=0
+  local progress_start_line=0
+  local progress_line=""
 
-  log "公网路由心跳：等待 Worker 完成外部连通性验证（最多 60 秒）"
-  for _ in 1 2 3 4 5 6 7 8 9 10 \
-    11 12 13 14 15 16 17 18 19 20 \
-    21 22 23 24 25 26 27 28 29 30 \
-    31 32 33 34 35 36 37 38 39 40 \
-    41 42 43 44 45 46 47 48 49 50 \
-    51 52 53 54 55 56 57 58 59 60; do
+  local route_wait_second
+  log "公网路由心跳：等待 Worker 完成外部连通性验证（最多 ${PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS} 秒）"
+  for ((route_wait_second = 1; route_wait_second <= PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS; route_wait_second += 1)); do
+    if [[ -f "${route_progress_marker}" ]]; then
+      current_progress_lines="$(wc -l <"${route_progress_marker}" 2>/dev/null | tr -d '[:space:]' || true)"
+      [[ "${current_progress_lines}" =~ ^[0-9]+$ ]] || current_progress_lines=0
+      if (( current_progress_lines < progress_lines )); then
+        progress_lines=0
+      fi
+      if (( current_progress_lines > progress_lines )); then
+        progress_start_line=$((progress_lines + 1))
+        while IFS= read -r progress_line; do
+          [[ -n "${progress_line}" ]] || continue
+          log "公网路由心跳进度：${progress_line}"
+        done < <(sed -n "${progress_start_line},${current_progress_lines}p" "${route_progress_marker}")
+        progress_lines="${current_progress_lines}"
+      fi
+    fi
     if [[ -f "${no_route_marker}" ]]; then
       no_route_reason="$(head -c 512 "${no_route_marker}" 2>/dev/null || true)"
       die "Worker 公网路由心跳失败；${no_route_reason:-请检查云平台安全组、上游网络和最终域名}"
@@ -2288,6 +2328,10 @@ main() {
   validate_local_port "ARGO_PORT" "${ARGO_PORT}"
   validate_local_port "DIRECT_PORT" "${DIRECT_PORT}"
   validate_local_port "DIRECT_HTTP_PORT" "${DIRECT_HTTP_PORT}"
+  [[ "${PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS}" =~ ^[0-9]+$ ]] ||
+    die "PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS 必须是数字"
+  (( PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS >= 30 && PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS <= 600 )) ||
+    die "PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS 必须在 30-600 秒之间"
   validate_port_roles
   validate_direct_port_candidates
   validate_direct_port_scan_config
@@ -2331,7 +2375,11 @@ main() {
   esac
 
   stage "安装 Cloudflare Tunnel"
-  install_cloudflared "${machine_arch}"
+  if is_true "${TUNNEL_PREFLIGHT_BLOCKED}"; then
+    log "阶段 1 已确认 Tunnel 7844 被阻断，跳过 cloudflared 下载和安装"
+  else
+    install_cloudflared "${machine_arch}"
+  fi
   stage "安装 Xray"
   install_xray "${machine_arch}"
   stage "下载并校验节点应用"
@@ -2344,7 +2392,7 @@ main() {
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"
   chmod 0600 "${ENV_FILE}"
   write_runner_script
-  stage "启动节点和 Cloudflare Tunnel"
+  stage "启动节点并选择公网路线"
   start_service
 
   stage "验证节点运行状态"

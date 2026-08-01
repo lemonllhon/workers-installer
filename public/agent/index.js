@@ -31,6 +31,7 @@ const XRAY_ACCESS_LOG_ENABLED = parseBoolean(process.env.XRAY_ACCESS_LOG_ENABLED
 const XRAY_SNIFFING_ENABLED = parseBoolean(process.env.XRAY_SNIFFING_ENABLED, false);
 const CLOUDFLARED_LOG_LEVEL = process.env.CLOUDFLARED_LOG_LEVEL || "info";
 const CLOUDFLARED_PROTOCOL = process.env.CLOUDFLARED_PROTOCOL || "http2";
+const TUNNEL_PREFLIGHT_BLOCKED = parseBoolean(process.env.TUNNEL_PREFLIGHT_BLOCKED, false);
 const CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS = Number.parseInt(process.env.CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS || "3000", 10);
 const CLOUDFLARED_CONNECTIVITY_CACHE_MS = Number.parseInt(process.env.CLOUDFLARED_CONNECTIVITY_CACHE_MS || "30000", 10);
 const CLOUDFLARED_TUNNEL_PORT = 7844;
@@ -154,12 +155,14 @@ const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
 const noRouteMarkerPath = path.resolve(FILE_PATH, ".no-route");
 const routeReadyMarkerPath = path.resolve(FILE_PATH, ".route-ready");
+const routeProbeProgressPath = path.resolve(FILE_PATH, ".route-probe-progress");
 const NO_ROUTE_EXIT_CODE = 78;
 const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
 const CERTBOT_BIN = process.env.CERTBOT_BIN || "/usr/bin/certbot";
 
 try {
   fs.rmSync(routeReadyMarkerPath, { force: true });
+  fs.rmSync(routeProbeProgressPath, { force: true });
 } catch {
   // 后续公网验证通过后仍会覆盖成功标记。
 }
@@ -461,6 +464,19 @@ function getRuntimeInfo() {
     cpuCores: Number.isFinite(cpuCount) ? cpuCount : null,
     memoryMb: Number.isFinite(totalMemoryMb) ? totalMemoryMb : null
   };
+}
+
+function appendRouteProbeProgress(message) {
+  const text = String(message || "")
+    .replace(/[\r\n]+/g, " ")
+    .trim()
+    .slice(0, 1024);
+  if (!text) return;
+  try {
+    fs.appendFileSync(routeProbeProgressPath, `${new Date().toISOString()} ${text}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error(`无法写入公网路由心跳进度：${error.message}`);
+  }
 }
 
 function tunnelConnectivityProtocols(protocol = getCloudflaredProtocol()) {
@@ -939,6 +955,9 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO
   const mode = DIRECT_MODE ? "direct" : "tunnel";
   let lastProbe = null;
   for (let attempt = 1; attempt <= PUBLIC_ROUTE_PROBE_ATTEMPTS; attempt += 1) {
+    appendRouteProbeProgress(
+      `Worker 最终路线回访 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${mode} ${domain}${mode === "direct" ? `:${DIRECT_PORT}` : ""}`
+    );
     lastProbe = await probePublicRoute({
       domain,
       mode,
@@ -947,6 +966,9 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO
       tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
     });
     if (lastProbe?.ok) {
+      appendRouteProbeProgress(
+        `Worker 最终路线回访通过：${lastProbe.reason || "reachable"}${lastProbe.httpStatus ? `，HTTP ${lastProbe.httpStatus}` : ""}`
+      );
       publicRouteProbeCache = { ...lastProbe, mode, domain };
       console.log(
         `Worker 公网路由心跳通过：${mode === "direct" ? (DIRECT_TLS_ENABLED ? "HTTPS" : "HTTP") : "Tunnel"}`
@@ -955,6 +977,9 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO
       );
       return lastProbe;
     }
+    appendRouteProbeProgress(
+      `Worker 最终路线回访失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`
+    );
     console.warn(`Worker 公网路由心跳失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`);
     if (attempt < PUBLIC_ROUTE_PROBE_ATTEMPTS) {
       await new Promise((resolve) => setTimeout(resolve, PUBLIC_ROUTE_PROBE_RETRY_DELAY_MS));
@@ -970,6 +995,7 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO
 
 function markRouteReady() {
   try {
+    appendRouteProbeProgress(`公网路线验证完成：${ARGO_DOMAIN || "platform"}`);
     fs.writeFileSync(routeReadyMarkerPath, `${new Date().toISOString()} ${ARGO_DOMAIN || "platform"}\n`, { mode: 0o600 });
     console.log("公网路由启动验证通过，已允许节点注册");
   } catch (error) {
@@ -991,20 +1017,37 @@ function closeDirectPortListener(server) {
   });
 }
 
+function formatDirectProbeResults(results) {
+  return (Array.isArray(results) ? results : [])
+    .map((result) => {
+      const port = Number(result?.port);
+      const status = String(result?.status || "unknown");
+      const reason = String(result?.reason || "").trim();
+      return `${Number.isInteger(port) ? port : "?"}=${status}${reason ? `(${reason})` : ""}`;
+    })
+    .join(", ");
+}
+
 async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES) {
   const normalizedPorts = [...new Set((Array.isArray(ports) ? ports : [])
     .map((port) => Number.parseInt(String(port), 10))
     .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535 && !LOCAL_SERVICE_PORTS.has(port)))];
   if (!normalizedPorts.length) {
+    appendRouteProbeProgress("直连端口心跳：没有可用候选端口（已排除本机服务端口）");
     return { results: [], error: "direct_port_candidates_empty" };
   }
 
+  appendRouteProbeProgress(`直连端口心跳：准备本机临时监听 TCP ${normalizedPorts.join(",")}`);
   const listeners = await Promise.all(normalizedPorts.map((port) => createDirectPortListener(port)));
   const listeningPorts = listeners.filter((entry) => entry.status === "listening").map((entry) => entry.port);
+  appendRouteProbeProgress(
+    `本机临时监听结果：${formatDirectProbeResults(listeners)}；可供 Worker 回访：${listeningPorts.join(",") || "无"}`
+  );
   let remoteResults = [];
 
   try {
     if (listeningPorts.length > 0) {
+      appendRouteProbeProgress(`请求 Worker 从公网回访 TCP ${listeningPorts.join(",")}`);
       const response = await postTeamNodeSync(
         "/api/internal/nodejs-argo/direct-port-probe",
         { uuid: UUID, ports: listeningPorts },
@@ -1014,8 +1057,12 @@ async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES) {
         throw new Error(`direct_port_probe_rejected_${response?.status || "unknown"}`);
       }
       remoteResults = Array.isArray(response.data?.results) ? response.data.results : [];
+      appendRouteProbeProgress(
+        `Worker 外部回访结果：公网 IP ${response.data?.host || "unknown"}；${formatDirectProbeResults(remoteResults) || "无结果"}`
+      );
     }
   } catch (error) {
+    appendRouteProbeProgress(`Worker 外部回访请求失败：${String(error?.message || "probe_error").slice(0, 128)}`);
     return {
       results: listeners.map((entry) => entry.status === "listening"
         ? { port: entry.port, status: "unknown", reason: String(error?.message || "probe_error").slice(0, 64) }
@@ -1075,22 +1122,38 @@ function selectDirectFallbackPlan(results) {
 }
 
 async function discoverDirectPortPlan() {
+  appendRouteProbeProgress(
+    `开始直连初始候选端口心跳：${DIRECT_PORT_CANDIDATES.join(",") || "无"}；本机端口 ${[...LOCAL_SERVICE_PORTS].join(",")} 已排除`
+  );
   const initialProbe = await probeDirectPortCandidates();
   const allResults = [...initialProbe.results];
   let plan = selectDirectFallbackPlan(allResults);
-  if (plan) return { plan, results: allResults };
+  if (plan) {
+    appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+    return { plan, results: allResults };
+  }
 
   const scanCandidates = buildDirectPortScanCandidates();
   let lastError = initialProbe.error || "";
+  const totalBatches = Math.ceil(scanCandidates.length / DIRECT_PORT_PROBE_BATCH_SIZE);
   for (let index = 0; index < scanCandidates.length; index += DIRECT_PORT_PROBE_BATCH_SIZE) {
     const batch = scanCandidates.slice(index, index + DIRECT_PORT_PROBE_BATCH_SIZE);
+    appendRouteProbeProgress(
+      `直连扩展端口心跳批次 ${Math.floor(index / DIRECT_PORT_PROBE_BATCH_SIZE) + 1}/${totalBatches}：${batch.join(",")}`
+    );
     const probe = await probeDirectPortCandidates(batch);
     allResults.push(...probe.results);
     if (probe.error) lastError = probe.error;
     plan = selectDirectFallbackPlan(allResults);
-    if (plan) return { plan, results: allResults };
+    if (plan) {
+      appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+      return { plan, results: allResults };
+    }
   }
 
+  appendRouteProbeProgress(
+    `直连端口心跳结束：未发现公网可达端口；${lastError || "direct_port_scan_exhausted"}`
+  );
   return { plan: null, results: allResults, error: lastError || "direct_port_scan_exhausted" };
 }
 
@@ -1304,6 +1367,20 @@ async function prepareDirectModeStartup() {
 
 async function prepareTunnelStartup() {
   if (DIRECT_MODE || PLATFORM_PROXY_MODE) return false;
+  if (TUNNEL_PREFLIGHT_BLOCKED) {
+    const preflightResult = {
+      status: "offline",
+      reason: "stage1_7844_blocked",
+      protocol: getCloudflaredProtocol(),
+      port: CLOUDFLARED_TUNNEL_PORT,
+      requiredProtocols: tunnelConnectivityProtocols()
+    };
+    appendRouteProbeProgress(
+      `阶段 1 已确认 ${preflightResult.requiredProtocols.join("/")} ${CLOUDFLARED_TUNNEL_PORT} 被阻断；跳过 Cloudflare Tunnel，直接进入直连端口心跳`
+    );
+    console.warn("阶段 1 已确认 7844 被阻断，不启动 Cloudflare Tunnel，直接探测直连路线");
+    return activateDirectFallbackAtStartup(preflightResult);
+  }
 
   const probeDomain = ARGO_DOMAIN || findTemporaryTunnelDomain();
   const attempts = Number.isInteger(STARTUP_TUNNEL_PROBE_ATTEMPTS)
@@ -1318,6 +1395,10 @@ async function prepareTunnelStartup() {
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     tunnelConnectivity = await checkCloudflareTunnelConnectivity(probeDomain, { force: true });
+    appendRouteProbeProgress(
+      `Tunnel 心跳 ${attempt}/${attempts}：${tunnelConnectivity.status}；`
+      + `${tunnelConnectivity.reason}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port}`
+    );
     console.log(
       `启动时 Cloudflare Tunnel 心跳 ${attempt}/${attempts}：${tunnelConnectivity.status}；`
       + `${tunnelConnectivity.reason}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port}`
@@ -1325,6 +1406,7 @@ async function prepareTunnelStartup() {
     if (tunnelConnectivity.status === "connected") {
       const publicProbe = await verifyPublicRouteAtStartup({ throwOnFailure: false, domain: probeDomain });
       if (publicProbe?.ok) {
+        appendRouteProbeProgress("Tunnel 7844 出站和 Worker 最终域名回访均通过");
         console.log("Cloudflare Tunnel 7844 出站心跳和 Worker 公网路由心跳均通过，继续使用 Tunnel 模式");
         return false;
       }
@@ -1343,6 +1425,9 @@ async function prepareTunnelStartup() {
     }
   }
 
+  appendRouteProbeProgress(
+    `Tunnel 心跳最终失败：${tunnelConnectivity?.reason || "unknown"}；开始直连端口发现`
+  );
   console.warn(`Cloudflare Tunnel 心跳最终失败：${tunnelConnectivity?.reason || "unknown"}，开始进行直连端口发现心跳`);
   return activateDirectFallbackAtStartup(tunnelConnectivity);
 }
@@ -2429,6 +2514,7 @@ function noRouteError(message) {
 async function stopForNoRoute(message) {
   console.error(`Tunnel 和直连均未探测到可用路线，程序停止：${message}`);
   try {
+    appendRouteProbeProgress(`公网路线失败并停止：${message}`);
     fs.writeFileSync(noRouteMarkerPath, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
     fs.rmSync(routeReadyMarkerPath, { force: true });
   } catch (error) {
@@ -2443,12 +2529,13 @@ async function stopForNoRoute(message) {
 
 // 启动 Xray、cloudflared
 async function startProcesses() {
+  const shouldStartCloudflared = !DIRECT_MODE && !PLATFORM_PROXY_MODE && !TUNNEL_PREFLIGHT_BLOCKED;
   try {
     ensureBinaryExists(webPath, "xray");
-    if (!DIRECT_MODE && !PLATFORM_PROXY_MODE) {
+    if (shouldStartCloudflared) {
       ensureBinaryExists(botPath, "cloudflared");
     }
-    authorizeFiles(DIRECT_MODE || PLATFORM_PROXY_MODE ? [webPath] : [webPath, botPath]);
+    authorizeFiles(shouldStartCloudflared ? [webPath, botPath] : [webPath]);
   } catch (error) {
     console.error(`二进制检查失败：${error.message}`);
     throw error;
@@ -2483,6 +2570,8 @@ async function startProcesses() {
   } else if (PLATFORM_PROXY_MODE) {
     console.log(`平台代理模式已启动：容器入口 ${ARGO_PORT}，公网 HTTPS 端口 ${PLATFORM_PUBLIC_PORT}`);
     console.log("平台应将 HTTPS/HTTP WebSocket 请求转发到容器的 ARGO_PORT；容器不申请、不校验证书");
+  } else if (TUNNEL_PREFLIGHT_BLOCKED) {
+    console.log("阶段 1 已确认 Tunnel 7844 被阻断，cloudflared 未启动");
   } else {
     try {
       const args = buildCloudflaredArgs();
@@ -2500,9 +2589,13 @@ async function startProcesses() {
 
 // 生成固定隧道配置文件
 function argoType() {
-  if (DIRECT_MODE || PLATFORM_PROXY_MODE) {
+  if (DIRECT_MODE || PLATFORM_PROXY_MODE || TUNNEL_PREFLIGHT_BLOCKED) {
     if (PLATFORM_PROXY_MODE) {
       console.log("PLATFORM_PROXY_MODE 已启用，不启动 Cloudflare Tunnel");
+      return;
+    }
+    if (TUNNEL_PREFLIGHT_BLOCKED && !DIRECT_MODE) {
+      console.log("阶段 1 已确认 Tunnel 7844 被阻断，不生成 Cloudflare Tunnel 配置");
       return;
     }
     console.log("DIRECT_MODE 已启用，不启动 Cloudflare Tunnel");
