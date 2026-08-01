@@ -726,8 +726,8 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .system-status-title-block { display: grid; grid-template-rows: auto auto; align-content: center; align-items: start; gap: 12px; min-width: 0; }
-    .system-status-overview { display: grid; place-items: center; min-width: 0; min-height: 32px; padding-top: 0; }
+    .system-status-title-block { display: flex; flex-direction: column; align-self: stretch; justify-content: center; align-items: stretch; gap: 12px; min-width: 0; }
+    .system-status-overview { display: grid; place-items: center; width: 100%; min-width: 0; min-height: 32px; padding-top: 0; }
     .system-status-overview-copy { display: grid; width: 100%; min-width: 0; gap: 2px; align-content: center; text-align: left; }
     .system-status-summary { display: grid; justify-items: start; gap: 2px; min-width: 0; text-align: left; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
