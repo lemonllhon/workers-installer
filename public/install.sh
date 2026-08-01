@@ -46,9 +46,27 @@ TEAMNODE_SYNC_RELAY_TOKEN="${TEAMNODE_SYNC_RELAY_TOKEN:-}"
 TEAMNODE_SYNC_ENROLL_PASSWORD="${TEAMNODE_SYNC_ENROLL_PASSWORD:-}"
 TEAMNODE_SYNC_GROUP_KEY="${TEAMNODE_SYNC_GROUP_KEY:-basic}"
 TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS="${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS:-300000}"
+TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS="${TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS:-15000}"
 TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT="${TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT:-true}"
 TEAMNODE_SYNC_TIMEOUT_MS="${TEAMNODE_SYNC_TIMEOUT_MS:-10000}"
 TEAMNODE_SYNC_ENABLED="${TEAMNODE_SYNC_ENABLED:-true}"
+CLOUDFLARE_API_KEY="${CLOUDFLARE_API_KEY:-}"
+AUTO_DIRECT_FALLBACK="${AUTO_DIRECT_FALLBACK:-true}"
+DIRECT_MODE="${DIRECT_MODE:-false}"
+DIRECT_TLS_ENABLED="${DIRECT_TLS_ENABLED:-true}"
+DIRECT_PORT="${DIRECT_PORT:-443}"
+DIRECT_HTTP_PORT="${DIRECT_HTTP_PORT:-80}"
+DIRECT_PORT_CANDIDATES="${DIRECT_PORT_CANDIDATES:-80,443,8080,8443,8880,2053,2083,2087,2096}"
+DIRECT_PORT_SCAN_PORTS="${DIRECT_PORT_SCAN_PORTS:-8000,8008,8081,8088,8090,8181,8444,8888,9000,9443,10000,11550-11570,20000,30000,40000,50000,60000}"
+DIRECT_PORT_SCAN_RANGE="${DIRECT_PORT_SCAN_RANGE:-1024-65535}"
+DIRECT_PORT_SCAN_MAX="${DIRECT_PORT_SCAN_MAX:-256}"
+CF_DNS_ENABLED="${CF_DNS_ENABLED:-false}"
+CF_DNS_RECORD_NAME="${CF_DNS_RECORD_NAME:-}"
+CF_DNS_ZONE_ID="${CF_DNS_ZONE_ID:-}"
+CF_DNS_ZONE_NAME="${CF_DNS_ZONE_NAME:-}"
+CF_DNS_PUBLIC_IP="${CF_DNS_PUBLIC_IP:-}"
+CF_DNS_TTL="${CF_DNS_TTL:-120}"
+CF_DNS_REPLACE_CNAME="${CF_DNS_REPLACE_CNAME:-true}"
 
 ARGO_PORT="${ARGO_PORT:-8001}"
 CFPORT="${CFPORT:-443}"
@@ -114,6 +132,8 @@ auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后�
 如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
 CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
 AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
+AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；Tunnel 连续异常后，节点会由 Worker 从公网探测直连端口，443+80 都可达时申请 Let's Encrypt，否则使用探测到的 HTTP 端口。
+候选端口全部失败后，会按 DIRECT_PORT_SCAN_PORTS 和 DIRECT_PORT_SCAN_RANGE 扩展探测；DIRECT_PORT_SCAN_MAX 默认 256，避免一次性扫描全部端口。
 USAGE
 }
 
@@ -427,6 +447,7 @@ check_dependencies() {
   has_command tar || die "未找到 tar，无法安装项目专用 Node.js"
   has_command unzip || die "未找到 unzip"
   prepare_user_switch
+  install_direct_gateway_dependencies
 
   NODE_RUNTIME_VERSION="${NODE_RUNTIME_VERSION#v}"
   [[ "${NODE_RUNTIME_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "NODE_RUNTIME_VERSION 必须是三段版本号，例如 20.20.2"
@@ -740,7 +761,8 @@ redeem_teamnode_relay_token() {
     process.stdin.on("data", (chunk) => { input += chunk; });
     process.stdin.on("end", () => process.stdout.write(JSON.stringify({
       password: input,
-      uuid: process.env.TEAMNODE_ENROLL_UUID
+      uuid: process.env.TEAMNODE_ENROLL_UUID,
+      includeCloudflareApiKey: true
     })));
   ' >"${request_file}" || die "无法生成 Worker 兑换请求"
 
@@ -791,6 +813,24 @@ redeem_teamnode_relay_token() {
   fi
 
   TEAMNODE_SYNC_RELAY_TOKEN="${relay_token}"
+
+  local cloudflare_api_key=""
+  if ! cloudflare_api_key="$("${NODE_BIN}" -e '
+    const fs = require("fs");
+    const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const token = String(data.cloudflareApiKey || "").trim();
+    if (token.length > 256 || /[\r\n]/.test(token)) process.exit(1);
+    process.stdout.write(token);
+  ' "${response_file}")"; then
+    rm -f -- "${request_file}" "${response_file}"
+    die "Worker 返回的 Cloudflare API Token 格式异常"
+  fi
+  if [[ -n "${cloudflare_api_key}" ]]; then
+    CLOUDFLARE_API_KEY="${cloudflare_api_key}"
+    log "已通过 Worker 兑换 Cloudflare DNS API Token（不会打印 Token）"
+  else
+    warn "Worker 未下发 CLOUDFLARE_API_KEY；直连模式的自动 DNS 更新不可用"
+  fi
 
   unset password TEAMNODE_SYNC_ENROLL_PASSWORD
   rm -f -- "${request_file}" "${response_file}"
@@ -858,13 +898,31 @@ write_env_file() {
   write_env_value "TEAMNODE_SYNC_LABEL_PREFIX" "${TEAMNODE_SYNC_LABEL_PREFIX:-}"
   write_env_value "TEAMNODE_SYNC_TIMEOUT_MS" "${TEAMNODE_SYNC_TIMEOUT_MS}"
   write_env_value "TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS" "${TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS}"
+  write_env_value "TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS" "${TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS}"
   write_env_value "TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT" "${TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT}"
+  write_env_value "CLOUDFLARE_API_KEY" "${CLOUDFLARE_API_KEY}"
+  write_env_value "AUTO_DIRECT_FALLBACK" "${AUTO_DIRECT_FALLBACK}"
   write_env_value "CLOUDFLARED_PROTOCOL" "${CLOUDFLARED_PROTOCOL}"
   write_env_value "CLOUDFLARED_LOG_LEVEL" "${CLOUDFLARED_LOG_LEVEL:-info}"
   write_env_value "XRAY_LOG_LEVEL" "${XRAY_LOG_LEVEL:-warning}"
   write_env_value "XRAY_ACCESS_LOG_ENABLED" "${XRAY_ACCESS_LOG_ENABLED:-false}"
   write_env_value "XRAY_SNIFFING_ENABLED" "${XRAY_SNIFFING_ENABLED:-false}"
   write_env_value "DIRECT_MODE" "${DIRECT_MODE:-false}"
+  write_env_value "DIRECT_TLS_ENABLED" "${DIRECT_TLS_ENABLED}"
+  write_env_value "DIRECT_PORT" "${DIRECT_PORT}"
+  write_env_value "DIRECT_HTTP_PORT" "${DIRECT_HTTP_PORT}"
+  write_env_value "DIRECT_PORT_CANDIDATES" "${DIRECT_PORT_CANDIDATES}"
+  write_env_value "DIRECT_PORT_SCAN_PORTS" "${DIRECT_PORT_SCAN_PORTS}"
+  write_env_value "DIRECT_PORT_SCAN_RANGE" "${DIRECT_PORT_SCAN_RANGE}"
+  write_env_value "DIRECT_PORT_SCAN_MAX" "${DIRECT_PORT_SCAN_MAX}"
+  write_env_value "CF_DNS_ENABLED" "${CF_DNS_ENABLED}"
+  write_env_value "CF_DNS_RECORD_NAME" "${CF_DNS_RECORD_NAME}"
+  write_env_value "CF_DNS_ZONE_ID" "${CF_DNS_ZONE_ID}"
+  write_env_value "CF_DNS_ZONE_NAME" "${CF_DNS_ZONE_NAME}"
+  write_env_value "CF_DNS_PUBLIC_IP" "${CF_DNS_PUBLIC_IP}"
+  write_env_value "CF_DNS_TTL" "${CF_DNS_TTL}"
+  write_env_value "CF_DNS_REPLACE_CNAME" "${CF_DNS_REPLACE_CNAME}"
+  write_env_value "NODEJS_ARGO_ENV_FILE" "${ENV_FILE}"
   write_env_value "PLATFORM_PROXY_MODE" "${PLATFORM_PROXY_MODE:-false}"
   set_owner "${SERVICE_USER}:${SERVICE_USER}" "${ENV_FILE}"
 }
@@ -926,6 +984,8 @@ ExecStart=${RUNNER_SCRIPT}
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
@@ -1197,6 +1257,60 @@ validate_local_port() {
   (( value >= 1 && value <= 65535 )) || die "${name} 端口范围无效：${value}"
 }
 
+validate_direct_port_candidates() {
+  local candidate
+  local seen=","
+  [[ -n "${DIRECT_PORT_CANDIDATES}" ]] || die "DIRECT_PORT_CANDIDATES 不能为空"
+  IFS=',' read -r -a candidates <<<"${DIRECT_PORT_CANDIDATES}"
+  for candidate in "${candidates[@]}"; do
+    candidate="${candidate//[[:space:]]/}"
+    validate_local_port "DIRECT_PORT_CANDIDATES" "${candidate}"
+    if [[ "${seen}" != *",${candidate},"* ]]; then
+      seen+="${candidate},"
+    fi
+  done
+  [[ "${seen}" != "," ]] || die "DIRECT_PORT_CANDIDATES 未包含有效端口"
+}
+
+validate_direct_port_scan_config() {
+  [[ "${DIRECT_PORT_SCAN_MAX}" =~ ^[0-9]+$ ]] || die "DIRECT_PORT_SCAN_MAX 必须是数字"
+  (( DIRECT_PORT_SCAN_MAX >= 0 && DIRECT_PORT_SCAN_MAX <= 4096 )) || die "DIRECT_PORT_SCAN_MAX 必须在 0-4096 之间"
+
+  local range_start
+  local range_end
+  if [[ "${DIRECT_PORT_SCAN_RANGE}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    range_start="${BASH_REMATCH[1]}"
+    range_end="${BASH_REMATCH[2]}"
+    validate_local_port "DIRECT_PORT_SCAN_RANGE 起点" "${range_start}"
+    validate_local_port "DIRECT_PORT_SCAN_RANGE 终点" "${range_end}"
+    (( range_start <= range_end )) || die "DIRECT_PORT_SCAN_RANGE 起点不能大于终点"
+  else
+    die "DIRECT_PORT_SCAN_RANGE 格式无效，应为 start-end"
+  fi
+
+  local item
+  local item_start
+  local item_end
+  local scan_items=()
+  [[ -n "${DIRECT_PORT_SCAN_PORTS}" ]] || return 0
+  IFS=',' read -r -a scan_items <<<"${DIRECT_PORT_SCAN_PORTS}"
+  for item in "${scan_items[@]}"; do
+    item="${item//[[:space:]]/}"
+    if [[ "${item}" =~ ^[0-9]+$ ]]; then
+      validate_local_port "DIRECT_PORT_SCAN_PORTS" "${item}"
+    elif [[ "${item}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      item_start="${BASH_REMATCH[1]}"
+      item_end="${BASH_REMATCH[2]}"
+      validate_local_port "DIRECT_PORT_SCAN_PORTS 起点" "${item_start}"
+      validate_local_port "DIRECT_PORT_SCAN_PORTS 终点" "${item_end}"
+      (( item_start <= item_end )) || die "DIRECT_PORT_SCAN_PORTS 范围起点不能大于终点：${item}"
+      (( item_end - item_start <= 1024 )) || die "DIRECT_PORT_SCAN_PORTS 单个范围不能超过 1025 个端口：${item}"
+    else
+      die "DIRECT_PORT_SCAN_PORTS 包含无效项：${item}"
+    fi
+  done
+}
+
 validate_cloudflared_protocol() {
   case "${CLOUDFLARED_PROTOCOL,,}" in
     http2|quic|auto) CLOUDFLARED_PROTOCOL="${CLOUDFLARED_PROTOCOL,,}" ;;
@@ -1290,6 +1404,77 @@ configure_firewalld_tunnel_firewall() {
 
   if [[ "${runtime_changed}" == true ]]; then
     firewall-cmd --reload >/dev/null || return 1
+  fi
+}
+
+install_direct_gateway_dependencies() {
+  if [[ "${RUN_AS_ROOT}" != true || ( "${DIRECT_MODE}" != true && "${AUTO_DIRECT_FALLBACK}" != true ) ]]; then
+    return 0
+  fi
+
+  local nginx_missing=false
+  local certbot_missing=false
+  local nginx_was_active=false
+  has_command nginx || nginx_missing=true
+  if is_true "${DIRECT_TLS_ENABLED}"; then
+    has_command certbot || certbot_missing=true
+  fi
+  if [[ "${nginx_missing}" != true && "${certbot_missing}" != true ]]; then
+    return 0
+  fi
+
+  if has_command systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+    nginx_was_active=true
+  fi
+
+  local dependency_label="Nginx"
+  [[ "${certbot_missing}" == true ]] && dependency_label+="、Certbot"
+  log "准备直连网关依赖：${dependency_label}"
+  local install_failed=false
+  if has_command apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    local apt_packages=(nginx)
+    [[ "${certbot_missing}" == true ]] && apt_packages+=(certbot)
+    apt-get install -y -qq "${apt_packages[@]}" >/dev/null || install_failed=true
+  elif has_command apk; then
+    local apk_packages=(nginx)
+    [[ "${certbot_missing}" == true ]] && apk_packages+=(certbot)
+    apk add --no-cache "${apk_packages[@]}" >/dev/null || install_failed=true
+  elif has_command dnf; then
+    local dnf_packages=(nginx)
+    [[ "${certbot_missing}" == true ]] && dnf_packages+=(certbot)
+    dnf install -y "${dnf_packages[@]}" >/dev/null || install_failed=true
+  elif has_command yum; then
+    local yum_packages=(nginx)
+    [[ "${certbot_missing}" == true ]] && yum_packages+=(certbot)
+    yum install -y "${yum_packages[@]}" >/dev/null || install_failed=true
+  elif has_command zypper; then
+    local zypper_packages=(nginx)
+    [[ "${certbot_missing}" == true ]] && zypper_packages+=(certbot)
+    zypper --non-interactive install "${zypper_packages[@]}" >/dev/null || install_failed=true
+  else
+    install_failed=true
+  fi
+
+  if [[ "${install_failed}" == true ]]; then
+    warn "无法自动安装 Nginx/Certbot；若 Tunnel 仍不可用，直连回退可能只能在已有组件可用时执行"
+  fi
+
+  # 发行版安装 Nginx 时可能自动启动默认站点。仅在安装前没有运行 Nginx
+  # 时停止它，避免抢占后续直连探测和节点网关端口；已有站点由管理员自行管理。
+  if [[ "${nginx_was_active}" != true ]] && has_command systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
+    systemctl disable --now nginx >/dev/null 2>&1 || warn "无法停止发行版默认 Nginx；直连回退会跳过被占用的端口"
+  fi
+  if [[ "${nginx_was_active}" != true ]] && ! has_command systemctl && has_command service; then
+    service nginx stop >/dev/null 2>&1 || true
+  fi
+
+  if ! has_command nginx; then
+    warn "未找到 nginx；直连模式不会启动，Tunnel 模式仍可继续运行"
+  fi
+  if is_true "${DIRECT_TLS_ENABLED}" && ! has_command certbot; then
+    warn "未找到 certbot；如果 443+80 均可达，将按无证书 HTTP 模式处理"
   fi
 }
 
@@ -1409,6 +1594,183 @@ configure_tunnel_firewall() {
   log "未检测到启用的主机防火墙，未添加规则；如果端口仍不通，请检查云平台安全组或上游网络"
 }
 
+direct_firewall_ports() {
+  local port
+  local item
+  local range_start
+  local range_end
+  local seen=","
+  local candidates=()
+  IFS=',' read -r -a candidates <<<"${DIRECT_PORT_CANDIDATES}"
+  candidates+=("${DIRECT_PORT}" "${DIRECT_HTTP_PORT}")
+  for port in "${candidates[@]}"; do
+    port="${port//[[:space:]]/}"
+    [[ -n "${port}" && "${seen}" != *",${port},"* ]] || continue
+    seen+="${port},"
+    printf '%s\n' "${port}"
+  done
+
+  local scan_items=()
+  IFS=',' read -r -a scan_items <<<"${DIRECT_PORT_SCAN_PORTS}"
+  for item in "${scan_items[@]}"; do
+    item="${item//[[:space:]]/}"
+    if [[ "${item}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      range_start="${BASH_REMATCH[1]}"
+      range_end="${BASH_REMATCH[2]}"
+      for ((port = range_start; port <= range_end; port += 1)); do
+        [[ "${seen}" != *",${port},"* ]] || continue
+        seen+="${port},"
+        printf '%s\n' "${port}"
+      done
+    else
+      port="${item}"
+      [[ -n "${port}" && "${seen}" != *",${port},"* ]] || continue
+      seen+="${port},"
+      printf '%s\n' "${port}"
+    fi
+  done
+}
+
+configure_ufw_direct_firewall() {
+  local port
+  local status
+  status="$(ufw status 2>/dev/null || true)"
+  while read -r port; do
+    [[ -n "${port}" ]] || continue
+    if printf '%s\n' "${status}" | grep -Eiq "^${port}/tcp[[:space:]]+ALLOW[[:space:]]+IN"; then
+      log "ufw 已放行入站 TCP ${port}"
+      continue
+    fi
+    ufw allow in "${port}/tcp" >/dev/null || return 1
+    log "ufw 已添加入站 TCP ${port}"
+    status="$(ufw status 2>/dev/null || true)"
+  done < <(direct_firewall_ports)
+}
+
+configure_firewalld_direct_firewall() {
+  local port
+  local changed=false
+  while read -r port; do
+    [[ -n "${port}" ]] || continue
+    if ! firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+      firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null || return 1
+      firewall-cmd --add-port="${port}/tcp" >/dev/null || return 1
+      changed=true
+    fi
+    log "firewalld 已放行入站 TCP ${port}"
+  done < <(direct_firewall_ports)
+  [[ "${changed}" == true ]] && firewall-cmd --reload >/dev/null || true
+}
+
+nft_direct_rule_exists() {
+  local port="$1"
+  nft list chain inet nodejs_argo_direct input 2>/dev/null |
+    grep -Fq -- "tcp dport ${port} accept"
+}
+
+persist_nft_direct_rules() {
+  local config_file="/etc/nftables.conf"
+  local fragment="/etc/nftables.d/nodejs-argo-direct.nft"
+  if [[ -f "${config_file}" ]] && grep -Eq '^[[:space:]]*include[[:space:]]+"/etc/nftables\.d/(\*\.nft|\*)"' "${config_file}"; then
+    install -d -m 0755 /etc/nftables.d
+    {
+      printf '%s\n' 'table inet nodejs_argo_direct {'
+      printf '%s\n' '  chain input {'
+      printf '%s\n' '    type filter hook input priority -50; policy accept;'
+      while read -r port; do
+        [[ -n "${port}" ]] || continue
+        printf '    tcp dport %s accept comment "nodejs-argo direct"\n' "${port}"
+      done < <(direct_firewall_ports)
+      printf '%s\n' '  }'
+      printf '%s\n' '}'
+    } >"${fragment}"
+    chmod 0644 "${fragment}"
+    log "nftables 规则已写入持久化配置：${fragment}"
+    return 0
+  fi
+  warn "nftables 当前运行时入站规则已添加，但未找到 /etc/nftables.conf 的 nftables.d include；重启后可能需要重新加载规则"
+}
+
+configure_nftables_direct_firewall() {
+  if ! nft list table inet nodejs_argo_direct >/dev/null 2>&1; then
+    nft add table inet nodejs_argo_direct || return 1
+  fi
+  if ! nft list chain inet nodejs_argo_direct input >/dev/null 2>&1; then
+    nft add chain inet nodejs_argo_direct input '{ type filter hook input priority -50; policy accept; }' || return 1
+  fi
+
+  local port
+  while read -r port; do
+    [[ -n "${port}" ]] || continue
+    if ! nft_direct_rule_exists "${port}"; then
+      nft add rule inet nodejs_argo_direct input tcp dport "${port}" accept || return 1
+    fi
+    log "nftables 已放行入站 TCP ${port}"
+  done < <(direct_firewall_ports)
+  persist_nft_direct_rules
+}
+
+configure_iptables_direct_firewall() {
+  local firewall_bin
+  local port
+  local configured=false
+  for firewall_bin in iptables ip6tables; do
+    has_command "${firewall_bin}" || continue
+    while read -r port; do
+      [[ -n "${port}" ]] || continue
+      if ! "${firewall_bin}" -C INPUT -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+        if "${firewall_bin}" -I INPUT 1 -p tcp --dport "${port}" -j ACCEPT >/dev/null 2>&1; then
+          configured=true
+        else
+          warn "${firewall_bin} 无法添加入站 TCP ${port} 规则"
+          continue
+        fi
+      else
+        configured=true
+      fi
+      log "${firewall_bin} 已放行入站 TCP ${port}"
+    done < <(direct_firewall_ports)
+  done
+
+  [[ "${configured}" == true ]] || return 1
+  if has_command netfilter-persistent; then
+    netfilter-persistent save >/dev/null 2>&1 || warn "iptables 运行时入站规则已添加，但 netfilter-persistent 保存失败"
+  else
+    warn "iptables 运行时入站规则已添加，但未找到 netfilter-persistent；重启后可能需要重新加载规则"
+  fi
+}
+
+configure_direct_firewall() {
+  if [[ "${RUN_AS_ROOT}" != true ]]; then
+    warn "非 root 安装无法修改系统防火墙；请手动放行入站 TCP ${DIRECT_PORT}、${DIRECT_HTTP_PORT} 及候选端口"
+    return 0
+  fi
+  if ! is_true "${AUTO_CONFIGURE_FIREWALL}"; then
+    log "已关闭防火墙自动配置；直连候选端口需要手动放行：$(direct_firewall_ports | paste -sd, -)"
+    return 0
+  fi
+
+  log "检查主机防火墙：直连候选端口将放行入站 TCP $(direct_firewall_ports | paste -sd, -)"
+  if ufw_is_active; then
+    if ! configure_ufw_direct_firewall; then warn "ufw 自动配置直连端口失败；请手动放行入站 TCP 候选端口"; fi
+    return 0
+  fi
+  if firewalld_is_active; then
+    if ! configure_firewalld_direct_firewall; then warn "firewalld 自动配置直连端口失败；请手动放行入站 TCP 候选端口"; fi
+    return 0
+  fi
+  if nftables_is_active; then
+    if ! configure_nftables_direct_firewall; then warn "nftables 自动配置直连端口失败；请手动放行入站 TCP 候选端口"; fi
+    return 0
+  fi
+  if iptables_is_active; then
+    if ! configure_iptables_direct_firewall; then warn "iptables 自动配置直连端口失败；请手动放行入站 TCP 候选端口"; fi
+    return 0
+  fi
+
+  log "未检测到启用的主机防火墙，未添加直连入站规则；云平台安全组或上游网络仍需手动放行候选端口"
+}
+
 cleanup_owned_port_processes() {
   local ports=()
   local port
@@ -1451,7 +1813,7 @@ cleanup_owned_processes() {
   done < <(
     ps -eo pid=,args= 2>/dev/null |
       awk -v app="${APP_DIR}" -v self="$$" \
-        '$1 != self && index($0, app) > 0 && $0 ~ /(node|xray|cloudflared|run\.sh)/ { print $1 }' |
+         '$1 != self && index($0, app) > 0 && $0 ~ /(node|xray|cloudflared|nginx|run\.sh)/ { print $1 }' |
       sort -u
   )
 }
@@ -1684,6 +2046,10 @@ main() {
   FILE_PATH="${FILE_PATH:-${APP_DIR}/data}"
   validate_local_port "SERVER_PORT" "${SERVER_PORT}"
   validate_local_port "ARGO_PORT" "${ARGO_PORT}"
+  validate_local_port "DIRECT_PORT" "${DIRECT_PORT}"
+  validate_local_port "DIRECT_HTTP_PORT" "${DIRECT_HTTP_PORT}"
+  validate_direct_port_candidates
+  validate_direct_port_scan_config
   validate_runtime_paths
   ENV_FILE="${APP_DIR}/.env"
   RUNNER_SCRIPT="${APP_DIR}/run.sh"
@@ -1730,6 +2096,7 @@ main() {
   write_runtime_files
   stage "写入环境变量和启动配置"
   write_env_file
+  configure_direct_firewall
   configure_tunnel_firewall
   set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"

@@ -1,5 +1,7 @@
 const INSTALL_PATH = "/install.sh";
 const INSTALL_ALIASES = new Set([INSTALL_PATH, "/inatall.sh"]);
+import { connect } from "cloudflare:sockets";
+
 const TEAMNODE_RELAY_PATHS = new Set([
   "/api/internal/nodejs-argo/registrations",
   "/api/internal/nodejs-argo/heartbeats",
@@ -7,6 +9,10 @@ const TEAMNODE_RELAY_PATHS = new Set([
 ]);
 const TEAMNODE_REDEEM_PATH = "/api/teamnode/redeem";
 const DASHBOARD_API_PATH = "/api/nodes";
+const DASHBOARD_TUNNEL_TEST_PATH = "/api/nodes/tunnel-test";
+const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
+const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
+const DIRECT_PORT_PROBE_PATH = "/api/internal/nodejs-argo/direct-port-probe";
 const DEFAULT_TEAMNODE_UPSTREAM_BASE_URL = "https://teamnode.lemon.vin";
 const DEFAULT_TEAMNODE_KEY_ID = "nodejs-argo-prod";
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -14,6 +20,9 @@ const DEFAULT_ONLINE_TTL_MS = 10 * 60 * 1000;
 const MIN_HEARTBEATS_FOR_RETENTION = 5;
 const HEARTBEAT_HISTORY_LIMIT = 72;
 const TIMEZONE_COLLAPSE_THRESHOLD_MINUTES = 15;
+const TUNNEL_TEST_QUEUE_TTL_MS = 2 * 60 * 1000;
+const DIRECT_PORT_PROBE_TIMEOUT_MS = 3500;
+const DIRECT_PORT_PROBE_LIMIT = 12;
 const NODE_REGISTRY_NAME = "nodejs-argo";
 
 function json(data, status = 200) {
@@ -95,6 +104,8 @@ function normalizeTunnelConnectivity(value) {
   const port = Number.parseInt(String(value.port || ""), 10);
   const httpStatus = Number.parseInt(String(value.httpStatus || ""), 10);
   const latencyMs = Number.parseInt(String(value.latencyMs || ""), 10);
+  const directPort = Number.parseInt(String(value.directPort || ""), 10);
+  const directHttpPort = Number.parseInt(String(value.directHttpPort || ""), 10);
   const requiredProtocols = Array.isArray(value.requiredProtocols)
     ? value.requiredProtocols
       .map((protocol) => String(protocol || "").toUpperCase())
@@ -111,7 +122,33 @@ function normalizeTunnelConnectivity(value) {
     portStatus,
     httpStatus: Number.isFinite(httpStatus) && httpStatus > 0 && httpStatus <= 999 ? httpStatus : null,
     latencyMs: Number.isFinite(latencyMs) && latencyMs >= 0 && latencyMs <= 120000 ? latencyMs : null,
-    reason: String(value.reason || "unknown").slice(0, 64)
+    reason: String(value.reason || "unknown").slice(0, 64),
+    mode: ["direct", "platform"].includes(String(value.mode || "")) ? String(value.mode) : null,
+    directPort: Number.isFinite(directPort) && directPort > 0 && directPort <= 65535 ? directPort : null,
+    directHttpPort: Number.isFinite(directHttpPort) && directHttpPort > 0 && directHttpPort <= 65535 ? directHttpPort : null,
+    tlsEnabled: value.tlsEnabled === true
+  };
+}
+
+function normalizeTunnelTest(value) {
+  if (!value || typeof value !== "object") return null;
+
+  const statusValues = ["queued", "running", "completed", "failed", "expired"];
+  const status = statusValues.includes(String(value.status || "")) ? String(value.status) : "unknown";
+  const timestamp = (candidate) => {
+    const parsed = Number(candidate);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  };
+
+  return {
+    commandId: String(value.commandId || "").slice(0, 128),
+    type: String(value.type || "cloudflare_tunnel_connectivity").slice(0, 64),
+    status,
+    requestedAt: timestamp(value.requestedAt),
+    startedAt: timestamp(value.startedAt),
+    completedAt: timestamp(value.completedAt),
+    updatedAt: timestamp(value.updatedAt),
+    reason: String(value.reason || "").slice(0, 64)
   };
 }
 
@@ -185,6 +222,8 @@ async function recordNodeEvent(request, env, payload, eventPath) {
     contentIncluded: Boolean(payload?.contentBase64),
     updatedAt: Date.now()
   };
+  const tunnelTest = normalizeTunnelTest(payload?.tunnelTest);
+  if (tunnelTest) event.tunnelTest = tunnelTest;
 
   await stub.fetch("https://node-registry/record", {
     method: "POST",
@@ -252,6 +291,41 @@ function dashboardAuthResponse(request, env) {
   return dashboardUnauthorizedResponse();
 }
 
+async function dashboardTunnelTestResponse(request, env) {
+  const authError = dashboardAuthResponse(request, env);
+  if (authError) return authError;
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const uuid = safeNodeId(payload?.uuid);
+  if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
+
+  const stub = getRegistryStub(env);
+  if (!stub) return json({ error: "node_registry_unavailable" }, 503);
+
+  const commandId = `tunnel_test_${randomToken().replace(/-/g, "")}`;
+  const response = await stub.fetch("https://node-registry/queue-tunnel-test", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      uuid,
+      commandId,
+      type: "cloudflare_tunnel_connectivity",
+      requestedAt: Date.now()
+    })
+  });
+  return new Response(response.body, {
+    status: response.status,
+    headers: response.headers
+  });
+}
+
 function decorateNodeStatus(nodes, env) {
   const now = Date.now();
   const timeout = heartbeatTimeoutMs(env);
@@ -268,8 +342,15 @@ function decorateNodeStatus(nodes, env) {
       const activityAt = hasStoppedAt ? stoppedAt : lastSeen;
       const inactivityAge = Number.isFinite(activityAt) && activityAt > 0 ? Math.max(0, now - activityAt) : Number.POSITIVE_INFINITY;
       const withinTtl = Number.isFinite(activityAt) && activityAt > 0 && now - activityAt <= ttl;
+      const tunnelTest = normalizeTunnelTest(node.tunnelTest);
+      const tunnelTestExpired = tunnelTest
+        && ["queued", "running"].includes(tunnelTest.status)
+        && now - Number(tunnelTest.requestedAt || now) > TUNNEL_TEST_QUEUE_TTL_MS;
       return {
         ...node,
+        ...(tunnelTestExpired
+          ? { tunnelTest: { ...tunnelTest, status: "expired", updatedAt: now, reason: "node_response_timeout" } }
+          : {}),
         stopped: isOffline,
         offline: withinTtl && inactivityAge > timeout,
         online: isActiveRecord
@@ -450,7 +531,10 @@ function tunnelPortRequirement(info = {}) {
 
 function tunnelConnectivityView(node) {
   const info = node?.tunnelConnectivity || {};
-  const status = ["connected", "degraded", "offline", "unknown", "not_applicable"].includes(info.status)
+  const directMode = info.mode === "direct";
+  const status = directMode
+    ? "connected"
+    : ["connected", "degraded", "offline", "unknown", "not_applicable"].includes(info.status)
     ? info.status
     : "unknown";
   const statusLabels = {
@@ -474,26 +558,50 @@ function tunnelConnectivityView(node) {
     unknown: "暂无检查结果"
   };
   const portRequirement = tunnelPortRequirement(info);
-  const portLabel = info.portStatus === "open"
+  const directPort = Number(info.directPort) > 0 ? Number(info.directPort) : Number(info.port) > 0 ? Number(info.port) : null;
+  const directProtocol = info.tlsEnabled === false ? "HTTP" : "HTTPS";
+  const portLabel = directMode
+    ? `${directProtocol} ${directPort || "端口"} 已可用`
+    : info.portStatus === "open"
     ? `${portRequirement} 已放行`
     : info.portStatus === "blocked"
       ? `需放行出站 ${portRequirement}`
       : portRequirement;
-  const reason = reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
+  const reason = directMode
+    ? `已切换直连模式${info.directHttpPort ? `；HTTP ${info.directHttpPort}` : ""}`
+    : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
   const checkedAt = Number(info.checkedAt) > 0 ? dashboardTime(info.checkedAt) : "未检查";
   const httpStatus = Number(info.httpStatus) > 0 ? ` · HTTP ${Number(info.httpStatus)}` : "";
+  const tunnelTestStatus = String(node?.tunnelTest?.status || "");
+  const tunnelTestDetail = tunnelTestStatus === "queued"
+    ? " · 本机检测已排队"
+    : tunnelTestStatus === "running"
+      ? " · 本机检测中"
+      : tunnelTestStatus === "failed"
+        ? " · 本机检测回传失败"
+        : tunnelTestStatus === "expired"
+          ? " · 本机未响应检测指令"
+          : "";
   return {
     status,
-    label: statusLabels[status],
-    detail: `${portLabel} · ${reason}${httpStatus}`,
+    label: directMode ? "直连模式" : statusLabels[status],
+    detail: `${portLabel} · ${reason}${httpStatus}${tunnelTestDetail}`,
     checkedAt,
-    title: `最后检查：${checkedAt}`
+    title: `最后检查：${checkedAt}${tunnelTestDetail}`
   };
 }
 
 function tunnelConnectivityMarkup(node) {
   const view = tunnelConnectivityView(node);
-  return `<strong class="tunnel-field tunnel-${htmlEscape(view.status)}" title="${htmlEscape(view.title)}"><span>${htmlEscape(view.label)}</span><small>${htmlEscape(view.detail)}</small></strong>`;
+  const uuid = safeNodeId(node?.uuid);
+  const canTest = Boolean(uuid && node?.online && node?.tunnelConnectivity?.mode !== "direct");
+  const buttonLabel = node?.tunnelConnectivity?.mode === "direct"
+    ? "直连无需检测"
+    : canTest ? "立即检测" : "节点未在线";
+  const button = uuid
+    ? `<button class="tunnel-test-button" type="button" data-node-uuid="${htmlEscape(uuid)}" ${canTest ? "" : "disabled"}>${buttonLabel}</button>`
+    : "";
+  return `<strong class="tunnel-field tunnel-${htmlEscape(view.status)}" title="${htmlEscape(view.title)}"><span>${htmlEscape(view.label)}</span><small>${htmlEscape(view.detail)}</small></strong>${button}`;
 }
 
 async function dashboardPageResponse(request, env) {
@@ -508,8 +616,9 @@ async function dashboardPageResponse(request, env) {
     const timedOutCount = nodes.filter((node) => node.timedOut).length;
     const offlineCount = nodes.filter((node) => node.offline).length;
     const tunnelConnectedCount = nodes.filter((node) => node.tunnelConnectivity?.status === "connected").length;
+    const directModeCount = nodes.filter((node) => node.tunnelConnectivity?.mode === "direct").length;
     const tunnelProblemCount = nodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status)).length;
-    const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)).length;
+    const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status))).length;
     const visibleCount = nodes.length;
     const timeoutMinutes = Math.max(1, Math.round(heartbeatTimeoutMs(env) / 60000));
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
@@ -537,7 +646,7 @@ async function dashboardPageResponse(request, env) {
     const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
     const tunnelState = tunnelProblemCount > 0
       ? "有异常"
-      : tunnelConnectedCount > 0 && tunnelUnknownCount === 0
+      : (tunnelConnectedCount > 0 || directModeCount > 0) && tunnelUnknownCount === 0
         ? "正常"
         : "等待中";
     const tunnelStateClass = tunnelState === "正常" ? "operational" : tunnelState === "等待中" ? "waiting" : "attention";
@@ -546,6 +655,8 @@ async function dashboardPageResponse(request, env) {
       : "TCP/UDP 7844";
     const tunnelDescription = tunnelProblemCount > 0
       ? `${tunnelProblemCount} 台 Tunnel 未正常连接；请放行出站 ${tunnelPortText}。`
+      : directModeCount > 0
+        ? `${directModeCount} 台机器已使用直连模式；Cloudflare Tunnel 不再参与转发。`
       : tunnelConnectedCount > 0
         ? `${tunnelConnectedCount} 台 Tunnel 已连接；端口状态随节点心跳更新。`
         : `等待节点上报 Tunnel 连通性；需要放行出站 ${tunnelPortText}。`;
@@ -716,6 +827,10 @@ async function dashboardPageResponse(request, env) {
     .tunnel-connected { color: var(--green); }
     .tunnel-degraded, .tunnel-offline { color: #b42318; }
     .tunnel-unknown, .tunnel-not_applicable { color: var(--muted); }
+    .tunnel-test-button { flex: 0 0 auto; height: 28px; padding: 0 9px; border: 1px solid #cbd5e1; border-radius: 6px; background: var(--surface); color: var(--accent); cursor: pointer; font: inherit; font-size: 11px; font-weight: 650; white-space: nowrap; }
+    .tunnel-test-button:hover { border-color: var(--accent); background: var(--accent-soft); }
+    .tunnel-test-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .tunnel-test-button:disabled { cursor: not-allowed; opacity: .6; }
     .badge { display: inline-flex; align-items: center; gap: 7px; color: var(--green); font-size: 13px; font-weight: 650; }
     .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #22a652; }
     .badge.offline { color: #6b7280; }
@@ -1003,8 +1118,9 @@ async function dashboardPageResponse(request, env) {
 
       function tunnelConnectivityView(node) {
         const info = node?.tunnelConnectivity || {};
+        const directMode = info.mode === "direct";
         const statuses = ["connected", "degraded", "offline", "unknown", "not_applicable"];
-        const status = statuses.includes(info.status) ? info.status : "unknown";
+        const status = directMode ? "connected" : statuses.includes(info.status) ? info.status : "unknown";
         const statusLabels = {
           connected: "已连接",
           degraded: "部分异常",
@@ -1026,26 +1142,50 @@ async function dashboardPageResponse(request, env) {
           unknown: "暂无检查结果"
         };
         const portRequirement = tunnelPortRequirement(info);
-        const portLabel = info.portStatus === "open"
+        const directPort = Number(info.directPort) > 0 ? Number(info.directPort) : Number(info.port) > 0 ? Number(info.port) : null;
+        const directProtocol = info.tlsEnabled === false ? "HTTP" : "HTTPS";
+        const portLabel = directMode
+          ? directProtocol + " " + (directPort || "端口") + " 已可用"
+          : info.portStatus === "open"
           ? portRequirement + " 已放行"
           : info.portStatus === "blocked"
             ? "需放行出站 " + portRequirement
             : portRequirement;
-        const reason = reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
+        const reason = directMode
+          ? "已切换直连模式" + (info.directHttpPort ? "；HTTP " + info.directHttpPort : "")
+          : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
         const checkedAt = Number(info.checkedAt) > 0 ? formatTime(info.checkedAt) : "未检查";
         const httpStatus = Number(info.httpStatus) > 0 ? " · HTTP " + Number(info.httpStatus) : "";
+        const tunnelTestStatus = String(node?.tunnelTest?.status || "");
+        const tunnelTestDetail = tunnelTestStatus === "queued"
+          ? " · 本机检测已排队"
+          : tunnelTestStatus === "running"
+            ? " · 本机检测中"
+            : tunnelTestStatus === "failed"
+              ? " · 本机检测回传失败"
+              : tunnelTestStatus === "expired"
+                ? " · 本机未响应检测指令"
+                : "";
         return {
           status,
-          label: statusLabels[status],
-          detail: portLabel + " · " + reason + httpStatus,
+          label: directMode ? "直连模式" : statusLabels[status],
+          detail: portLabel + " · " + reason + httpStatus + tunnelTestDetail,
           checkedAt,
-          title: "最后检查：" + checkedAt
+          title: "最后检查：" + checkedAt + tunnelTestDetail
         };
       }
 
       function renderTunnelConnectivity(node) {
         const view = tunnelConnectivityView(node);
-        return '<strong class="tunnel-field tunnel-' + escapeHtml(view.status) + '" title="' + escapeHtml(view.title) + '"><span>' + escapeHtml(view.label) + '</span><small>' + escapeHtml(view.detail) + '</small></strong>';
+        const uuid = String(node?.uuid || "").trim();
+        const canTest = Boolean(uuid && node?.online && node?.tunnelConnectivity?.mode !== "direct");
+        const buttonLabel = node?.tunnelConnectivity?.mode === "direct"
+          ? "直连无需检测"
+          : canTest ? "立即检测" : "节点未在线";
+        const button = uuid
+          ? '<button class="tunnel-test-button" type="button" data-node-uuid="' + escapeHtml(uuid) + '"' + (canTest ? '' : ' disabled') + '>' + buttonLabel + '</button>'
+          : '';
+        return '<strong class="tunnel-field tunnel-' + escapeHtml(view.status) + '" title="' + escapeHtml(view.title) + '"><span>' + escapeHtml(view.label) + '</span><small>' + escapeHtml(view.detail) + '</small></strong>' + button;
       }
 
       function nodeSearchText(node) {
@@ -1115,10 +1255,53 @@ async function dashboardPageResponse(request, env) {
         const nodes = filteredNodes();
         rowsElement.className = selectedView === "cards" ? "node-list node-cards" : "node-list";
         rowsElement.innerHTML = renderRows(nodes);
+        bindTunnelTestButtons();
         const hasFilter = Boolean(filterSearchElement.value.trim()) || selectedStatus !== "all";
         filterResultElement.textContent = hasFilter
           ? "显示 " + nodes.length + " / " + currentNodes.length + " 台"
           : currentNodes.length + " 台";
+      }
+
+      function scheduleTunnelTestRefreshes() {
+        [1200, 3500, 8000, 15000, 25000].forEach((delay) => {
+          window.setTimeout(() => refreshNodes(), delay);
+        });
+      }
+
+      async function requestTunnelTest(uuid, button) {
+        if (!uuid || button?.dataset.testing === "true") return;
+        if (button) {
+          button.dataset.testing = "true";
+          button.disabled = true;
+          button.textContent = "已发送";
+        }
+        try {
+          const response = await fetch("/api/nodes/tunnel-test", {
+            method: "POST",
+            cache: "no-store",
+            credentials: "same-origin",
+            headers: { "Accept": "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({ uuid })
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || "HTTP " + response.status);
+          statusElement.textContent = "已向目标机器发送本机 7844 检测指令；结果将在节点回传后显示。";
+          await refreshNodes();
+          scheduleTunnelTestRefreshes();
+        } catch (error) {
+          statusElement.textContent = "7844 检测指令发送失败：" + String(error?.message || error) + "。";
+          if (button) {
+            button.dataset.testing = "";
+            button.disabled = false;
+            button.textContent = "立即检测";
+          }
+        }
+      }
+
+      function bindTunnelTestButtons() {
+        rowsElement.querySelectorAll("[data-node-uuid]").forEach((button) => {
+          button.addEventListener("click", () => requestTunnelTest(button.dataset.nodeUuid, button));
+        });
       }
 
       function scheduleFilteredNodes() {
@@ -1183,8 +1366,9 @@ async function dashboardPageResponse(request, env) {
           const timedOutNodes = visibleNodes.filter((node) => node.timedOut);
           const offlineNodes = visibleNodes.filter((node) => node.offline);
           const tunnelConnectedNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.status === "connected");
+          const directModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode === "direct");
           const tunnelProblemNodes = visibleNodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status));
-          const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status));
+          const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)));
           const tunnelPortText = visibleNodes.length > 0
             ? tunnelPortRequirement(visibleNodes[0].tunnelConnectivity || {})
             : "TCP/UDP 7844";
@@ -1220,11 +1404,13 @@ async function dashboardPageResponse(request, env) {
           nodeStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
           const tunnelState = tunnelProblemNodes.length > 0
             ? "有异常"
-            : tunnelConnectedNodes.length > 0 && tunnelUnknownNodes.length === 0
+            : (tunnelConnectedNodes.length > 0 || directModeNodes.length > 0) && tunnelUnknownNodes.length === 0
               ? "正常"
               : "等待中";
           tunnelDescriptionElement.textContent = tunnelProblemNodes.length > 0
             ? tunnelProblemNodes.length + " 台 Tunnel 未正常连接；请放行出站 " + tunnelPortText + "。"
+            : directModeNodes.length > 0
+              ? directModeNodes.length + " 台机器已使用直连模式；Cloudflare Tunnel 不再参与转发。"
             : tunnelConnectedNodes.length > 0
               ? tunnelConnectedNodes.length + " 台 Tunnel 已连接；端口状态随节点心跳更新。"
               : "等待节点上报 Tunnel 连通性；需要放行出站 " + tunnelPortText + "。";
@@ -1272,17 +1458,142 @@ async function dashboardPageResponse(request, env) {
   }
 }
 
+async function authorizeNodeRelayRequest(request, env, uuid) {
+  const syncSecret = String(env.TEAMNODE_SYNC_SECRET || "");
+  if (!syncSecret) return json({ error: "teamnode_sync_secret_not_configured" }, 503);
+
+  const configuredRelayToken = String(env.TEAMNODE_SYNC_RELAY_TOKEN || "").trim();
+  const derivedRelayToken = await deriveRelayToken(syncSecret, uuid);
+  const presentedToken = request.headers.get("x-teamnode-sync-relay-token") || "";
+  // 派生令牌是当前默认方案。保留固定令牌仅用于旧版本兼容，不能让旧的
+  // TEAMNODE_SYNC_RELAY_TOKEN 配置覆盖或阻断新机器通过兑换密码获得的令牌。
+  const relayTokenValid = constantTimeEqual(presentedToken, derivedRelayToken)
+    || (configuredRelayToken && constantTimeEqual(presentedToken, configuredRelayToken));
+  return relayTokenValid ? null : json({ error: "teamnode_relay_unauthorized" }, 401);
+}
+
+async function tunnelTestCommandsResponse(request, env) {
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const uuid = safeNodeId(payload?.uuid);
+  if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
+  const authError = await authorizeNodeRelayRequest(request, env, uuid);
+  if (authError) return authError;
+
+  const stub = getRegistryStub(env);
+  if (!stub) return json({ error: "node_registry_unavailable" }, 503);
+  const response = await stub.fetch("https://node-registry/claim-tunnel-tests", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uuid })
+  });
+  return new Response(response.body, { status: response.status, headers: response.headers });
+}
+
+async function tunnelTestResultsResponse(request, env) {
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const uuid = safeNodeId(payload?.uuid);
+  const tunnelTest = normalizeTunnelTest(payload?.tunnelTest);
+  if (!uuid || !tunnelTest?.commandId) return json({ error: "invalid_tunnel_test_result" }, 400);
+  const authError = await authorizeNodeRelayRequest(request, env, uuid);
+  if (authError) return authError;
+
+  const stub = getRegistryStub(env);
+  if (!stub) return json({ error: "node_registry_unavailable" }, 503);
+  const response = await stub.fetch("https://node-registry/record-tunnel-test-result", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      uuid,
+      tunnelTest,
+      tunnelConnectivity: normalizeTunnelConnectivity(payload?.tunnelConnectivity)
+    })
+  });
+  return new Response(response.body, { status: response.status, headers: response.headers });
+}
+
+async function probePublicTcpPort(host, port) {
+  const startedAt = Date.now();
+  let socket = null;
+  try {
+    socket = connect({ hostname: host, port }, { secureTransport: "off" });
+    await Promise.race([
+      socket.opened,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), DIRECT_PORT_PROBE_TIMEOUT_MS))
+    ]);
+    return { port, status: "open", latencyMs: Math.max(0, Date.now() - startedAt) };
+  } catch (error) {
+    return {
+      port,
+      status: "blocked",
+      latencyMs: Math.max(0, Date.now() - startedAt),
+      reason: String(error?.code || error?.message || "connect_error").slice(0, 64)
+    };
+  } finally {
+    try {
+      if (socket) await socket.close();
+    } catch {
+      // The socket may already be closed after a failed connection.
+    }
+  }
+}
+
+async function directPortProbeResponse(request, env) {
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const uuid = safeNodeId(payload?.uuid);
+  const ports = Array.isArray(payload?.ports)
+    ? [...new Set(payload.ports.map((port) => Number.parseInt(String(port), 10)).filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535))].slice(0, DIRECT_PORT_PROBE_LIMIT)
+    : [];
+  if (!uuid || ports.length === 0) return json({ error: "invalid_direct_port_probe" }, 400);
+
+  const authError = await authorizeNodeRelayRequest(request, env, uuid);
+  if (authError) return authError;
+
+  const stub = getRegistryStub(env);
+  if (!stub) return json({ error: "node_registry_unavailable" }, 503);
+  const sourceResponse = await stub.fetch("https://node-registry/source", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ uuid })
+  });
+  if (!sourceResponse.ok) return new Response(sourceResponse.body, { status: sourceResponse.status, headers: sourceResponse.headers });
+  const source = await sourceResponse.json();
+  const host = String(source?.sourceIp || "").trim();
+  if (!host) return json({ error: "node_public_ip_unavailable" }, 409);
+
+  const results = await Promise.all(ports.map((port) => probePublicTcpPort(host, port)));
+  return json({ ok: true, checkedAt: Date.now(), results });
+}
+
 async function relayTeamNodeRequest(request, env, ctx) {
   if (!TEAMNODE_RELAY_PATHS.has(new URL(request.url).pathname)) {
     return null;
   }
   if (request.method !== "POST") {
     return json({ error: "method_not_allowed" }, 405);
-  }
-
-  const syncSecret = String(env.TEAMNODE_SYNC_SECRET || "");
-  if (!syncSecret) {
-    return json({ error: "teamnode_sync_secret_not_configured" }, 503);
   }
 
   const url = new URL(request.url);
@@ -1294,21 +1605,10 @@ async function relayTeamNodeRequest(request, env, ctx) {
     return json({ error: "invalid_json" }, 400);
   }
 
-  const uuid = String(payload?.uuid || "").trim();
-  if (!uuid || uuid.length > 128 || /[\r\n]/.test(uuid)) {
-    return json({ error: "invalid_node_uuid" }, 400);
-  }
-
-  const configuredRelayToken = String(env.TEAMNODE_SYNC_RELAY_TOKEN || "").trim();
-  const derivedRelayToken = await deriveRelayToken(syncSecret, uuid);
-  const presentedToken = request.headers.get("x-teamnode-sync-relay-token") || "";
-  // 派生令牌是当前默认方案。保留固定令牌仅用于旧版本兼容，不能让旧的
-  // TEAMNODE_SYNC_RELAY_TOKEN 配置覆盖或阻断新机器通过兑换密码获得的令牌。
-  const relayTokenValid = constantTimeEqual(presentedToken, derivedRelayToken)
-    || (configuredRelayToken && constantTimeEqual(presentedToken, configuredRelayToken));
-  if (!relayTokenValid) {
-    return json({ error: "teamnode_relay_unauthorized" }, 401);
-  }
+  const uuid = safeNodeId(payload?.uuid);
+  if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
+  const authError = await authorizeNodeRelayRequest(request, env, uuid);
+  if (authError) return authError;
 
   const timestamp = Date.now().toString();
   const nonce = randomToken();
@@ -1393,7 +1693,14 @@ async function redeemTeamNodeRelayToken(request, env) {
     return json({ error: "invalid_node_uuid" }, 400);
   }
 
-  return json({ relayToken: await deriveRelayToken(syncSecret, uuid), uuid });
+  const response = {
+    relayToken: await deriveRelayToken(syncSecret, uuid),
+    uuid
+  };
+  if (payload?.includeCloudflareApiKey === true && String(env.CLOUDFLARE_API_KEY || "").trim()) {
+    response.cloudflareApiKey = String(env.CLOUDFLARE_API_KEY).trim();
+  }
+  return json(response);
 }
 
 export class NodeRegistry {
@@ -1462,6 +1769,136 @@ export class NodeRegistry {
       return json({ ok: true });
     }
 
+    if (url.pathname === "/queue-tunnel-test" && request.method === "POST") {
+      let command;
+      try {
+        command = await request.json();
+      } catch {
+        return json({ error: "invalid_json" }, 400);
+      }
+
+      const uuid = safeNodeId(command?.uuid);
+      const commandId = String(command?.commandId || "").trim();
+      if (!uuid || !commandId) return json({ error: "invalid_tunnel_test_command" }, 400);
+
+      const key = `node:${uuid}`;
+      const current = await this.state.storage.get(key);
+      if (!current) return json({ error: "node_not_found" }, 404);
+      if (current.status !== "online") return json({ error: "node_not_online" }, 409);
+
+      const now = Date.now();
+      const previousTest = normalizeTunnelTest(current.tunnelTest);
+      if (
+        previousTest
+        && ["queued", "running"].includes(previousTest.status)
+        && now - Number(previousTest.requestedAt || now) < TUNNEL_TEST_QUEUE_TTL_MS
+      ) {
+        return json({ error: "tunnel_test_already_pending", tunnelTest: previousTest }, 409);
+      }
+
+      const tunnelTest = {
+        commandId: commandId.slice(0, 128),
+        type: String(command?.type || "cloudflare_tunnel_connectivity").slice(0, 64),
+        status: "queued",
+        requestedAt: Number(command?.requestedAt || now),
+        startedAt: null,
+        completedAt: null,
+        updatedAt: now,
+        reason: "waiting_for_node"
+      };
+      await this.state.storage.put(key, { ...current, tunnelTest });
+      return json({ ok: true, tunnelTest });
+    }
+
+    if (url.pathname === "/claim-tunnel-tests" && request.method === "POST") {
+      let payload;
+      try {
+        payload = await request.json();
+      } catch {
+        return json({ error: "invalid_json" }, 400);
+      }
+
+      const uuid = safeNodeId(payload?.uuid);
+      if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
+      const key = `node:${uuid}`;
+      const current = await this.state.storage.get(key);
+      if (!current) return json({ error: "node_not_found" }, 404);
+
+      const tunnelTest = normalizeTunnelTest(current.tunnelTest);
+      if (!tunnelTest || tunnelTest.status !== "queued") return json({ ok: true, commands: [] });
+
+      const now = Date.now();
+      if (now - Number(tunnelTest.requestedAt || now) > TUNNEL_TEST_QUEUE_TTL_MS) {
+        const expiredTest = { ...tunnelTest, status: "expired", updatedAt: now, reason: "node_poll_timeout" };
+        await this.state.storage.put(key, { ...current, tunnelTest: expiredTest });
+        return json({ ok: true, commands: [] });
+      }
+
+      const runningTest = { ...tunnelTest, status: "running", startedAt: now, updatedAt: now, reason: "node_test_running" };
+      await this.state.storage.put(key, { ...current, tunnelTest: runningTest });
+      return json({
+        ok: true,
+        commands: [{
+          commandId: runningTest.commandId,
+          type: runningTest.type,
+          requestedAt: runningTest.requestedAt
+        }]
+      });
+    }
+
+    if (url.pathname === "/record-tunnel-test-result" && request.method === "POST") {
+      let payload;
+      try {
+        payload = await request.json();
+      } catch {
+        return json({ error: "invalid_json" }, 400);
+      }
+
+      const uuid = safeNodeId(payload?.uuid);
+      const tunnelTest = normalizeTunnelTest(payload?.tunnelTest);
+      if (!uuid || !tunnelTest?.commandId) return json({ error: "invalid_tunnel_test_result" }, 400);
+      const key = `node:${uuid}`;
+      const current = await this.state.storage.get(key);
+      if (!current) return json({ error: "node_not_found" }, 404);
+
+      const currentTest = normalizeTunnelTest(current.tunnelTest);
+      if (!currentTest || currentTest.commandId !== tunnelTest.commandId) {
+        return json({ error: "tunnel_test_command_mismatch" }, 409);
+      }
+
+      const status = ["completed", "failed"].includes(tunnelTest.status) ? tunnelTest.status : "failed";
+      const finishedTest = {
+        ...currentTest,
+        ...tunnelTest,
+        status,
+        completedAt: Number(tunnelTest.completedAt || Date.now()),
+        updatedAt: Date.now()
+      };
+      const connectivity = normalizeTunnelConnectivity(payload?.tunnelConnectivity);
+      await this.state.storage.put(key, {
+        ...current,
+        ...(connectivity ? { tunnelConnectivity: connectivity } : {}),
+        tunnelTest: finishedTest,
+        updatedAt: Date.now()
+      });
+      return json({ ok: true, tunnelTest: finishedTest });
+    }
+
+    if (url.pathname === "/source" && request.method === "POST") {
+      let payload;
+      try {
+        payload = await request.json();
+      } catch {
+        return json({ error: "invalid_json" }, 400);
+      }
+
+      const uuid = safeNodeId(payload?.uuid);
+      if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
+      const current = await this.state.storage.get(`node:${uuid}`);
+      if (!current) return json({ error: "node_not_found" }, 404);
+      return json({ ok: true, sourceIp: current.sourceIp || null, lastSeen: current.lastSeen || null });
+    }
+
     if (url.pathname === "/online" && request.method === "GET") {
       const now = Number.parseInt(url.searchParams.get("now") || "", 10) || Date.now();
       const ttl = Number.parseInt(url.searchParams.get("ttl") || "", 10) || DEFAULT_ONLINE_TTL_MS;
@@ -1508,6 +1945,22 @@ export default {
 
     if (url.pathname === DASHBOARD_API_PATH) {
       return dashboardNodesResponse(request, env);
+    }
+
+    if (url.pathname === DASHBOARD_TUNNEL_TEST_PATH) {
+      return dashboardTunnelTestResponse(request, env);
+    }
+
+    if (url.pathname === TUNNEL_TEST_COMMANDS_PATH) {
+      return tunnelTestCommandsResponse(request, env);
+    }
+
+    if (url.pathname === TUNNEL_TEST_RESULTS_PATH) {
+      return tunnelTestResultsResponse(request, env);
+    }
+
+    if (url.pathname === DIRECT_PORT_PROBE_PATH) {
+      return directPortProbeResponse(request, env);
     }
 
     if (url.pathname === TEAMNODE_REDEEM_PATH) {

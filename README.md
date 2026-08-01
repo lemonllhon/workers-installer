@@ -37,6 +37,7 @@ Workers & Pages
 | --- | --- | --- |
 | `TEAMNODE_SYNC_SECRET` | Secret | TeamNode 主密钥，只在 Worker 代理请求时使用 |
 | `TEAMNODE_SYNC_ENROLL_PASSWORD` | Secret | 目标机器安装时输入的兑换密码 |
+| `CLOUDFLARE_API_KEY` | Secret，可选 | 直连回退时用于更新 `ARGO_DOMAIN` 的 Cloudflare Zone DNS；安装兑换时按请求下发到目标机器的 0600 `.env` |
 
 如果需要根页面在线机器面板，再添加：
 
@@ -157,6 +158,7 @@ https://你的-worker.workers.dev/
 - `FORCE_KILL_PORTS=true`：清理旧安装时强制终止相关端口上的其他进程，谨慎使用。
 - `NODE_RUNTIME_VERSION`：仅当系统 Node.js 低于 14 时使用的项目专用 Node.js 版本，默认 `20.20.2`；不会升级或替换系统 Node.js。
 - `NODE_RUNTIME_SHA256`：仅在自定义 `NODE_RUNTIME_VERSION` 且该版本没有内置校验值时，填写对应 Node.js 官方 Linux 压缩包的 64 位 SHA256。
+- `TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS`：节点轮询面板检测指令的间隔，默认 `15000` 毫秒，允许范围为 5–60 秒。
 
 如果目标机已有 Node.js 12，安装器不会把它升级成全局版本，也不会影响其他项目；它会在
 安装目录内的 `node-runtime/` 安装并使用项目专用 Node.js 20.20.2。已有 Node.js 14 或更高版本
@@ -364,6 +366,22 @@ env \
 `ARGO_PORT` 默认是 `8001`，通常不需要填写。`FORCE_KILL_PORTS=true` 只在覆盖旧安装、确认其他程序占用节点端口且需要强制清理时添加；新机器安装不建议默认开启。
 
 安装器会检测已启用的 UFW、firewalld、nftables 或 iptables，并按 `CLOUDFLARED_PROTOCOL` 尝试幂等放行出站 `7844`：`http2` 为 TCP，`quic` 为 UDP，`auto` 为 TCP 和 UDP。Cloudflare Tunnel 是出站连接，不需要为了 Tunnel 打开入站 `7844`。云平台安全组、VPS 上游防火墙或服务商网络策略不在机器内部，安装器无法代为修改；面板会通过节点探测结果显示端口是否仍被阻断。
+
+安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES` 的入站 TCP 端口。自动直连回退需要 `CLOUDFLARE_API_KEY`：Tunnel 连续异常后，或节点已经配置为直连模式时，节点会让 Worker 从公网探测本机临时监听的候选端口；如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时将 `ARGO_DOMAIN` 更新为 DNS-only A 记录；如果证书组件不可用或这两个端口不同时可达，则选择可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多扫描 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。自动回退会写入 `.env` 并重启服务，重启后面板显示“直连模式”。
+
+这三个扩展探测参数可以不指定，安装器会使用以下默认值：
+
+```text
+DIRECT_PORT_SCAN_PORTS=8000,8008,8081,8088,8090,8181,8444,8888,9000,9443,10000,11550-11570,20000,30000,40000,50000,60000
+DIRECT_PORT_SCAN_RANGE=1024-65535
+DIRECT_PORT_SCAN_MAX=256
+```
+
+探测顺序是先检查默认候选端口，再检查 `DIRECT_PORT_SCAN_PORTS`，最后按 `DIRECT_PORT_SCAN_RANGE` 扩展扫描；每批最多探测 12 个端口。将 `DIRECT_PORT_SCAN_MAX` 设置为 `0` 可关闭扩展扫描，最大值为 `4096`。这些变量应写入目标机器的 `/opt/nodejs-argo-no-docker/.env`，不需要配置为 Worker Secret。
+
+安装器只能修改目标机器上的 UFW、firewalld、nftables 或 iptables；云厂商安全组、上游防火墙和运营商网络仍需在厂商控制台放行。当前使用的 Cloudflare API Token 只应授予目标 Zone 的 DNS Read/Edit 权限，不要把 Token 放入 GitHub、公开安装命令或日志；如果曾经暴露过 Token，应先在 Cloudflare 中撤销并重新创建。
+
+面板每台在线机器的 Cloudflare Tunnel 状态旁提供“立即检测”。点击后由 `install.lemon.vin` 排队并下发一次性检测指令，目标机器本地执行 7844 探测，再把结果回传到面板；Worker 或浏览器本身不会冒充目标机器测试。默认每 15 秒轮询一次指令，节点收到后会绕过缓存立即检测。对 `http2`，本机 TCP 7844 连接超时或失败会显示“出站端口被阻断”；这表示本机已经执行探测。若机器离线、服务未运行或没有在指令有效期内收到指令，面板会显示“本机未响应检测指令”，不能把这种情况直接等同于端口关闭。`quic` 的 UDP 端口不能用普通 TCP 连接判断，面板会以 cloudflared 实际 Tunnel 状态和协议要求为准。
 
 ### 安装完成后检查心跳
 

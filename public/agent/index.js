@@ -48,11 +48,27 @@ const DIRECT_MODE = parseBoolean(process.env.DIRECT_MODE, false);
 const PLATFORM_PUBLIC_PORT = Number.parseInt(process.env.PLATFORM_PUBLIC_PORT || "443", 10);
 const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
 const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 10);
+const DIRECT_TLS_ENABLED = parseBoolean(process.env.DIRECT_TLS_ENABLED, true);
+const AUTO_DIRECT_FALLBACK = parseBoolean(process.env.AUTO_DIRECT_FALLBACK, true);
+const NODEJS_ARGO_ENV_FILE = process.env.NODEJS_ARGO_ENV_FILE || "";
+const DIRECT_PORT_CANDIDATES = [...new Set(
+  String(process.env.DIRECT_PORT_CANDIDATES || "80,443,8080,8443,8880,2053,2083,2087,2096")
+    .split(",")
+    .map((value) => Number.parseInt(value.trim(), 10))
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535)
+)].slice(0, 12);
+const DIRECT_PORT_SCAN_PORTS = String(
+  process.env.DIRECT_PORT_SCAN_PORTS || "8000,8008,8081,8088,8090,8181,8444,8888,9000,9443,10000,11550-11570,20000,30000,40000,50000,60000"
+);
+const DIRECT_PORT_SCAN_RANGE = String(process.env.DIRECT_PORT_SCAN_RANGE || "1024-65535");
+const DIRECT_PORT_SCAN_MAX = Number.parseInt(process.env.DIRECT_PORT_SCAN_MAX || "256", 10);
+const DIRECT_PORT_PROBE_BATCH_SIZE = 12;
+const DIRECT_FALLBACK_FAILURE_THRESHOLD = Number.parseInt(process.env.DIRECT_FALLBACK_FAILURE_THRESHOLD || "2", 10);
 const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
 const DIRECT_KEY_FILE = process.env.DIRECT_KEY_FILE || "";
 const DIRECT_LETSENCRYPT_EMAIL = process.env.DIRECT_LETSENCRYPT_EMAIL || "admin@lemon.vin";
 const CF_DNS_ENABLED = parseBoolean(process.env.CF_DNS_ENABLED, false);
-const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
+const CF_API_TOKEN = process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_KEY || "";
 const CF_DNS_ZONE_ID = process.env.CF_DNS_ZONE_ID || "";
 const CF_DNS_ZONE_NAME = process.env.CF_DNS_ZONE_NAME || "";
 const CF_DNS_RECORD_NAME = process.env.CF_DNS_RECORD_NAME || ARGO_DOMAIN;
@@ -72,11 +88,14 @@ const TEAMNODE_SYNC_PROVIDER = process.env.TEAMNODE_SYNC_PROVIDER || "";
 const TEAMNODE_SYNC_LABEL_PREFIX = process.env.TEAMNODE_SYNC_LABEL_PREFIX || "";
 const TEAMNODE_SYNC_TIMEOUT_MS = Number.parseInt(process.env.TEAMNODE_SYNC_TIMEOUT_MS || "10000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS || "300000", 10);
+const TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS = Number.parseInt(process.env.TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS || "15000", 10);
 const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
   process.env.TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT,
   false
 );
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
+const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
+const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -124,6 +143,8 @@ const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
 const CERTBOT_BIN = process.env.CERTBOT_BIN || "/usr/bin/certbot";
 
 let teamnodeSyncTimer = null;
+let tunnelTestCommandPollTimer = null;
+let tunnelTestCommandPollPromise = null;
 let teamnodeSyncRegistered = false;
 let teamnodeSyncContext = null;
 let teamnodeShutdownPromise = null;
@@ -131,6 +152,10 @@ let directCertificateRenewalTimer = null;
 let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
 let tunnelConnectivityCache = null;
+let tunnelFailureStreak = 0;
+let directFallbackPromise = null;
+let xrayProcessId = null;
+let cloudflaredProcessId = null;
 let bootInstanceId = createRandomToken();
 const PROVIDER_CODE_OVERRIDES = {
   SG: "sin"
@@ -490,7 +515,7 @@ async function probeCloudflareTunnelPort(protocol) {
   };
 }
 
-async function checkCloudflareTunnelConnectivity(argoDomain) {
+async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } = {}) {
   const checkedAt = Date.now();
   const protocol = getCloudflaredProtocol();
   const requiredProtocols = tunnelConnectivityProtocols(protocol);
@@ -508,7 +533,15 @@ async function checkCloudflareTunnelConnectivity(argoDomain) {
   const domain = String(argoDomain || "").trim();
 
   if (DIRECT_MODE || PLATFORM_PROXY_MODE) {
-    return { ...baseResult, status: "not_applicable", reason: "not_cloudflare_tunnel" };
+    return {
+      ...baseResult,
+      status: "not_applicable",
+      reason: "not_cloudflare_tunnel",
+      mode: DIRECT_MODE ? "direct" : "platform",
+      directPort: DIRECT_MODE ? DIRECT_PORT : Number.parseInt(ARGO_PORT, 10),
+      directHttpPort: DIRECT_MODE ? DIRECT_HTTP_PORT : null,
+      tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
+    };
   }
   if (!domain) {
     return { ...baseResult, reason: "endpoint_missing" };
@@ -518,7 +551,7 @@ async function checkCloudflareTunnelConnectivity(argoDomain) {
   const cacheAge = tunnelConnectivityCache
     ? checkedAt - Number(tunnelConnectivityCache.value?.checkedAt || 0)
     : Number.POSITIVE_INFINITY;
-  if (tunnelConnectivityCache?.key === cacheKey && cacheAge >= 0 && cacheAge < CLOUDFLARED_CONNECTIVITY_CACHE_MS) {
+  if (!force && tunnelConnectivityCache?.key === cacheKey && cacheAge >= 0 && cacheAge < CLOUDFLARED_CONNECTIVITY_CACHE_MS) {
     return tunnelConnectivityCache.value;
   }
 
@@ -705,6 +738,352 @@ async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
   }
 }
 
+function directFallbackFailureThreshold() {
+  return Number.isInteger(DIRECT_FALLBACK_FAILURE_THRESHOLD) && DIRECT_FALLBACK_FAILURE_THRESHOLD >= 1
+    ? Math.min(DIRECT_FALLBACK_FAILURE_THRESHOLD, 10)
+    : 2;
+}
+
+function expandPortSpec(value, limit = 1024) {
+  const ports = [];
+  const addPort = (candidate) => {
+    const port = Number.parseInt(String(candidate).trim(), 10);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535 && !ports.includes(port) && ports.length < limit) {
+      ports.push(port);
+    }
+  };
+
+  for (const item of String(value || "").split(",")) {
+    const part = item.trim();
+    if (!part) continue;
+    const range = /^(\d+)\s*-\s*(\d+)$/.exec(part);
+    if (!range) {
+      addPort(part);
+      continue;
+    }
+    const start = Number.parseInt(range[1], 10);
+    const end = Number.parseInt(range[2], 10);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end > 65535 || start > end) continue;
+    for (let port = start; port <= end && ports.length < limit; port += 1) addPort(port);
+  }
+  return ports;
+}
+
+function buildDirectPortScanCandidates() {
+  const max = Number.isInteger(DIRECT_PORT_SCAN_MAX) && DIRECT_PORT_SCAN_MAX > 0
+    ? Math.min(DIRECT_PORT_SCAN_MAX, 4096)
+    : 0;
+  if (!max) return [];
+
+  const excluded = new Set([
+    ...DIRECT_PORT_CANDIDATES,
+    22,
+    25,
+    53,
+    110,
+    143,
+    587,
+    3306,
+    3389
+  ]);
+  const candidates = expandPortSpec(DIRECT_PORT_SCAN_PORTS, max * 2)
+    .filter((port) => !excluded.has(port));
+  const range = /^(\d+)\s*-\s*(\d+)$/.exec(DIRECT_PORT_SCAN_RANGE.trim());
+  if (!range || candidates.length >= max) return candidates.slice(0, max);
+
+  const start = Number.parseInt(range[1], 10);
+  const end = Number.parseInt(range[2], 10);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end > 65535 || start > end) {
+    return candidates.slice(0, max);
+  }
+
+  const remaining = max - candidates.length;
+  const span = end - start + 1;
+  for (let index = 0; index < remaining; index += 1) {
+    const port = start + Math.floor((index * span) / remaining);
+    if (!excluded.has(port) && !candidates.includes(port)) candidates.push(port);
+  }
+  return candidates.slice(0, max);
+}
+
+function createDirectPortListener(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer((socket) => {
+      socket.end();
+    });
+    const onError = (error) => {
+      server.removeListener("error", onError);
+      resolve({
+        port,
+        status: "local_unavailable",
+        reason: String(error?.code || error?.message || "listen_error").slice(0, 64),
+        server: null
+      });
+    };
+
+    server.once("error", onError);
+    server.listen({ host: "0.0.0.0", port, exclusive: true }, () => {
+      server.removeListener("error", onError);
+      resolve({ port, status: "listening", server });
+    });
+  });
+}
+
+function closeDirectPortListener(server) {
+  if (!server) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    server.close(finish);
+    setTimeout(finish, 1000).unref?.();
+  });
+}
+
+async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES) {
+  const normalizedPorts = [...new Set((Array.isArray(ports) ? ports : [])
+    .map((port) => Number.parseInt(String(port), 10))
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535))];
+  if (!normalizedPorts.length) {
+    return { results: [], error: "direct_port_candidates_empty" };
+  }
+
+  const listeners = await Promise.all(normalizedPorts.map((port) => createDirectPortListener(port)));
+  const listeningPorts = listeners.filter((entry) => entry.status === "listening").map((entry) => entry.port);
+  let remoteResults = [];
+
+  try {
+    if (listeningPorts.length > 0) {
+      const response = await postTeamNodeSync(
+        "/api/internal/nodejs-argo/direct-port-probe",
+        { uuid: UUID, ports: listeningPorts },
+        "nodejs_argo_direct_port_probe"
+      );
+      if (!response || response.status !== 200) {
+        throw new Error(`direct_port_probe_rejected_${response?.status || "unknown"}`);
+      }
+      remoteResults = Array.isArray(response.data?.results) ? response.data.results : [];
+    }
+  } catch (error) {
+    return {
+      results: listeners.map((entry) => entry.status === "listening"
+        ? { port: entry.port, status: "unknown", reason: String(error?.message || "probe_error").slice(0, 64) }
+        : { port: entry.port, status: entry.status, reason: entry.reason }),
+      error: String(error?.message || "direct_port_probe_failed").slice(0, 128)
+    };
+  } finally {
+    await Promise.all(listeners.map((entry) => closeDirectPortListener(entry.server)));
+  }
+
+  const remoteByPort = new Map(remoteResults.map((result) => [Number(result?.port), result]));
+  return {
+    results: listeners.map((entry) => entry.status === "listening"
+      ? remoteByPort.get(entry.port) || { port: entry.port, status: "unknown", reason: "probe_result_missing" }
+      : { port: entry.port, status: entry.status, reason: entry.reason })
+  };
+}
+
+function selectDirectFallbackPlan(results) {
+  const byPort = new Map(
+    (Array.isArray(results) ? results : [])
+      .map((result) => [Number(result?.port), result])
+  );
+  const isOpen = (port) => byPort.get(port)?.status === "open";
+  const nginxAvailable = fs.existsSync(NGINX_BIN);
+  const certificatePaths = getDirectCertificatePaths();
+  const tlsAvailable = DIRECT_TLS_ENABLED && nginxAvailable && (
+    fs.existsSync(CERTBOT_BIN)
+    || (fs.existsSync(certificatePaths.certificateFile) && fs.existsSync(certificatePaths.keyFile))
+  );
+
+  if (!nginxAvailable) return null;
+
+  if (tlsAvailable && isOpen(443) && isOpen(80)) {
+    return {
+      tlsEnabled: true,
+      port: 443,
+      httpPort: 80,
+      reason: "https_443_and_http_80"
+    };
+  }
+
+  const resultPorts = (Array.isArray(results) ? results : [])
+    .map((result) => Number(result?.port))
+    .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535);
+  const fallbackOrder = [80, 8080, 8443, 8880, 2053, 2083, 2087, 2096, 443, ...DIRECT_PORT_CANDIDATES, ...resultPorts];
+  const port = [...new Set(fallbackOrder)].find((candidate) => isOpen(candidate));
+  if (!port) return null;
+
+  return {
+    tlsEnabled: false,
+    port,
+    httpPort: port,
+    reason: "http_fallback_port_available"
+  };
+}
+
+async function discoverDirectPortPlan() {
+  const initialProbe = await probeDirectPortCandidates();
+  const allResults = [...initialProbe.results];
+  let plan = selectDirectFallbackPlan(allResults);
+  if (plan) return { plan, results: allResults };
+
+  const scanCandidates = buildDirectPortScanCandidates();
+  let lastError = initialProbe.error || "";
+  for (let index = 0; index < scanCandidates.length; index += DIRECT_PORT_PROBE_BATCH_SIZE) {
+    const batch = scanCandidates.slice(index, index + DIRECT_PORT_PROBE_BATCH_SIZE);
+    const probe = await probeDirectPortCandidates(batch);
+    allResults.push(...probe.results);
+    if (probe.error) lastError = probe.error;
+    plan = selectDirectFallbackPlan(allResults);
+    if (plan) return { plan, results: allResults };
+  }
+
+  return { plan: null, results: allResults, error: lastError || "direct_port_scan_exhausted" };
+}
+
+function writeDirectFallbackEnv(plan) {
+  const envFile = String(NODEJS_ARGO_ENV_FILE || "").trim();
+  if (!envFile) {
+    throw new Error("NODEJS_ARGO_ENV_FILE 未配置，无法持久化直连模式");
+  }
+  const resolvedEnvFile = path.resolve(envFile);
+  if (!fs.existsSync(resolvedEnvFile)) {
+    throw new Error(`环境文件不存在：${resolvedEnvFile}`);
+  }
+
+  const updates = {
+    DIRECT_MODE: "true",
+    DIRECT_TLS_ENABLED: plan.tlsEnabled ? "true" : "false",
+    DIRECT_PORT: String(plan.port),
+    DIRECT_HTTP_PORT: String(plan.httpPort),
+    CFPORT: String(plan.port),
+    CFIP: ARGO_DOMAIN,
+    CF_DNS_ENABLED: CF_API_TOKEN ? "true" : "false",
+    CF_DNS_RECORD_NAME: ARGO_DOMAIN,
+    CF_DNS_REPLACE_CNAME: "true",
+    AUTO_DIRECT_FALLBACK: "false",
+    CF_API_TOKEN,
+    CLOUDFLARE_API_KEY: CF_API_TOKEN
+  };
+  const raw = fs.readFileSync(resolvedEnvFile, "utf8");
+  const lines = raw.split(/\r?\n/);
+  const seen = new Set();
+  const output = lines.map((line) => {
+    const match = /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(line);
+    const key = match?.[1];
+    if (!key || !Object.prototype.hasOwnProperty.call(updates, key)) return line;
+    seen.add(key);
+    return `${key}=${shellQuote(updates[key])}`;
+  });
+
+  for (const [key, value] of Object.entries(updates)) {
+    if (!seen.has(key)) output.push(`${key}=${shellQuote(value)}`);
+  }
+
+  fs.writeFileSync(resolvedEnvFile, `${output.join("\n").replace(/\n+$/, "")}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(resolvedEnvFile, 0o600);
+  } catch {
+    // The installer already owns this file; mode changes are best effort.
+  }
+}
+
+async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
+  if (DIRECT_MODE || PLATFORM_PROXY_MODE || !AUTO_DIRECT_FALLBACK || directFallbackPromise) {
+    return false;
+  }
+
+  if (tunnelConnectivity?.status === "connected") {
+    tunnelFailureStreak = 0;
+    return false;
+  }
+
+  const fallbackReasons = new Set([
+    "port_blocked",
+    "edge_timeout",
+    "edge_request_failed",
+    "tunnel_inactive"
+  ]);
+  if (!fallbackReasons.has(String(tunnelConnectivity?.reason || ""))) {
+    return false;
+  }
+
+  tunnelFailureStreak += 1;
+  const threshold = directFallbackFailureThreshold();
+  if (tunnelFailureStreak < threshold) {
+    console.log(`Cloudflare Tunnel 连续异常 ${tunnelFailureStreak}/${threshold}，暂不切换直连`);
+    return false;
+  }
+
+  if (!CF_API_TOKEN) {
+    console.error("Cloudflare Tunnel 不可用，但未配置 Cloudflare API Token，无法自动更新 ARGO_DOMAIN DNS；保持 Tunnel 模式");
+    return false;
+  }
+  if (!NODEJS_ARGO_ENV_FILE) {
+    console.error("Cloudflare Tunnel 不可用，但未配置 NODEJS_ARGO_ENV_FILE，无法自动持久化直连模式；保持 Tunnel 模式");
+    return false;
+  }
+  if (!TEAMNODE_SYNC_RELAY_TOKEN) {
+    console.error("Cloudflare Tunnel 不可用，但当前 TeamNode 不是 Worker 中继模式，无法由 Worker 探测公网端口；保持 Tunnel 模式");
+    return false;
+  }
+
+  directFallbackPromise = (async () => {
+    const discovery = await discoverDirectPortPlan();
+    const plan = discovery.plan;
+    if (!plan) {
+      throw new Error(`候选端口和扩展扫描均未找到可用直连 TCP 端口${discovery.error ? `：${discovery.error}` : ""}`);
+    }
+
+    writeDirectFallbackEnv(plan);
+    console.warn(
+      `Cloudflare Tunnel 连续异常，已选择直连 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
+      + `${plan.tlsEnabled ? "（证书将申请/续期）" : "（不申请证书）"}，正在重启服务应用新配置`
+    );
+    await stopRuntimeProcesses();
+    await shutdownTeamNodeSync("direct_fallback");
+    setTimeout(() => process.exit(0), 100);
+    return true;
+  })()
+    .catch((error) => {
+      console.error(`自动切换直连失败：${error.message}`);
+      directFallbackPromise = null;
+      return false;
+    });
+
+  return directFallbackPromise;
+}
+
+async function normalizeDirectModePorts() {
+  if (!DIRECT_MODE || !AUTO_DIRECT_FALLBACK || !TEAMNODE_SYNC_RELAY_TOKEN || !NODEJS_ARGO_ENV_FILE) {
+    return false;
+  }
+
+  const discovery = await discoverDirectPortPlan();
+  const plan = discovery.plan;
+  if (!plan) {
+    console.warn(`候选端口和扩展扫描均未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}，继续使用现有配置`);
+    return false;
+  }
+
+  const samePlan = DIRECT_TLS_ENABLED === plan.tlsEnabled
+    && DIRECT_PORT === plan.port
+    && DIRECT_HTTP_PORT === plan.httpPort;
+  if (samePlan) return false;
+
+  writeDirectFallbackEnv(plan);
+  console.warn(
+    `直连启动探测已将配置调整为 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
+    + `${plan.tlsEnabled ? "（443+80 可达，准备证书）" : "（443+80 不同时可达，不申请证书）"}，正在重启服务`
+  );
+  setTimeout(() => process.exit(0), 100);
+  return true;
+}
+
 async function syncNodeToTeamNode(context) {
   if (!isTeamNodeSyncConfigured()) {
     return null;
@@ -727,9 +1106,11 @@ async function syncNodeToTeamNode(context) {
   teamnodeSyncContext = syncContext;
 
   try {
-    return teamnodeSyncRegistered
+    const response = teamnodeSyncRegistered
       ? await syncNodeHeartbeatToTeamNode(syncContext)
       : await syncNodeRegistrationToTeamNode(syncContext);
+    await maybeActivateDirectFallback(syncContext, tunnelConnectivity);
+    return response;
   } catch (error) {
     const status = error?.response?.status ? ` (HTTP ${error.response.status})` : "";
     const message = error?.response?.data?.error || error?.message || "unknown_error";
@@ -738,11 +1119,130 @@ async function syncNodeToTeamNode(context) {
   }
 }
 
+function tunnelTestCommandPollInterval() {
+  return Number.isFinite(TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS)
+    && TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS >= 5000
+    ? Math.min(TEAMNODE_SYNC_COMMAND_POLL_INTERVAL_MS, 60000)
+    : 15000;
+}
+
+async function reportTunnelTestResult(command, tunnelConnectivity, startedAt) {
+  const completedAt = Date.now();
+  const tunnelTest = {
+    commandId: String(command?.commandId || "").slice(0, 128),
+    type: String(command?.type || "cloudflare_tunnel_connectivity").slice(0, 64),
+    status: "completed",
+    requestedAt: Number(command?.requestedAt || completedAt),
+    startedAt,
+    completedAt,
+    updatedAt: completedAt,
+    reason: "node_test_completed"
+  };
+
+  const response = await postTeamNodeSync(
+    TUNNEL_TEST_RESULTS_PATH,
+    { uuid: UUID, tunnelTest, tunnelConnectivity },
+    "nodejs_argo_tunnel_test_result"
+  );
+  if (!response || response.status !== 200) {
+    throw new Error(`tunnel_test_result_rejected_${response?.status || "unknown"}`);
+  }
+  return response.data || null;
+}
+
+async function executeTunnelTestCommand(command) {
+  const startedAt = Date.now();
+  try {
+    const tunnelConnectivity = await checkCloudflareTunnelConnectivity(
+      teamnodeSyncContext?.argoDomain || ARGO_DOMAIN,
+      { force: true }
+    );
+    await reportTunnelTestResult(command, tunnelConnectivity, startedAt);
+    console.log(`本机 7844 连通性检测完成：${tunnelConnectivity.portStatus}；Tunnel=${tunnelConnectivity.status}`);
+  } catch (error) {
+    const completedAt = Date.now();
+    try {
+      await postTeamNodeSync(
+        TUNNEL_TEST_RESULTS_PATH,
+        {
+          uuid: UUID,
+          tunnelTest: {
+            commandId: String(command?.commandId || "").slice(0, 128),
+            type: String(command?.type || "cloudflare_tunnel_connectivity").slice(0, 64),
+            status: "failed",
+            requestedAt: Number(command?.requestedAt || completedAt),
+            startedAt,
+            completedAt,
+            updatedAt: completedAt,
+            reason: "node_test_error"
+          }
+        },
+        "nodejs_argo_tunnel_test_result"
+      );
+    } catch (reportError) {
+      console.error(`本机 7844 检测结果回传失败：${reportError.message}`);
+    }
+    console.error(`本机 7844 连通性检测失败：${error.message}`);
+  }
+}
+
+async function pollTunnelTestCommands() {
+  if (!TEAMNODE_SYNC_RELAY_TOKEN || !teamnodeSyncRegistered || !teamnodeSyncContext || tunnelTestCommandPollPromise) {
+    return null;
+  }
+
+  tunnelTestCommandPollPromise = (async () => {
+    const response = await postTeamNodeSync(
+      TUNNEL_TEST_COMMANDS_PATH,
+      { uuid: UUID },
+      "nodejs_argo_tunnel_test_poll"
+    );
+    const commands = Array.isArray(response?.data?.commands) ? response.data.commands.slice(0, 1) : [];
+    for (const command of commands) {
+      if (String(command?.type || "") !== "cloudflare_tunnel_connectivity") continue;
+      await executeTunnelTestCommand(command);
+    }
+    return commands;
+  })()
+    .catch((error) => {
+      if (error?.response?.status !== 404) {
+        console.error(`本机 7844 检测指令获取失败：${error.message}`);
+      }
+      return null;
+    })
+    .finally(() => {
+      tunnelTestCommandPollPromise = null;
+    });
+
+  return tunnelTestCommandPollPromise;
+}
+
+function stopTunnelTestCommandPollLoop() {
+  if (tunnelTestCommandPollTimer) {
+    clearInterval(tunnelTestCommandPollTimer);
+    tunnelTestCommandPollTimer = null;
+  }
+}
+
+function startTunnelTestCommandPollLoop() {
+  if (!TEAMNODE_SYNC_RELAY_TOKEN || tunnelTestCommandPollTimer) return;
+  stopTunnelTestCommandPollLoop();
+  const intervalMs = tunnelTestCommandPollInterval();
+  tunnelTestCommandPollTimer = setInterval(() => {
+    pollTunnelTestCommands().catch(() => null);
+  }, intervalMs);
+  if (typeof tunnelTestCommandPollTimer.unref === "function") {
+    tunnelTestCommandPollTimer.unref();
+  }
+  pollTunnelTestCommands().catch(() => null);
+}
+
 function stopTeamNodeHeartbeatLoop() {
   if (teamnodeSyncTimer) {
     clearInterval(teamnodeSyncTimer);
     teamnodeSyncTimer = null;
   }
+  stopTunnelTestCommandPollLoop();
 }
 
 function startTeamNodeHeartbeatLoop(context) {
@@ -750,6 +1250,7 @@ function startTeamNodeHeartbeatLoop(context) {
 
   teamnodeSyncContext = context;
   stopTeamNodeHeartbeatLoop();
+  startTunnelTestCommandPollLoop();
 
   const intervalMs = Number.isFinite(TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS) && TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS >= 30000
     ? TEAMNODE_SYNC_HEARTBEAT_INTERVAL_MS
@@ -974,11 +1475,11 @@ function validateDirectMode() {
     throw new Error("DIRECT_PORT 和 DIRECT_HTTP_PORT 必须是 1-65535 之间的端口");
   }
 
-  if (DIRECT_PORT === DIRECT_HTTP_PORT) {
+  if (DIRECT_TLS_ENABLED && DIRECT_PORT === DIRECT_HTTP_PORT) {
     throw new Error("DIRECT_PORT 和 DIRECT_HTTP_PORT 不能使用同一个端口");
   }
 
-  if (Boolean(DIRECT_CERT_FILE) !== Boolean(DIRECT_KEY_FILE)) {
+  if (DIRECT_TLS_ENABLED && Boolean(DIRECT_CERT_FILE) !== Boolean(DIRECT_KEY_FILE)) {
     throw new Error("DIRECT_CERT_FILE 和 DIRECT_KEY_FILE 必须同时配置，或同时留空");
   }
 }
@@ -1013,13 +1514,87 @@ function getDirectCertificatePaths() {
   }
 
   return {
-    certificateFile: path.join("/etc/letsencrypt/live", ARGO_DOMAIN, "fullchain.pem"),
-    keyFile: path.join("/etc/letsencrypt/live", ARGO_DOMAIN, "privkey.pem"),
+    certificateFile: path.join(FILE_PATH, "letsencrypt", "live", ARGO_DOMAIN, "fullchain.pem"),
+    keyFile: path.join(FILE_PATH, "letsencrypt", "live", ARGO_DOMAIN, "privkey.pem"),
     managedByCertbot: true
   };
 }
 
-function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly = false } = {}) {
+function buildDirectHttpOnlyNginxConfig() {
+  const domain = String(ARGO_DOMAIN).trim();
+  const runtimePidPath = path.resolve(directNginxPidPath);
+  const accessLogPath = path.resolve(directNginxAccessLogPath);
+  const errorLogPath = path.resolve(directNginxErrorLogPath);
+  const proxyHeaders = [
+    "proxy_http_version 1.1;",
+    "proxy_set_header Upgrade $http_upgrade;",
+    "proxy_set_header Connection $connection_upgrade;",
+    "proxy_set_header Host $host;",
+    "proxy_set_header X-Real-IP $remote_addr;",
+    "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
+    "proxy_set_header X-Forwarded-Proto $scheme;",
+    "proxy_connect_timeout 10s;",
+    "proxy_read_timeout 86400s;",
+    "proxy_send_timeout 86400s;",
+    "proxy_buffering off;",
+    "proxy_request_buffering off;",
+    "proxy_socket_keepalive on;"
+  ];
+  const lines = [
+    "worker_processes auto;",
+    "worker_rlimit_nofile 65535;",
+    "pid " + nginxConfigValue(runtimePidPath) + ";",
+    "error_log " + nginxConfigValue(errorLogPath) + " " + NGINX_LOG_LEVEL + ";",
+    "events {",
+    "  worker_connections 4096;",
+    "}",
+    "http {",
+    "  include /etc/nginx/mime.types;",
+    "  default_type application/octet-stream;",
+    "  sendfile on;",
+    "  tcp_nodelay on;",
+    "  keepalive_timeout 65s;",
+    "  map $http_upgrade $connection_upgrade {",
+    "    default upgrade;",
+    "    '' close;",
+    "  }",
+    DIRECT_NGINX_ACCESS_LOG_ENABLED
+      ? "  access_log " + nginxConfigValue(accessLogPath) + " combined;"
+      : "  access_log off;",
+    "",
+    "  server {",
+    "    listen " + DIRECT_PORT + ";",
+    "    server_name " + domain + ";",
+    "",
+    "    location = /vless-argo {",
+    "      proxy_pass http://127.0.0.1:3002;",
+    ...proxyHeaders.map((line) => "      " + line),
+    "    }",
+    "",
+    "    location = /vmess-argo {",
+    "      proxy_pass http://127.0.0.1:3003;",
+    ...proxyHeaders.map((line) => "      " + line),
+    "    }",
+    "",
+    "    location = /trojan-argo {",
+    "      proxy_pass http://127.0.0.1:3004;",
+    ...proxyHeaders.map((line) => "      " + line),
+    "    }",
+    "",
+    "    location / {",
+    "      proxy_pass http://127.0.0.1:3000;",
+    ...proxyHeaders.map((line) => "      " + line),
+    "    }",
+    "  }",
+    "}"
+  ];
+  return lines.join("\n") + "\n";
+}
+
+function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly = false, tlsEnabled = DIRECT_TLS_ENABLED } = {}) {
+  if (!httpOnly && !tlsEnabled) {
+    return buildDirectHttpOnlyNginxConfig();
+  }
   const domain = String(ARGO_DOMAIN).trim();
   const runtimePidPath = path.resolve(directNginxPidPath);
   const runtimeAcmePath = path.resolve(directAcmePath);
@@ -1164,6 +1739,12 @@ async function ensureDirectCertificate() {
       "--webroot",
       "--webroot-path",
       webroot,
+      "--config-dir",
+      path.join(FILE_PATH, "letsencrypt"),
+      "--work-dir",
+      path.join(FILE_PATH, "letsencrypt-work"),
+      "--logs-dir",
+      path.join(FILE_PATH, "letsencrypt-logs"),
       "--domain",
       ARGO_DOMAIN,
       "--email",
@@ -1192,7 +1773,12 @@ function startDirectCertificateRenewal() {
 
   directCertificateRenewalTimer = setInterval(async () => {
     try {
-      await exec(`${shellQuote(CERTBOT_BIN)} renew --quiet`);
+      await exec(
+        `${shellQuote(CERTBOT_BIN)} renew --quiet`
+        + ` --config-dir ${shellQuote(path.join(FILE_PATH, "letsencrypt"))}`
+        + ` --work-dir ${shellQuote(path.join(FILE_PATH, "letsencrypt-work"))}`
+        + ` --logs-dir ${shellQuote(path.join(FILE_PATH, "letsencrypt-logs"))}`
+      );
       await exec(`${shellQuote(NGINX_BIN)} -c ${shellQuote(path.resolve(directNginxConfigPath))} -s reload`);
       console.log("直连模式证书续期检查完成，Nginx 已重新加载");
     } catch (error) {
@@ -1359,6 +1945,13 @@ function startCloudflareDnsSyncLoop() {
 
 async function startDirectGateway() {
   validateDirectMode();
+  await stopDirectNginx();
+  if (!DIRECT_TLS_ENABLED) {
+    writeDirectNginxConfig({ tlsEnabled: false });
+    await startNginx();
+    console.log(`直连 HTTP 模式已启动：${ARGO_DOMAIN}:${DIRECT_PORT}`);
+    return;
+  }
   const certificate = await ensureDirectCertificate();
   writeDirectNginxConfig(certificate);
   await startNginx();
@@ -1500,6 +2093,29 @@ function buildCloudflaredArgs() {
   return `tunnel --edge-ip-version auto --autoupdate-freq 24h --protocol ${getCloudflaredProtocol()} --logfile ${shellQuote(bootLogPath)} --loglevel info --url ${shellQuote(`http://${ARGO_GATEWAY_HOST}:${ARGO_PORT}`)}`;
 }
 
+function backgroundPidFromOutput(stdout) {
+  const candidates = String(stdout || "").trim().split(/\s+/).reverse();
+  const pid = candidates.find((value) => /^[0-9]+$/.test(value));
+  return pid ? Number.parseInt(pid, 10) : null;
+}
+
+function stopProcessByPid(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return;
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // The child may have already exited or been reaped by the supervisor.
+  }
+}
+
+async function stopRuntimeProcesses() {
+  stopProcessByPid(cloudflaredProcessId);
+  stopProcessByPid(xrayProcessId);
+  cloudflaredProcessId = null;
+  xrayProcessId = null;
+  await new Promise((resolve) => setTimeout(resolve, 250));
+}
+
 // 启动 Xray、cloudflared
 async function startProcesses() {
   try {
@@ -1514,7 +2130,8 @@ async function startProcesses() {
   }
 
   try {
-    await exec(`nohup ${shellQuote(webPath)} -c ${shellQuote(configPath)} >>${shellQuote(xrayBootLogPath)} 2>&1 &`);
+    const xrayResult = await exec(`nohup ${shellQuote(webPath)} -c ${shellQuote(configPath)} >>${shellQuote(xrayBootLogPath)} 2>&1 & echo $!`);
+    xrayProcessId = backgroundPidFromOutput(xrayResult.stdout);
     console.log(`${webName} 已启动`);
     await new Promise((resolve) => setTimeout(resolve, 1000));
   } catch (error) {
@@ -1544,7 +2161,8 @@ async function startProcesses() {
   } else {
     try {
       const args = buildCloudflaredArgs();
-      await exec(`nohup ${shellQuote(botPath)} ${args} >>${shellQuote(cloudflaredBootLogPath)} 2>&1 &`);
+      const cloudflaredResult = await exec(`nohup ${shellQuote(botPath)} ${args} >>${shellQuote(cloudflaredBootLogPath)} 2>&1 & echo $!`);
+      cloudflaredProcessId = backgroundPidFromOutput(cloudflaredResult.stdout);
       console.log(`${botName} 已启动`);
       await new Promise((resolve) => setTimeout(resolve, 2000));
     } catch (error) {
@@ -1723,6 +2341,7 @@ async function generateLinks(argoDomain) {
   const nodeName = ipRiskSuffix ? `${baseNodeName}-${ipRiskSuffix}` : baseNodeName;
   const nodeAddress = DIRECT_MODE || PLATFORM_PROXY_MODE ? ARGO_DOMAIN : CFIP;
   const nodePort = DIRECT_MODE ? DIRECT_PORT : PLATFORM_PROXY_MODE ? PLATFORM_PUBLIC_PORT : CFPORT;
+  const linkTlsEnabled = !DIRECT_MODE || PLATFORM_PROXY_MODE || DIRECT_TLS_ENABLED;
 
   return new Promise((resolve) => {
     setTimeout(() => {
@@ -1738,16 +2357,20 @@ async function generateLinks(argoDomain) {
         type: "none",
         host: argoDomain,
         path: "/vmess-argo?ed=2560",
-        tls: "tls",
-        sni: argoDomain,
+        tls: linkTlsEnabled ? "tls" : "",
+        sni: linkTlsEnabled ? argoDomain : "",
         alpn: "",
         fp: "firefox"
       };
 
       const protocolNodes = [
-        `vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}`,
+        linkTlsEnabled
+          ? `vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}`
+          : `vless://${UUID}@${nodeAddress}:${nodePort}?encryption=none&security=none&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${nodeName}`,
         `vmess://${Buffer.from(JSON.stringify(VMESS)).toString("base64")}`,
-        `trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}`
+        linkTlsEnabled
+          ? `trojan://${UUID}@${nodeAddress}:${nodePort}?security=tls&sni=${argoDomain}&fp=firefox&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}`
+          : `trojan://${UUID}@${nodeAddress}:${nodePort}?security=none&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${nodeName}`
       ];
       const subTxt = `\n${protocolNodes.join("\n\n")}\n`;
       console.log("已生成 3 种协议节点：VLESS、VMess、Trojan");
@@ -1886,6 +2509,7 @@ async function startserver() {
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();
+    if (await normalizeDirectModePorts()) return;
     await syncCloudflareDnsRecord();
     startCloudflareDnsSyncLoop();
     deleteNodes();
@@ -1908,6 +2532,8 @@ function handleProcessShutdownSignal(signal) {
   processShutdownRequested = true;
   shutdownTeamNodeSync(`signal_${String(signal || "shutdown").toLowerCase()}`)
     .catch(() => null)
+    .then(() => stopRuntimeProcesses())
+    .then(() => DIRECT_MODE ? stopDirectNginx().catch(() => null) : null)
     .finally(() => {
       process.exit(0);
     });
