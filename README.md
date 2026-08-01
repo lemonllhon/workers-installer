@@ -6,7 +6,7 @@ Worker 不运行节点程序，只负责：
 
 - 提供经过动态校验的 `install.sh`；
 - 提供 `/agent/index.js` 源码下载；
-- 代理 TeamNode 注册、心跳和下线请求；
+- 代理健康节点的 TeamNode 注册、心跳和下线请求；公网路线异常的节点只记录在本地监控面板，不转发到上游；
 - 在用户输入兑换密码后，为每台机器签发专属中继令牌。
 
 目标机器运行的程序包含三种 WebSocket 协议：VLESS、VMess、Trojan，并通过 Cloudflare Tunnel 对外提供固定域名访问。
@@ -132,7 +132,11 @@ https://install.lemon.vin/install.sh
 https://你的-worker.workers.dev/
 ```
 
-未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板会分别显示可用的公网 IPv4、IPv6，以及节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，并显示节点实际上报的 Cloudflare Tunnel 连通性、传输协议、所需端口、HTTP 状态码、失败原因和最后检查时间；不显示 UUID 或其他敏感配置。Tunnel 连通性由节点先探测 Cloudflare Tunnel 传输端口，再访问 `ARGO_DOMAIN` 检查边缘返回，不把 TeamNode 心跳直接当作 Tunnel 在线。当前 HTTP/2 配置通常显示需要放行出站 TCP `7844`；QUIC 显示 UDP `7844`；自动协议显示 TCP/UDP `7844`。只有 Worker 成功转发 TeamNode 注册或心跳后，机器才会进入列表；累计心跳少于 5 次的节点，在明确下线或 Worker 确认其超过心跳检测阈值后直接删除，不进入超时/离线保留流程。累计达到 5 次心跳的节点，明确下线后的前 5 分钟显示“超时”，第 5–10 分钟显示“离线”，超过 10 分钟后自动删除。没有明确下线通知的节点，Worker 会在下一次轮询发现其超过 5 分钟没有心跳时显示“离线”，并在最后一次活动超过 10 分钟后自动删除；恢复心跳后自动回到“在线”。Worker 不会主动替节点生成心跳，只有通过中继令牌认证且成功转发到 TeamNode 的节点请求才会更新面板状态。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整心跳阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
+未设置 `DASHBOARD_PASSWORD` 时，面板和 `/api/nodes` 都可以被任何人查看，不需要登录。面板会分别显示可用的公网 IPv4、IPv6，以及节点名称、`ARGO_DOMAIN`、地区、Provider、最后心跳时间、操作系统、系统架构、CPU 和内存总量，并显示节点实际上报的 Cloudflare Tunnel/直连公网路线、传输协议、所需端口、HTTP 状态码、失败原因和最后检查时间；不显示 UUID 或其他敏感配置。Tunnel 连通性由节点先探测 Cloudflare Tunnel 传输端口，再访问 `ARGO_DOMAIN` 检查边缘返回，不把 TeamNode 心跳直接当作 Tunnel 在线。当前 HTTP/2 配置通常显示需要放行出站 TCP `7844`；QUIC 显示 UDP `7844`；自动协议显示 TCP/UDP `7844`。
+
+节点筛选包含“全部、在线、异常、超时、离线”五类，并且“在线”与“异常”互斥。“异常”表示节点仍在向本地 Worker 发送心跳，但当前 Cloudflare Tunnel 或直连公网路线已被明确判定为不可用；这类注册、心跳和下线请求只写入本 Worker 的 Durable Object，Worker 不会向 `teamnode.lemon.vin` 发起对应请求，因此异常节点不会产生新的 TeamNode 上游推送。路线恢复后，下一次正常心跳会自动恢复上游同步；如果 TeamNode 已将旧记录移除，节点会按现有 404 处理自动重新注册。
+
+通过中继令牌认证的正常或异常节点都可以更新本地面板。累计心跳少于 5 次的节点，在明确下线或 Worker 确认其超过心跳检测阈值后直接删除，不进入超时/离线保留流程。累计达到 5 次心跳的节点，明确下线后的前 5 分钟显示“超时”，第 5–10 分钟显示“离线”，超过 10 分钟后自动删除。没有明确下线通知的节点，Worker 会在下一次轮询发现其超过 5 分钟没有心跳时显示“离线”，并在最后一次活动超过 10 分钟后自动删除；恢复心跳后根据公网路线结果回到“在线”或“异常”。Worker 不会主动替节点生成心跳。可用 Worker 变量 `TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 调整心跳阈值；可用 `TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 调整自动删除时间，但必须不小于 30 秒。
 
 如果以后设置了 `DASHBOARD_PASSWORD`，根页面和 `/api/nodes` 会启用 Basic Auth，默认用户名为 `admin`。
 
@@ -483,6 +487,8 @@ grep -Ei 'TeamNode|注册|心跳|同步|relay|失败|error' \
 TeamNode 注册成功
 TeamNode 心跳成功
 ```
+
+如果公网路线异常，则会改为出现“状态仅保存到本地监控面板，未向 TeamNode 推送”或“心跳仅更新本地监控面板，未向 TeamNode 推送”；这是预期的隔离行为。
 
 也可以检查本机 Node.js 服务和订阅内容：
 

@@ -188,6 +188,14 @@ function normalizeTunnelConnectivity(value) {
   };
 }
 
+function isRouteAbnormal(value) {
+  const info = normalizeTunnelConnectivity(value);
+  if (!info) return false;
+  if (info.publicProbeStatus === "blocked") return true;
+  if (info.mode === "direct") return info.status === "offline";
+  return ["offline", "degraded"].includes(info.status) || info.portStatus === "blocked";
+}
+
 function normalizeTunnelTest(value) {
   if (!value || typeof value !== "object") return null;
 
@@ -251,7 +259,7 @@ function heartbeatTimeoutMs(env) {
     : Math.min(DEFAULT_HEARTBEAT_TIMEOUT_MS, onlineTtlMs(env));
 }
 
-async function recordNodeEvent(request, env, payload, eventPath) {
+async function recordNodeEvent(request, env, payload, eventPath, { upstreamForwarded = true } = {}) {
   const stub = getRegistryStub(env);
   if (!stub) return;
 
@@ -280,6 +288,8 @@ async function recordNodeEvent(request, env, payload, eventPath) {
     runtimeStatus: String(payload?.runtimeStatus || "").slice(0, 32),
     runtimeInfo: normalizeRuntimeInfo(payload?.runtimeInfo),
     tunnelConnectivity: normalizeTunnelConnectivity(payload?.tunnelConnectivity),
+    upstreamForwarded,
+    upstreamSuppressedReason: upstreamForwarded ? null : "route_abnormal",
     contentIncluded: Boolean(payload?.contentBase64),
     updatedAt: Date.now()
   };
@@ -408,6 +418,10 @@ function decorateNodeStatus(nodes, env) {
         && ["queued", "running"].includes(tunnelTest.status)
         && now - Number(tunnelTest.requestedAt || now) > TUNNEL_TEST_QUEUE_TTL_MS;
       const addresses = nodeIpAddresses(node);
+      const online = isActiveRecord
+        && hasLastSeen
+        && inactivityAge <= timeout;
+      const abnormal = online && isRouteAbnormal(node.tunnelConnectivity);
       return {
         ...node,
         sourceIpv4: addresses.ipv4 || null,
@@ -417,16 +431,15 @@ function decorateNodeStatus(nodes, env) {
           : {}),
         stopped: isOffline,
         offline: withinTtl && inactivityAge > timeout,
-        online: isActiveRecord
-          && hasLastSeen
-          && inactivityAge <= timeout,
+        online,
+        abnormal,
         timedOut: withinTtl
           && inactivityAge <= timeout
           && isOffline
       };
     })
     .sort((left, right) => {
-      const statusRank = (node) => node.online ? 0 : node.timedOut ? 1 : node.offline ? 2 : 3;
+      const statusRank = (node) => node.online && !node.abnormal ? 0 : node.abnormal ? 1 : node.timedOut ? 2 : node.offline ? 3 : 4;
       if (statusRank(left) !== statusRank(right)) return statusRank(left) - statusRank(right);
       return Number(right.lastSeen || right.lastEventAt || 0) - Number(left.lastSeen || left.lastEventAt || 0);
     });
@@ -687,6 +700,10 @@ function nodeAddressMarkup(node) {
     : "<strong>-</strong>";
 }
 
+function cloudflareRouteLabel(node) {
+  return node?.tunnelConnectivity?.mode === "direct" ? "Cloudflare" : "Cloudflare Tunnel 模式";
+}
+
 function tunnelConnectivityMarkup(node) {
   const view = tunnelConnectivityView(node);
   const uuid = safeNodeId(node?.uuid);
@@ -708,34 +725,43 @@ async function dashboardPageResponse(request, env) {
   try {
     const nodes = decorateNodeStatus(await listNodeEvents(env) || [], env)
       .filter((node) => node.online || node.timedOut || node.offline);
-    const onlineCount = nodes.filter((node) => node.online).length;
+    const heartbeatOnlineCount = nodes.filter((node) => node.online).length;
+    const abnormalCount = nodes.filter((node) => node.abnormal).length;
+    const onlineCount = nodes.filter((node) => node.online && !node.abnormal).length;
     const timedOutCount = nodes.filter((node) => node.timedOut).length;
     const offlineCount = nodes.filter((node) => node.offline).length;
     const tunnelConnectedCount = nodes.filter((node) => node.tunnelConnectivity?.status === "connected").length;
     const directModeCount = nodes.filter((node) => node.tunnelConnectivity?.mode === "direct").length;
-    const tunnelProblemCount = nodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status)).length;
+    const tunnelModeCount = nodes.filter((node) => node.tunnelConnectivity?.mode !== "direct").length;
+    const tunnelProblemCount = abnormalCount;
     const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status))).length;
     const visibleCount = nodes.length;
     const timeoutMinutes = Math.max(1, Math.round(heartbeatTimeoutMs(env) / 60000));
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
-    const hasAttention = timedOutCount > 0 || offlineCount > 0;
+    const heartbeatAttention = timedOutCount > 0 || offlineCount > 0;
+    const hasAttention = heartbeatAttention || abnormalCount > 0;
     const isOperational = onlineCount > 0 && !hasAttention;
+    const issueSummary = [
+      abnormalCount > 0 ? `${abnormalCount} 台机器路线异常` : "",
+      timedOutCount > 0 ? `${timedOutCount} 台机器超时` : "",
+      offlineCount > 0 ? `${offlineCount} 台机器离线` : ""
+    ].filter(Boolean).join("，");
     const overviewLabel = hasAttention
       ? "部分节点状态异常"
       : isOperational ? "全部系统运行正常" : "暂无在线机器";
     const overviewDetail = hasAttention
-      ? String(offlineCount) + " 台机器离线，" + String(timedOutCount) + " 台机器超时；超过 " + String(ttlMinutes) + " 分钟未恢复后自动移除。"
+      ? issueSummary + "；超过 " + String(ttlMinutes) + " 分钟未恢复心跳的节点会自动移除。"
       : isOperational
         ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(timeoutMinutes) + " 分钟内保持在线。"
         : "等待机器发送心跳；超过 " + String(timeoutMinutes) + " 分钟后标记为超时，总计 " + String(ttlMinutes) + " 分钟后自动移出列表。";
     const overviewClass = isOperational ? "operational" : hasAttention ? "attention" : "waiting";
-    const heartbeatDescription = hasAttention
+    const heartbeatDescription = heartbeatAttention
       ? String(offlineCount) + " 台离线，" + String(timedOutCount) + " 台超时，恢复后会自动变绿"
-      : onlineCount > 0 ? String(onlineCount) + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
-    const heartbeatState = hasAttention ? "有异常" : onlineCount > 0 ? "正常" : "等待中";
+      : heartbeatOnlineCount > 0 ? String(heartbeatOnlineCount) + " 台机器正在向本地面板上报状态" : "当前没有收到在线机器的心跳";
+    const heartbeatState = heartbeatAttention ? "有异常" : heartbeatOnlineCount > 0 ? "正常" : "等待中";
     const heartbeatStateClass = heartbeatState === "正常" ? "operational" : heartbeatState === "等待中" ? "waiting" : "attention";
     const nodeDescription = hasAttention
-      ? String(offlineCount + timedOutCount) + " 台节点暂时不可用，恢复后会自动变绿"
+      ? issueSummary + "，异常节点不会推送到 TeamNode"
       : onlineCount > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
     const nodeState = hasAttention ? "部分异常" : onlineCount > 0 ? "正常" : "等待中";
     const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
@@ -749,18 +775,23 @@ async function dashboardPageResponse(request, env) {
       ? tunnelPortRequirement(nodes[0].tunnelConnectivity || {})
       : "TCP/UDP 7844";
     const tunnelDescription = tunnelProblemCount > 0
-      ? `${tunnelProblemCount} 台 Tunnel 未正常连接；请放行出站 ${tunnelPortText}。`
+      ? `${tunnelProblemCount} 台机器公网路线异常，已停止向 TeamNode 推送。`
       : directModeCount > 0
         ? `${directModeCount} 台机器已使用直连模式；Cloudflare Tunnel 不再参与转发。`
       : tunnelConnectedCount > 0
         ? `${tunnelConnectedCount} 台 Tunnel 已连接；端口状态随节点心跳更新。`
         : `等待节点上报 Tunnel 连通性；需要放行出站 ${tunnelPortText}。`;
+    const cloudflareServiceName = directModeCount > 0 && tunnelModeCount === 0
+      ? "Cloudflare 直连模式"
+      : directModeCount > 0 && tunnelModeCount > 0
+        ? "Cloudflare 混合模式"
+        : "Cloudflare Tunnel 模式";
     const rows = nodes.length > 0
       ? nodes.map((node) => {
         const runtime = runtimeSummary(node);
-        const nodeStatusClass = node.online ? "online" : node.timedOut ? "timed-out" : "offline";
-        const nodeStatusLabel = node.online ? "在线" : node.offline ? "离线" : node.timedOut ? "超时" : "未知";
-        const nodeBadgeClass = node.online ? "online" : node.offline ? "offline" : "timed-out";
+        const nodeStatusClass = node.abnormal ? "abnormal" : node.online ? "online" : node.timedOut ? "timed-out" : "offline";
+        const nodeStatusLabel = node.abnormal ? "异常" : node.online ? "在线" : node.offline ? "离线" : node.timedOut ? "超时" : "未知";
+        const nodeBadgeClass = node.abnormal ? "abnormal" : node.online ? "online" : node.offline ? "offline" : "timed-out";
         return `
         <article class="node-row node-row-${nodeStatusClass}">
           <div class="node-row-header">
@@ -779,7 +810,7 @@ async function dashboardPageResponse(request, env) {
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
             <div><span>系统架构</span><strong>${htmlEscape(runtime.arch)}</strong></div>
             <div><span>CPU / 内存</span><strong>${htmlEscape(runtime.resources)}</strong></div>
-            <div class="tunnel-row"><span>Cloudflare Tunnel</span>${tunnelConnectivityMarkup(node)}</div>
+            <div class="tunnel-row"><span>${cloudflareRouteLabel(node)}</span>${tunnelConnectivityMarkup(node)}</div>
           </div>
         </article>`;
       }).join("")
@@ -877,10 +908,12 @@ async function dashboardPageResponse(request, env) {
     .node-row > * { position: relative; z-index: 1; }
     .node-row::after { position: absolute; z-index: 0; inset: 0; box-sizing: border-box; padding: 2px; border-radius: inherit; clip-path: inset(0 0 0 5px); content: ""; pointer-events: none; background: conic-gradient(from var(--node-border-angle), transparent 0deg 300deg, var(--node-border-runner) 320deg 350deg, transparent 360deg); -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); mask-composite: exclude; opacity: .78; animation: node-border-run 4.5s linear infinite; }
     .node-row-online { --node-border-runner: #22a652; border-color: #bfe8ce; border-left-color: #22a652; }
+    .node-row-abnormal { --node-border-runner: #d59b16; border-color: #f1d28b; border-left-color: #d59b16; }
     .node-row-timed-out { --node-border-runner: #e05252; border-color: #f0caca; border-left-color: #e05252; }
     .node-row-offline { --node-border-runner: #9ca3af; border-color: #d9dde2; border-left-color: #9ca3af; }
     .node-cards .node-row { padding: 15px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
     .node-cards .node-row.node-row-online { border-color: #bfe8ce; border-left-color: #22a652; }
+    .node-cards .node-row.node-row-abnormal { border-color: #f1d28b; border-left-color: #d59b16; }
     .node-cards .node-row.node-row-timed-out { border-color: #f0caca; border-left-color: #e05252; }
     .node-cards .node-row.node-row-offline { border-color: #d9dde2; border-left-color: #9ca3af; }
     .node-cards .node-row-header { display: grid; gap: 12px; }
@@ -937,6 +970,8 @@ async function dashboardPageResponse(request, env) {
     .badge.offline::before { background: #9ca3af; }
     .badge.timed-out { color: #b42318; }
     .badge.timed-out::before { background: #e05252; }
+    .badge.abnormal { color: var(--amber); }
+    .badge.abnormal::before { background: #d59b16; }
     .empty { padding: 34px; text-align: center; color: var(--muted); }
     .footer { margin: 18px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
     @media (max-width: 1180px) and (min-width: 641px) {
@@ -1007,7 +1042,7 @@ async function dashboardPageResponse(request, env) {
             <div class="service-main"><span id="node-state" class="service-state ${nodeStateClass}">${nodeState}</span><span class="service-copy"><span class="service-name">节点连接</span><span class="service-description" id="node-description">${nodeDescription}</span></span></div>
           </div>
           <div class="service-row">
-            <div class="service-main"><span id="tunnel-state" class="service-state ${tunnelStateClass}">${tunnelState}</span><span class="service-copy"><span class="service-name">Cloudflare Tunnel</span><span class="service-description" id="tunnel-description">${tunnelDescription}</span></span></div>
+            <div class="service-main"><span id="tunnel-state" class="service-state ${tunnelStateClass}">${tunnelState}</span><span class="service-copy"><span class="service-name" id="cloudflare-service-name">${cloudflareServiceName}</span><span class="service-description" id="tunnel-description">${tunnelDescription}</span></span></div>
           </div>
           <div class="service-row">
             <div class="service-main"><span class="service-state operational">正常</span><span class="service-copy"><span class="service-name">监控面板</span><span class="service-description">Worker API 和节点列表可用</span></span></div>
@@ -1031,6 +1066,7 @@ async function dashboardPageResponse(request, env) {
           <div id="node-filter-status" class="filter-status" role="group" aria-label="状态筛选">
             <button class="filter-status-option" type="button" data-status="all" aria-pressed="true">全部</button>
             <button class="filter-status-option" type="button" data-status="online" aria-pressed="false">在线</button>
+            <button class="filter-status-option" type="button" data-status="abnormal" aria-pressed="false">异常</button>
             <button class="filter-status-option" type="button" data-status="timedOut" aria-pressed="false">超时</button>
             <button class="filter-status-option" type="button" data-status="offline" aria-pressed="false">离线</button>
           </div>
@@ -1067,6 +1103,7 @@ async function dashboardPageResponse(request, env) {
       const nodeStateElement = document.getElementById("node-state");
       const tunnelDescriptionElement = document.getElementById("tunnel-description");
       const tunnelStateElement = document.getElementById("tunnel-state");
+      const cloudflareServiceNameElement = document.getElementById("cloudflare-service-name");
       const lastUpdatedElement = document.getElementById("last-updated");
       const statusElement = document.getElementById("dashboard-status");
       let refreshing = false;
@@ -1222,6 +1259,10 @@ async function dashboardPageResponse(request, env) {
           : '<strong>-</strong>';
       }
 
+      function renderCloudflareRouteLabel(node) {
+        return node?.tunnelConnectivity?.mode === "direct" ? "Cloudflare" : "Cloudflare Tunnel 模式";
+      }
+
       function tunnelPortRequirement(info) {
         const protocols = Array.isArray(info?.requiredProtocols) && info.requiredProtocols.length > 0
           ? info.requiredProtocols.join("/")
@@ -1365,7 +1406,7 @@ async function dashboardPageResponse(request, env) {
       }
 
       function setStatusFilter(status) {
-        selectedStatus = ["all", "online", "timedOut", "offline"].includes(status) ? status : "all";
+        selectedStatus = ["all", "online", "abnormal", "timedOut", "offline"].includes(status) ? status : "all";
         filterStatusElement.querySelectorAll("[data-status]").forEach((button) => {
           button.setAttribute("aria-pressed", String(button.dataset.status === selectedStatus));
         });
@@ -1381,7 +1422,8 @@ async function dashboardPageResponse(request, env) {
       function filteredNodes() {
         const query = filterSearchElement.value.trim().toLowerCase();
         return currentNodes.filter((node) => {
-          if (selectedStatus === "online" && !node.online) return false;
+          if (selectedStatus === "online" && (!node.online || node.abnormal)) return false;
+          if (selectedStatus === "abnormal" && !node.abnormal) return false;
           if (selectedStatus === "timedOut" && !node.timedOut) return false;
           if (selectedStatus === "offline" && !node.offline) return false;
           return fuzzySearchMatch(nodeSearchText(node), query);
@@ -1459,9 +1501,9 @@ async function dashboardPageResponse(request, env) {
         }
 
         return nodes.map((node) => {
-          const status = node.online ? "在线" : node.offline ? "离线" : node.timedOut ? "超时" : "未知";
-          const statusClass = node.online ? "online" : node.offline ? "offline" : "timed-out";
-          const nodeStatusClass = node.online ? "online" : node.timedOut ? "timed-out" : "offline";
+          const status = node.abnormal ? "异常" : node.online ? "在线" : node.offline ? "离线" : node.timedOut ? "超时" : "未知";
+          const statusClass = node.abnormal ? "abnormal" : node.online ? "online" : node.offline ? "offline" : "timed-out";
+          const nodeStatusClass = node.abnormal ? "abnormal" : node.online ? "online" : node.timedOut ? "timed-out" : "offline";
           const runtime = runtimeSummary(node);
           const heartbeatLimit = selectedView === "cards" ? 24 : 72;
           const heartbeatWindowMinutes = Math.max(1, Math.round((Number(window.__onlineTtlMs || 600000) / 60000) * heartbeatLimit / 72));
@@ -1479,7 +1521,7 @@ async function dashboardPageResponse(request, env) {
             + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
             + '<div><span>系统架构</span><strong>' + escapeHtml(runtime.arch) + '</strong></div>'
             + '<div><span>CPU / 内存</span><strong>' + escapeHtml(runtime.resources) + '</strong></div>'
-            + '<div class="tunnel-row"><span>Cloudflare Tunnel</span>' + renderTunnelConnectivity(node) + '</div>'
+            + '<div class="tunnel-row"><span>' + escapeHtml(renderCloudflareRouteLabel(node)) + '</span>' + renderTunnelConnectivity(node) + '</div>'
             + '</div></article>';
         }).join("");
       }
@@ -1499,20 +1541,29 @@ async function dashboardPageResponse(request, env) {
           if (!data || !Array.isArray(data.nodes)) throw new Error("invalid_dashboard_response");
 
           const visibleNodes = data.nodes.filter((node) => node && (node.online || node.timedOut || node.offline));
-          const onlineNodes = visibleNodes.filter((node) => node.online);
+          const heartbeatOnlineNodes = visibleNodes.filter((node) => node.online);
+          const abnormalNodes = visibleNodes.filter((node) => node.abnormal);
+          const onlineNodes = visibleNodes.filter((node) => node.online && !node.abnormal);
           const timedOutNodes = visibleNodes.filter((node) => node.timedOut);
           const offlineNodes = visibleNodes.filter((node) => node.offline);
           const tunnelConnectedNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.status === "connected");
           const directModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode === "direct");
-          const tunnelProblemNodes = visibleNodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status));
+          const tunnelModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode !== "direct");
+          const tunnelProblemNodes = abnormalNodes;
           const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)));
           const tunnelPortText = visibleNodes.length > 0
             ? tunnelPortRequirement(visibleNodes[0].tunnelConnectivity || {})
             : "TCP/UDP 7844";
           const timeoutMinutes = Math.max(1, Math.round(Number(data.heartbeatTimeoutMs || 300000) / 60000));
           const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
-          const hasAttention = timedOutNodes.length > 0 || offlineNodes.length > 0;
+          const heartbeatAttention = timedOutNodes.length > 0 || offlineNodes.length > 0;
+          const hasAttention = heartbeatAttention || abnormalNodes.length > 0;
           const operational = onlineNodes.length > 0 && !hasAttention;
+          const issueSummary = [
+            abnormalNodes.length > 0 ? abnormalNodes.length + " 台机器路线异常" : "",
+            timedOutNodes.length > 0 ? timedOutNodes.length + " 台机器超时" : "",
+            offlineNodes.length > 0 ? offlineNodes.length + " 台机器离线" : ""
+          ].filter(Boolean).join("，");
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
           currentNodes = visibleNodes;
           renderFilteredNodes();
@@ -1522,18 +1573,18 @@ async function dashboardPageResponse(request, env) {
             ? "部分节点状态异常"
             : operational ? "全部系统运行正常" : "暂无在线机器";
           overviewDetailElement.textContent = hasAttention
-            ? offlineNodes.length + " 台机器离线，" + timedOutNodes.length + " 台机器超时；超过 " + ttlMinutes + " 分钟未恢复后自动移除。"
+            ? issueSummary + "；超过 " + ttlMinutes + " 分钟未恢复心跳的节点会自动移除。"
             : operational
               ? onlineNodes.length + " 台机器正在发送心跳，最近 " + timeoutMinutes + " 分钟内保持在线。"
               : "等待机器发送心跳；超过 " + timeoutMinutes + " 分钟后标记为超时，总计 " + ttlMinutes + " 分钟后自动移出列表。";
           nodeCountElement.textContent = visibleNodes.length + " 台";
-          heartbeatDescriptionElement.textContent = hasAttention
+          heartbeatDescriptionElement.textContent = heartbeatAttention
             ? offlineNodes.length + " 台离线，" + timedOutNodes.length + " 台超时，恢复后会自动变绿"
-            : onlineNodes.length > 0 ? onlineNodes.length + " 台机器正在上报状态" : "当前没有收到在线机器的心跳";
-          heartbeatStateElement.textContent = hasAttention ? "有异常" : onlineNodes.length > 0 ? "正常" : "等待中";
-          heartbeatStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
+            : heartbeatOnlineNodes.length > 0 ? heartbeatOnlineNodes.length + " 台机器正在向本地面板上报状态" : "当前没有收到在线机器的心跳";
+          heartbeatStateElement.textContent = heartbeatAttention ? "有异常" : heartbeatOnlineNodes.length > 0 ? "正常" : "等待中";
+          heartbeatStateElement.className = "service-state " + (heartbeatAttention ? "attention" : heartbeatOnlineNodes.length > 0 ? "operational" : "waiting");
           nodeDescriptionElement.textContent = hasAttention
-            ? (offlineNodes.length + timedOutNodes.length) + " 台节点暂时不可用，恢复后会自动变绿"
+            ? issueSummary + "，异常节点不会推送到 TeamNode"
             : onlineNodes.length > 0 ? "在线节点可继续提供订阅和连接" : "在线节点恢复后会显示在下方";
           nodeStateElement.textContent = hasAttention ? "部分异常" : onlineNodes.length > 0 ? "正常" : "等待中";
           nodeStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
@@ -1543,12 +1594,17 @@ async function dashboardPageResponse(request, env) {
               ? "正常"
               : "等待中";
           tunnelDescriptionElement.textContent = tunnelProblemNodes.length > 0
-            ? tunnelProblemNodes.length + " 台 Tunnel 未正常连接；请放行出站 " + tunnelPortText + "。"
+            ? tunnelProblemNodes.length + " 台机器公网路线异常，已停止向 TeamNode 推送。"
             : directModeNodes.length > 0
               ? directModeNodes.length + " 台机器已使用直连模式；Cloudflare Tunnel 不再参与转发。"
             : tunnelConnectedNodes.length > 0
               ? tunnelConnectedNodes.length + " 台 Tunnel 已连接；端口状态随节点心跳更新。"
               : "等待节点上报 Tunnel 连通性；需要放行出站 " + tunnelPortText + "。";
+          cloudflareServiceNameElement.textContent = directModeNodes.length > 0 && tunnelModeNodes.length === 0
+            ? "Cloudflare 直连模式"
+            : directModeNodes.length > 0 && tunnelModeNodes.length > 0
+              ? "Cloudflare 混合模式"
+              : "Cloudflare Tunnel 模式";
           tunnelStateElement.textContent = tunnelState;
           tunnelStateElement.className = "service-state " + (tunnelState === "有异常" ? "attention" : tunnelState === "正常" ? "operational" : "waiting");
           lastUpdatedElement.textContent = "刚刚更新";
@@ -1894,6 +1950,23 @@ async function relayTeamNodeRequest(request, env, ctx) {
   if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
   const authError = await authorizeNodeRelayRequest(request, env, uuid);
   if (authError) return authError;
+
+  if (isRouteAbnormal(payload?.tunnelConnectivity)) {
+    try {
+      await recordNodeEvent(request, env, payload, url.pathname, { upstreamForwarded: false });
+    } catch (error) {
+      console.error(`异常节点状态记录失败：${error?.message || error}`);
+      return json({ error: "node_registry_unavailable" }, 503);
+    }
+    return json({
+      ok: true,
+      forwarded: false,
+      localOnly: true,
+      abnormal: true,
+      reason: "route_abnormal"
+    });
+  }
+
   const syncSecret = String(env.TEAMNODE_SYNC_SECRET || "");
 
   const timestamp = Date.now().toString();

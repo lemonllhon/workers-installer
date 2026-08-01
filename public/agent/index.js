@@ -782,7 +782,9 @@ async function syncNodeRegistrationToTeamNode(context) {
   const response = await postTeamNodeSync("/api/internal/nodejs-argo/registrations", payload, "nodejs_argo_register");
   if (response && response.status === 200) {
     teamnodeSyncRegistered = true;
-    console.log("TeamNode 注册成功");
+    console.log(response.data?.forwarded === false
+      ? "节点公网路线异常：状态仅保存到本地监控面板，未向 TeamNode 推送"
+      : "TeamNode 注册成功");
     return response.data || null;
   }
   return null;
@@ -800,7 +802,9 @@ async function syncNodeHeartbeatToTeamNode(context) {
     const response = await postTeamNodeSync("/api/internal/nodejs-argo/heartbeats", payload, "nodejs_argo_heartbeat");
     if (response && response.status === 200) {
       teamnodeSyncRegistered = true;
-      console.log("TeamNode 心跳成功");
+      console.log(response.data?.forwarded === false
+        ? "节点公网路线仍异常：心跳仅更新本地监控面板，未向 TeamNode 推送"
+        : "TeamNode 心跳成功");
       return response.data || null;
     }
     return null;
@@ -820,6 +824,7 @@ async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
   const payload = {
     uuid: UUID,
     argoDomain: context.argoDomain,
+    tunnelConnectivity: context.tunnelConnectivity || null,
     reason: String(reason || "process_shutdown").trim() || "process_shutdown"
   };
 
@@ -829,7 +834,9 @@ async function syncNodeOfflineToTeamNode(context, reason = "process_shutdown") {
     const response = await postTeamNodeSync("/api/internal/nodejs-argo/offline", payload, "nodejs_argo_offline");
     if (response && response.status === 200) {
       teamnodeSyncRegistered = false;
-      console.log("TeamNode 下线通知成功");
+      console.log(response.data?.forwarded === false
+        ? "异常节点下线状态已更新到本地监控面板，未向 TeamNode 推送"
+        : "TeamNode 下线通知成功");
       return response.data || null;
     }
     return null;
