@@ -576,7 +576,7 @@ function tunnelConnectivityView(node) {
     public_http_timeout: "公网 HTTP/HTTPS 请求超时",
     public_http_failed: "公网 HTTP/HTTPS 请求失败",
     public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
-    public_route_reachable: "install.lemon.vin 公网探测通过",
+    public_route_reachable: "install.lemon.vin 公网路由心跳通过",
     relay_token_missing: "缺少 Worker 中继令牌",
     not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
     not_checked: "等待节点上报检查结果",
@@ -598,9 +598,9 @@ function tunnelConnectivityView(node) {
       : `已切换直连模式${info.directHttpPort ? `；HTTP ${info.directHttpPort}` : ""}`
     : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
   const publicProbeDetail = info.publicProbeStatus === "reachable"
-    ? "install.lemon.vin 公网探测通过"
+      ? "install.lemon.vin 公网路由心跳通过"
     : info.publicProbeStatus === "blocked"
-      ? "install.lemon.vin 公网探测失败"
+      ? "install.lemon.vin 公网路由心跳失败"
       : "";
   const publicProbePortDetail = info.publicProbeStatus === "blocked" && Number(info.publicProbeBlockedPort) > 0
     ? ` · 端口 ${Number(info.publicProbeBlockedPort)} 不可达`
@@ -1185,7 +1185,7 @@ async function dashboardPageResponse(request, env) {
           public_http_timeout: "公网 HTTP/HTTPS 请求超时",
           public_http_failed: "公网 HTTP/HTTPS 请求失败",
           public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
-          public_route_reachable: "install.lemon.vin 公网探测通过",
+          public_route_reachable: "install.lemon.vin 公网路由心跳通过",
           relay_token_missing: "缺少 Worker 中继令牌",
           not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
           not_checked: "等待节点上报检查结果",
@@ -1207,9 +1207,9 @@ async function dashboardPageResponse(request, env) {
             : "已切换直连模式" + (info.directHttpPort ? "；HTTP " + info.directHttpPort : "")
           : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
         const publicProbeDetail = info.publicProbeStatus === "reachable"
-          ? "install.lemon.vin 公网探测通过"
+          ? "install.lemon.vin 公网路由心跳通过"
           : info.publicProbeStatus === "blocked"
-            ? "install.lemon.vin 公网探测失败"
+            ? "install.lemon.vin 公网路由心跳失败"
             : "";
         const publicProbePortDetail = info.publicProbeStatus === "blocked" && Number(info.publicProbeBlockedPort) > 0
           ? " · 端口 " + Number(info.publicProbeBlockedPort) + " 不可达"

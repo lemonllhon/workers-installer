@@ -368,6 +368,8 @@ env \
 
 安装器会检测已启用的 UFW、firewalld、nftables 或 iptables，并按 `CLOUDFLARED_PROTOCOL` 尝试幂等放行出站 `7844`：`http2` 为 TCP，`quic` 为 UDP，`auto` 为 TCP 和 UDP。Cloudflare Tunnel 是出站连接，不需要为了 Tunnel 打开入站 `7844`。云平台安全组、VPS 上游防火墙或服务商网络策略不在机器内部，安装器无法代为修改；面板会通过节点探测结果显示端口是否仍被阻断。
 
+启动阶段的 Tunnel 路由心跳默认最多重试 5 次、每次间隔 4 秒；可用 `STARTUP_TUNNEL_PROBE_ATTEMPTS` 和 `STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS` 调整。Tunnel 心跳包括节点到 Cloudflare Edge 的 7844 出站连通性，以及 Worker 对最终 `ARGO_DOMAIN` 的回访；Worker 不会把 `install.lemon.vin:7844` 当作 Tunnel 目标，因为 7844 是节点到 Cloudflare Edge 的传输端口。
+
 安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES` 的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会让 `install.lemon.vin` 从公网向本机临时监听的候选端口建立 TCP 连接，这一步能够覆盖云平台安全组、上游防火墙和运营商入口策略。如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时将 `ARGO_DOMAIN` 更新为 DNS-only A 记录；如果证书组件不可用或这两个端口不同时可达，则选择可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多扫描 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。直连网关启动后，Worker 还会从公网向最终域名发起一次 HTTP/HTTPS 请求；只有 TCP 和最终请求都通过，节点才会注册到面板。
 
 如果 Tunnel 和直连都探测不到可用路线，程序不会继续空转重启：会在数据目录写入 `.no-route`，以退出码 `78` 停止，systemd、Supervisor 和 PM2 也会停止拉起。修复云平台安全组、上游防火墙或运营商网络后，重新运行安装器会清除该标记并再次按 Tunnel 优先顺序探测。直连模式下不会启动 Cloudflare Tunnel，也不会删除 Cloudflare 控制台中的远端 Tunnel 资源；仅清理本机运行进程和凭据文件，避免误删共享 Tunnel。
@@ -491,7 +493,7 @@ systemd → OpenRC → SysV/init.d → Supervisor → rc.local → cron/crond
 节点路由选择顺序为：
 
 ```text
-启动前 Worker 公网候选端口探测 → Cloudflare Tunnel 启动并验证 → Worker 公网最终路由验证 → 直连候选端口/扩展端口探测 → 两者都失败则退出码 78 停止
+启动前 Tunnel 7844 出站心跳 → Worker 公网路由心跳 → 直连候选端口发现心跳/扩展端口发现 → 两者都失败则退出码 78 停止
 ```
 
 切换到直连时会停止本机 `cloudflared`、删除本机 `tunnel.json`/`tunnel.yml`，并在下一次启动时只运行直连网关。远端 Cloudflare Tunnel 不会被自动删除。

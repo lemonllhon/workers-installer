@@ -100,6 +100,8 @@ const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results"
 const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
 const PUBLIC_ROUTE_PROBE_ATTEMPTS = 5;
 const PUBLIC_ROUTE_PROBE_RETRY_DELAY_MS = 3000;
+const STARTUP_TUNNEL_PROBE_ATTEMPTS = Number.parseInt(process.env.STARTUP_TUNNEL_PROBE_ATTEMPTS || "5", 10);
+const STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS = Number.parseInt(process.env.STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS || "4000", 10);
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -939,13 +941,13 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO
     if (lastProbe?.ok) {
       publicRouteProbeCache = { ...lastProbe, mode, domain };
       console.log(
-        `Worker 公网路由探测通过：${mode === "direct" ? (DIRECT_TLS_ENABLED ? "HTTPS" : "HTTP") : "Tunnel"}`
+        `Worker 公网路由心跳通过：${mode === "direct" ? (DIRECT_TLS_ENABLED ? "HTTPS" : "HTTP") : "Tunnel"}`
         + ` ${domain}${DIRECT_MODE ? `:${DIRECT_PORT}` : ""}`
         + `${lastProbe.httpStatus ? `（HTTP ${lastProbe.httpStatus}）` : ""}`
       );
       return lastProbe;
     }
-    console.warn(`Worker 公网路由探测失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`);
+    console.warn(`Worker 公网路由心跳失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`);
     if (attempt < PUBLIC_ROUTE_PROBE_ATTEMPTS) {
       await new Promise((resolve) => setTimeout(resolve, PUBLIC_ROUTE_PROBE_RETRY_DELAY_MS));
     }
@@ -953,7 +955,7 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO
 
   publicRouteProbeCache = lastProbe ? { ...lastProbe, mode, domain } : null;
   if (throwOnFailure) {
-    throw noRouteError(`install.lemon.vin 公网探测未通过：${lastProbe?.reason || "public_route_unreachable"}`);
+    throw noRouteError(`install.lemon.vin 公网路由心跳未通过：${lastProbe?.reason || "public_route_unreachable"}`);
   }
   return lastProbe || { ok: false, reason: "public_route_unreachable" };
 }
@@ -1238,8 +1240,9 @@ async function activateDirectFallbackAtStartup(tunnelConnectivity) {
   const discovery = await discoverDirectPortPlan();
   const plan = discovery.plan;
   if (!plan) {
+    const tunnelReason = tunnelConnectivity?.reason || "unknown";
     throw noRouteError(
-      `候选端口和扩展扫描均未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}`
+      `Cloudflare Tunnel 探测失败（${tunnelReason}）；候选端口和扩展扫描均未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}`
     );
   }
 
@@ -1249,7 +1252,7 @@ async function activateDirectFallbackAtStartup(tunnelConnectivity) {
   removeCloudflaredRuntimeArtifacts();
   await shutdownTeamNodeSync("startup_direct_fallback");
   console.warn(
-    `Tunnel 启动探测失败，已选择直连 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
+    `Tunnel 心跳失败，已选择直连 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
     + `${plan.tlsEnabled ? "（443+80 可达，重启后申请/续期证书）" : "（不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
@@ -1269,7 +1272,7 @@ async function prepareDirectModeStartup() {
   const plan = discovery.plan;
   if (!plan) {
     throw noRouteError(
-      `直连模式启动探测未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}`
+      `直连模式端口发现心跳未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}`
     );
   }
 
@@ -1277,13 +1280,13 @@ async function prepareDirectModeStartup() {
     && DIRECT_PORT === plan.port
     && DIRECT_HTTP_PORT === plan.httpPort;
   if (samePlan) {
-    console.log(`直连启动探测通过：${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+    console.log(`直连端口发现心跳通过：${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
     return false;
   }
 
   writeDirectFallbackEnv(plan);
   console.warn(
-    `直连启动探测已将配置调整为 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
+    `直连端口发现心跳已将配置调整为 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
     + `${plan.tlsEnabled ? "（443+80 可达，准备证书）" : "（443+80 不同时可达，不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
@@ -1294,26 +1297,44 @@ async function prepareTunnelStartup() {
   if (DIRECT_MODE || PLATFORM_PROXY_MODE) return false;
 
   const probeDomain = ARGO_DOMAIN || findTemporaryTunnelDomain();
-  const tunnelConnectivity = await checkCloudflareTunnelConnectivity(probeDomain, { force: true });
-  console.log(
-    `启动时 Cloudflare Tunnel 探测：${tunnelConnectivity.status}；`
-    + `${tunnelConnectivity.reason}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port}`
-  );
-  if (tunnelConnectivity.status === "connected") {
-    const publicProbe = await verifyPublicRouteAtStartup({ throwOnFailure: false, domain: probeDomain });
-    if (publicProbe?.ok) {
-      console.log("Cloudflare Tunnel 本机和 Worker 公网启动探测均通过，继续使用 Tunnel 模式");
-      return false;
+  const attempts = Number.isInteger(STARTUP_TUNNEL_PROBE_ATTEMPTS)
+    && STARTUP_TUNNEL_PROBE_ATTEMPTS >= 1
+    ? Math.min(STARTUP_TUNNEL_PROBE_ATTEMPTS, 12)
+    : 5;
+  const retryDelayMs = Number.isInteger(STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS)
+    && STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS >= 500
+    ? Math.min(STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS, 30000)
+    : 4000;
+  let tunnelConnectivity = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    tunnelConnectivity = await checkCloudflareTunnelConnectivity(probeDomain, { force: true });
+    console.log(
+      `启动时 Cloudflare Tunnel 心跳 ${attempt}/${attempts}：${tunnelConnectivity.status}；`
+      + `${tunnelConnectivity.reason}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port}`
+    );
+    if (tunnelConnectivity.status === "connected") {
+      const publicProbe = await verifyPublicRouteAtStartup({ throwOnFailure: false, domain: probeDomain });
+      if (publicProbe?.ok) {
+        console.log("Cloudflare Tunnel 7844 出站心跳和 Worker 公网路由心跳均通过，继续使用 Tunnel 模式");
+        return false;
+      }
+      tunnelConnectivity = {
+        ...tunnelConnectivity,
+        status: "offline",
+        reason: publicProbe?.reason || "public_route_unreachable"
+      };
+      console.warn(
+        `Cloudflare Tunnel 7844 出站心跳通过，但 Worker 公网路由心跳失败：${tunnelConnectivity.reason}`
+      );
     }
-    console.warn(`Cloudflare Tunnel 本机探测通过，但 Worker 公网探测失败：${publicProbe?.reason || "unknown"}`);
-    return activateDirectFallbackAtStartup({
-      ...tunnelConnectivity,
-      status: "offline",
-      reason: publicProbe?.reason || "public_route_unreachable"
-    });
+    if (attempt < attempts) {
+      console.warn(`Tunnel 心跳尚未完成，${retryDelayMs}ms 后重试`);
+      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+    }
   }
 
-  console.warn(`Cloudflare Tunnel 启动探测失败：${tunnelConnectivity.reason}，开始探测直连端口`);
+  console.warn(`Cloudflare Tunnel 心跳最终失败：${tunnelConnectivity?.reason || "unknown"}，开始进行直连端口发现心跳`);
   return activateDirectFallbackAtStartup(tunnelConnectivity);
 }
 
