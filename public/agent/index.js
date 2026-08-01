@@ -72,7 +72,9 @@ const DIRECT_PORT_SCAN_PORTS = String(
 );
 const DIRECT_PORT_SCAN_RANGE = String(process.env.DIRECT_PORT_SCAN_RANGE || "1024-65535");
 const DIRECT_PORT_SCAN_MAX = Number.parseInt(process.env.DIRECT_PORT_SCAN_MAX || "256", 10);
-const DIRECT_PORT_PROBE_BATCH_SIZE = 12;
+// Cloudflare Worker 同一请求最多只能保持少量并发外连。保留余量，避免
+// 多个被过滤端口占满连接槽后令整个心跳请求超时。
+const DIRECT_PORT_PROBE_BATCH_SIZE = 4;
 const DIRECT_FALLBACK_FAILURE_THRESHOLD = Number.parseInt(process.env.DIRECT_FALLBACK_FAILURE_THRESHOLD || "2", 10);
 const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
 const DIRECT_KEY_FILE = process.env.DIRECT_KEY_FILE || "";
@@ -1132,16 +1134,39 @@ async function discoverDirectPortPlan() {
   appendRouteProbeProgress(
     `开始直连初始候选端口心跳：${DIRECT_PORT_CANDIDATES.join(",") || "无"}；本机端口 ${[...LOCAL_SERVICE_PORTS].join(",")} 已排除`
   );
-  const initialProbe = await probeDirectPortCandidates();
-  const allResults = [...initialProbe.results];
+  const priorityPorts = [80, 443].filter((port) => DIRECT_PORT_CANDIDATES.includes(port));
+  const remainingInitialPorts = DIRECT_PORT_CANDIDATES.filter((port) => !priorityPorts.includes(port));
+  if (priorityPorts.length > 0) {
+    appendRouteProbeProgress(`优先检查标准入口端口：${priorityPorts.join(",")}`);
+  }
+  const priorityProbe = priorityPorts.length > 0
+    ? await probeDirectPortCandidates(priorityPorts)
+    : { results: [], error: "" };
+  const allResults = [...priorityProbe.results];
   let plan = selectDirectFallbackPlan(allResults);
   if (plan) {
     appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
     return { plan, results: allResults };
   }
 
+  let lastError = priorityProbe.error || "";
+  const initialBatches = Math.ceil(remainingInitialPorts.length / DIRECT_PORT_PROBE_BATCH_SIZE);
+  for (let index = 0; index < remainingInitialPorts.length; index += DIRECT_PORT_PROBE_BATCH_SIZE) {
+    const batch = remainingInitialPorts.slice(index, index + DIRECT_PORT_PROBE_BATCH_SIZE);
+    appendRouteProbeProgress(
+      `直连其余候选端口心跳批次 ${Math.floor(index / DIRECT_PORT_PROBE_BATCH_SIZE) + 1}/${initialBatches}：${batch.join(",")}`
+    );
+    const probe = await probeDirectPortCandidates(batch);
+    allResults.push(...probe.results);
+    if (probe.error) lastError = probe.error;
+    plan = selectDirectFallbackPlan(allResults);
+    if (plan) {
+      appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+      return { plan, results: allResults };
+    }
+  }
+
   const scanCandidates = buildDirectPortScanCandidates();
-  let lastError = initialProbe.error || "";
   const totalBatches = Math.ceil(scanCandidates.length / DIRECT_PORT_PROBE_BATCH_SIZE);
   for (let index = 0; index < scanCandidates.length; index += DIRECT_PORT_PROBE_BATCH_SIZE) {
     const batch = scanCandidates.slice(index, index + DIRECT_PORT_PROBE_BATCH_SIZE);

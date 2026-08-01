@@ -23,7 +23,8 @@ const HEARTBEAT_HISTORY_LIMIT = 72;
 const TIMEZONE_COLLAPSE_THRESHOLD_MINUTES = 15;
 const TUNNEL_TEST_QUEUE_TTL_MS = 2 * 60 * 1000;
 const DIRECT_PORT_PROBE_TIMEOUT_MS = 3500;
-const DIRECT_PORT_PROBE_LIMIT = 12;
+// Worker 每个请求的同时外连数有限，保留连接槽给平台内部请求。
+const DIRECT_PORT_PROBE_LIMIT = 4;
 const NODE_REGISTRY_NAME = "nodejs-argo";
 
 function json(data, status = 200) {
@@ -1598,7 +1599,7 @@ async function probePublicTcpPort(host, port) {
     };
   } finally {
     try {
-      if (socket) await socket.close();
+      if (socket) socket.close().catch(() => {});
     } catch {
       // The socket may already be closed after a failed connection.
     }
