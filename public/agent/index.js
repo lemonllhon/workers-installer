@@ -1,6 +1,7 @@
 const express = require("express");
 const app = express();
 const http = require("http");
+const https = require("https");
 const axios = require("axios");
 const crypto = require("crypto");
 const dns = require("dns");
@@ -103,6 +104,9 @@ const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
   false
 );
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
+// 直连入口最终写入 Cloudflare A 记录，并由 Nginx 监听 IPv4。直连探测请求
+// 必须从本机 IPv4 出口访问 Worker，确保 CF-Connecting-IP 与实际入口一致。
+const TEAMNODE_IPV4_HTTPS_AGENT = new https.Agent({ family: 4, keepAlive: false });
 const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
 const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
 const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
@@ -676,7 +680,7 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
   }
 }
 
-async function postTeamNodeSync(relativePath, payload, eventPrefix) {
+async function postTeamNodeSync(relativePath, payload, eventPrefix, { forceIpv4 = false } = {}) {
   const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
   if (!baseUrl) return null;
 
@@ -696,7 +700,8 @@ async function postTeamNodeSync(relativePath, payload, eventPrefix) {
     },
     timeout: Number.isFinite(TEAMNODE_SYNC_TIMEOUT_MS) && TEAMNODE_SYNC_TIMEOUT_MS > 0
       ? TEAMNODE_SYNC_TIMEOUT_MS
-      : 10000
+      : 10000,
+    ...(forceIpv4 ? { httpsAgent: TEAMNODE_IPV4_HTTPS_AGENT } : {})
   });
 }
 
@@ -913,7 +918,8 @@ async function probePublicRoute({ domain = ARGO_DOMAIN, mode = DIRECT_MODE ? "di
         httpPort: mode === "direct" && tlsEnabled ? httpPort : null,
         tlsEnabled: mode === "direct" ? tlsEnabled : true
       },
-      "nodejs_argo_public_route_probe"
+      "nodejs_argo_public_route_probe",
+      { forceIpv4: mode === "direct" }
     );
     if (!response || response.status !== 200 || !response.data) {
       return {
@@ -1047,11 +1053,12 @@ async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES) {
 
   try {
     if (listeningPorts.length > 0) {
-      appendRouteProbeProgress(`请求 Worker 从公网回访 TCP ${listeningPorts.join(",")}`);
+      appendRouteProbeProgress(`请求 Worker 通过本机 IPv4 出口，从公网回访 TCP ${listeningPorts.join(",")}`);
       const response = await postTeamNodeSync(
         "/api/internal/nodejs-argo/direct-port-probe",
         { uuid: UUID, ports: listeningPorts },
-        "nodejs_argo_direct_port_probe"
+        "nodejs_argo_direct_port_probe",
+        { forceIpv4: true }
       );
       if (!response || response.status !== 200) {
         throw new Error(`direct_port_probe_rejected_${response?.status || "unknown"}`);

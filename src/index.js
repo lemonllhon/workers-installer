@@ -1605,6 +1605,21 @@ async function probePublicTcpPort(host, port) {
   }
 }
 
+function normalizeIpv4(value) {
+  const parts = String(value || "").trim().split(".");
+  if (parts.length !== 4) return "";
+  const octets = parts.map((part) => {
+    if (!/^\d{1,3}$/.test(part)) return -1;
+    return Number.parseInt(part, 10);
+  });
+  if (octets.some((octet) => octet < 0 || octet > 255)) return "";
+  return octets.join(".");
+}
+
+function requestIpv4(request) {
+  return normalizeIpv4(request.headers.get("CF-Connecting-IP"));
+}
+
 function publicRouteHostname(value) {
   const raw = String(value || "").trim();
   if (!raw || raw.length > 253) return "";
@@ -1689,27 +1704,12 @@ async function publicRouteProbeResponse(request, env) {
   const authError = await authorizeNodeRelayRequest(request, env, uuid);
   if (authError) return authError;
 
-  let source = null;
-  if (mode === "direct") {
-    const stub = getRegistryStub(env);
-    if (!stub) return json({ error: "node_registry_unavailable" }, 503);
-    const sourceResponse = await stub.fetch("https://node-registry/source", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ uuid })
-    });
-    if (sourceResponse.ok) {
-      source = await sourceResponse.json();
-    } else if (sourceResponse.status !== 404) {
-      return new Response(sourceResponse.body, { status: sourceResponse.status, headers: sourceResponse.headers });
-    }
-  }
-
-  // 优先使用本次节点请求的出口 IP，避免旧节点记录把探测指向历史机器。
+  // 直连探测请求由节点强制通过 IPv4 访问 Worker。只信任本次请求中
+  // Cloudflare 看到的出口地址，避免旧节点记录或 IPv6 出口指向错误入口。
   const host = mode === "direct"
-    ? String(request.headers.get("CF-Connecting-IP") || source?.sourceIp || "").trim()
+    ? requestIpv4(request)
     : "";
-  if (mode === "direct" && !host) return json({ error: "node_public_ip_unavailable" }, 409);
+  if (mode === "direct" && !host) return json({ error: "node_public_ipv4_unavailable" }, 409);
 
   const ports = mode === "direct"
     ? [...new Set([port, ...(tlsEnabled ? [httpPort] : [])])]
@@ -1723,6 +1723,7 @@ async function publicRouteProbeResponse(request, env) {
       ok: false,
       mode,
       domain,
+      host,
       port,
       checkedAt: Date.now(),
       externalStatus: "blocked",
@@ -1741,6 +1742,7 @@ async function publicRouteProbeResponse(request, env) {
     ok,
     mode,
     domain,
+    host: mode === "direct" ? host : null,
     port: mode === "direct" ? port : 7844,
     checkedAt: Date.now(),
     externalStatus: ok ? "reachable" : "blocked",
@@ -1770,26 +1772,10 @@ async function directPortProbeResponse(request, env) {
   const authError = await authorizeNodeRelayRequest(request, env, uuid);
   if (authError) return authError;
 
-  const stub = getRegistryStub(env);
-  if (!stub) return json({ error: "node_registry_unavailable" }, 503);
-  const sourceResponse = await stub.fetch("https://node-registry/source", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ uuid })
-  });
-  let source = null;
-  if (sourceResponse.ok) {
-    source = await sourceResponse.json();
-  } else if (sourceResponse.status !== 404) {
-    return new Response(sourceResponse.body, { status: sourceResponse.status, headers: sourceResponse.headers });
-  }
-
-  // 启动阶段节点还没有完成首次注册，Durable Object 中没有 sourceIp。
-  // Worker 本身看到的 CF-Connecting-IP 就是这次探测请求的公网出口 IP，
-  // 可用于首次 Tunnel 失败后的直连探测；注册完成后优先使用已记录地址。
-  // 启动阶段优先使用本次节点请求的出口 IP，避免旧记录影响当前机器探测。
-  const host = String(request.headers.get("CF-Connecting-IP") || source?.sourceIp || "").trim();
-  if (!host) return json({ error: "node_public_ip_unavailable" }, 409);
+  // 节点会强制通过 IPv4 请求此端点，因此这里得到的地址与直连 A 记录、
+  // IPv4 临时监听器属于同一地址族。不要回退到可能过期或为 IPv6 的注册地址。
+  const host = requestIpv4(request);
+  if (!host) return json({ error: "node_public_ipv4_unavailable" }, 409);
 
   const results = await Promise.all(ports.map((port) => probePublicTcpPort(host, port)));
   return json({ ok: true, checkedAt: Date.now(), host, results });
