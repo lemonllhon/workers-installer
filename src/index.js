@@ -1803,6 +1803,7 @@ async function relayTeamNodeRequest(request, env, ctx) {
   if (!uuid) return json({ error: "invalid_node_uuid" }, 400);
   const authError = await authorizeNodeRelayRequest(request, env, uuid);
   if (authError) return authError;
+  const syncSecret = String(env.TEAMNODE_SYNC_SECRET || "");
 
   const timestamp = Date.now().toString();
   const nonce = randomToken();
