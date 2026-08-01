@@ -62,6 +62,8 @@ const PLATFORM_PUBLIC_PORT = Number.parseInt(process.env.PLATFORM_PUBLIC_PORT ||
 const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
 const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 10);
 const DIRECT_TLS_ENABLED = parseBoolean(process.env.DIRECT_TLS_ENABLED, true);
+const DIRECT_IPV4_ENABLED = parseBoolean(process.env.DIRECT_IPV4_ENABLED, true);
+const DIRECT_IPV6_ENABLED = parseBoolean(process.env.DIRECT_IPV6_ENABLED, true);
 const AUTO_DIRECT_FALLBACK = parseBoolean(process.env.AUTO_DIRECT_FALLBACK, true);
 const NODEJS_ARGO_ENV_FILE = process.env.NODEJS_ARGO_ENV_FILE || "";
 const DIRECT_PORT_CANDIDATES = [...new Set(
@@ -90,6 +92,9 @@ const CF_DNS_ZONE_ID = process.env.CF_DNS_ZONE_ID || "";
 const CF_DNS_ZONE_NAME = process.env.CF_DNS_ZONE_NAME || "";
 const CF_DNS_RECORD_NAME = DIRECT_DOMAIN;
 const CF_DNS_PUBLIC_IP = process.env.CF_DNS_PUBLIC_IP || "";
+const CF_DNS_PUBLIC_IPV6 = process.env.CF_DNS_PUBLIC_IPV6 || "";
+const DIRECT_LAST_PUBLIC_IPV4 = process.env.DIRECT_LAST_PUBLIC_IPV4 || "";
+const DIRECT_LAST_PUBLIC_IPV6 = process.env.DIRECT_LAST_PUBLIC_IPV6 || "";
 const CF_DNS_TTL = Number.parseInt(process.env.CF_DNS_TTL || "120", 10);
 const CF_DNS_SYNC_INTERVAL_MS = Number.parseInt(process.env.CF_DNS_SYNC_INTERVAL_MS || "300000", 10);
 const CF_DNS_REPLACE_CNAME = parseBoolean(process.env.CF_DNS_REPLACE_CNAME, true);
@@ -111,8 +116,8 @@ const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
   false
 );
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
-// 直连入口最终写入 Cloudflare A 记录，并由 Nginx 监听 IPv4。直连探测请求
-// 必须从本机 IPv4 出口访问 Worker，确保 CF-Connecting-IP 与实际入口一致。
+// 直连入口分别写入 Cloudflare A/AAAA 记录。探测请求强制使用对应地址族，
+// 确保 Worker 看到的 CF-Connecting-IP 与实际被回访的入口一致。
 const TEAMNODE_IPV4_HTTPS_AGENT = new https.Agent({ family: 4, keepAlive: false });
 const TEAMNODE_IPV6_HTTPS_AGENT = new https.Agent({ family: 6, keepAlive: false });
 const NODE_PUBLIC_ADDRESS_CACHE_MS = 5 * 60 * 1000;
@@ -624,6 +629,9 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
       mode: DIRECT_MODE ? "direct" : "platform",
       directPort: DIRECT_MODE ? DIRECT_PORT : Number.parseInt(ARGO_PORT, 10),
       directHttpPort: DIRECT_MODE ? DIRECT_HTTP_PORT : null,
+      directAddressFamilies: DIRECT_MODE
+        ? configuredDirectAddressFamilies().map((family) => directFamilyName(family))
+        : [],
       tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
     };
   }
@@ -698,7 +706,7 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
   }
 }
 
-async function postTeamNodeSync(relativePath, payload, eventPrefix, { forceIpv4 = false } = {}) {
+async function postTeamNodeSync(relativePath, payload, eventPrefix, { ipFamily = 0 } = {}) {
   const baseUrl = normalizeBaseUrl(TEAMNODE_SYNC_BASE_URL);
   if (!baseUrl) return null;
 
@@ -711,6 +719,7 @@ async function postTeamNodeSync(relativePath, payload, eventPrefix, { forceIpv4 
     eventPrefix
   });
 
+  const requestedFamily = ipFamily === 6 ? 6 : ipFamily === 4 ? 4 : 0;
   return axios.post(requestUrl.toString(), payload, {
     headers: {
       "Content-Type": "application/json",
@@ -719,7 +728,11 @@ async function postTeamNodeSync(relativePath, payload, eventPrefix, { forceIpv4 
     timeout: Number.isFinite(TEAMNODE_SYNC_TIMEOUT_MS) && TEAMNODE_SYNC_TIMEOUT_MS > 0
       ? TEAMNODE_SYNC_TIMEOUT_MS
       : 10000,
-    ...(forceIpv4 ? { httpsAgent: TEAMNODE_IPV4_HTTPS_AGENT } : {})
+    ...(requestedFamily === 4
+      ? { httpsAgent: TEAMNODE_IPV4_HTTPS_AGENT }
+      : requestedFamily === 6
+        ? { httpsAgent: TEAMNODE_IPV6_HTTPS_AGENT }
+        : {})
   });
 }
 
@@ -836,6 +849,17 @@ function directFallbackFailureThreshold() {
     : 2;
 }
 
+function directFamilyName(family) {
+  return Number(family) === 6 ? "ipv6" : "ipv4";
+}
+
+function configuredDirectAddressFamilies() {
+  const families = [];
+  if (DIRECT_IPV4_ENABLED) families.push(4);
+  if (DIRECT_IPV6_ENABLED) families.push(6);
+  return families.length > 0 ? families : [4];
+}
+
 function expandPortSpec(value, limit = 1024) {
   const ports = [];
   const addPort = (candidate) => {
@@ -899,7 +923,7 @@ function buildDirectPortScanCandidates() {
   return candidates.slice(0, max);
 }
 
-function createDirectPortListener(port) {
+function createDirectPortListener(port, family) {
   return new Promise((resolve) => {
     const server = net.createServer((socket) => {
       socket.end();
@@ -908,6 +932,7 @@ function createDirectPortListener(port) {
       server.removeListener("error", onError);
       resolve({
         port,
+        family: directFamilyName(family),
         status: "local_unavailable",
         reason: String(error?.code || error?.message || "listen_error").slice(0, 64),
         server: null
@@ -915,18 +940,24 @@ function createDirectPortListener(port) {
     };
 
     server.once("error", onError);
-    server.listen({ host: "0.0.0.0", port, exclusive: true }, () => {
+    server.listen({
+      host: Number(family) === 6 ? "::" : "0.0.0.0",
+      port,
+      exclusive: true,
+      ...(Number(family) === 6 ? { ipv6Only: true } : {})
+    }, () => {
       server.removeListener("error", onError);
-      resolve({ port, status: "listening", server });
+      resolve({ port, family: directFamilyName(family), status: "listening", server });
     });
   });
 }
 
-async function probePublicRoute({ domain = ACTIVE_PUBLIC_DOMAIN, mode = DIRECT_MODE ? "direct" : "tunnel", port = DIRECT_PORT, httpPort = DIRECT_HTTP_PORT, tlsEnabled = DIRECT_TLS_ENABLED } = {}) {
+async function probePublicRouteForFamily({ domain, mode, port, httpPort, tlsEnabled, family = 0 }) {
   if (!TEAMNODE_SYNC_RELAY_TOKEN) {
     return { ok: false, externalStatus: "blocked", reason: "relay_token_missing", checkedAt: Date.now() };
   }
 
+  const familyName = family === 6 ? "ipv6" : family === 4 ? "ipv4" : "";
   try {
     const response = await postTeamNodeSync(
       PUBLIC_ROUTE_PROBE_PATH,
@@ -936,10 +967,11 @@ async function probePublicRoute({ domain = ACTIVE_PUBLIC_DOMAIN, mode = DIRECT_M
         mode,
         port: mode === "direct" ? port : 7844,
         httpPort: mode === "direct" && tlsEnabled ? httpPort : null,
-        tlsEnabled: mode === "direct" ? tlsEnabled : true
+        tlsEnabled: mode === "direct" ? tlsEnabled : true,
+        family: mode === "direct" ? familyName : null
       },
       "nodejs_argo_public_route_probe",
-      { forceIpv4: mode === "direct" }
+      { ipFamily: mode === "direct" ? family : 0 }
     );
     if (!response || response.status !== 200 || !response.data) {
       return {
@@ -949,15 +981,45 @@ async function probePublicRoute({ domain = ACTIVE_PUBLIC_DOMAIN, mode = DIRECT_M
         checkedAt: Date.now()
       };
     }
-    return response.data;
+    return { ...response.data, ...(familyName ? { family: familyName } : {}) };
   } catch (error) {
     return {
       ok: false,
       externalStatus: "blocked",
       reason: String(error?.response?.data?.error || error?.message || "public_probe_failed").slice(0, 64),
-      checkedAt: Date.now()
+      checkedAt: Date.now(),
+      ...(familyName ? { family: familyName } : {})
     };
   }
+}
+
+async function probePublicRoute({ domain = ACTIVE_PUBLIC_DOMAIN, mode = DIRECT_MODE ? "direct" : "tunnel", port = DIRECT_PORT, httpPort = DIRECT_HTTP_PORT, tlsEnabled = DIRECT_TLS_ENABLED } = {}) {
+  if (mode !== "direct") {
+    return probePublicRouteForFamily({ domain, mode, port, httpPort, tlsEnabled, family: 0 });
+  }
+
+  const addressFamilies = configuredDirectAddressFamilies();
+  const familyResultsList = await Promise.all(addressFamilies.map((family) => (
+    probePublicRouteForFamily({ domain, mode, port, httpPort, tlsEnabled, family })
+  )));
+  const familyResults = Object.fromEntries(familyResultsList.map((result, index) => (
+    [directFamilyName(addressFamilies[index]), result]
+  )));
+  const failed = familyResultsList.find((result) => result?.ok !== true);
+  const representative = failed || familyResultsList[0] || {};
+  const ok = familyResultsList.length > 0 && !failed;
+  return {
+    ...representative,
+    ok,
+    mode,
+    domain,
+    port,
+    checkedAt: Date.now(),
+    externalStatus: ok ? "reachable" : "blocked",
+    reason: ok ? "public_route_reachable" : String(representative.reason || "public_route_unreachable").slice(0, 64),
+    addressFamilies: addressFamilies.map((family) => directFamilyName(family)),
+    familyResults
+  };
 }
 
 function mergePublicRouteProbe(connectivity, publicProbe) {
@@ -971,6 +1033,12 @@ function mergePublicRouteProbe(connectivity, publicProbe) {
     publicProbeReason: String(publicProbe.reason || "unknown").slice(0, 64),
     publicProbeHttpStatus: Number.isFinite(Number(publicProbe.httpStatus)) ? Number(publicProbe.httpStatus) : null,
     publicProbeBlockedPort: Number.isFinite(Number(publicProbe.blockedPort)) ? Number(publicProbe.blockedPort) : null,
+    directAddressFamilies: Array.isArray(publicProbe.addressFamilies)
+      ? publicProbe.addressFamilies.filter((family) => ["ipv4", "ipv6"].includes(family))
+      : connectivity.directAddressFamilies,
+    publicProbeFamilies: publicProbe.familyResults && typeof publicProbe.familyResults === "object"
+      ? publicProbe.familyResults
+      : null,
     ...(reachable
       ? {}
       : { status: "offline", reason: String(publicProbe.reason || "public_probe_failed").slice(0, 64) })
@@ -1049,71 +1117,136 @@ function formatDirectProbeResults(results) {
       const port = Number(result?.port);
       const status = String(result?.status || "unknown");
       const reason = String(result?.reason || "").trim();
-      return `${Number.isInteger(port) ? port : "?"}=${status}${reason ? `(${reason})` : ""}`;
+      const familyStatuses = result?.families && typeof result.families === "object"
+        ? Object.entries(result.families)
+          .map(([family, value]) => `${family.toUpperCase()}=${String(value?.status || "unknown")}`)
+          .join("/")
+        : "";
+      return `${Number.isInteger(port) ? port : "?"}=${status}${familyStatuses ? `[${familyStatuses}]` : ""}${reason ? `(${reason})` : ""}`;
     })
     .join(", ");
 }
 
-async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES) {
+async function probeDirectPortCandidates(ports = DIRECT_PORT_CANDIDATES, addressFamilies = configuredDirectAddressFamilies()) {
   const normalizedPorts = [...new Set((Array.isArray(ports) ? ports : [])
     .map((port) => Number.parseInt(String(port), 10))
     .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535 && !LOCAL_SERVICE_PORTS.has(port)))];
+  const normalizedFamilies = [...new Set((Array.isArray(addressFamilies) ? addressFamilies : [])
+    .map((family) => Number(family))
+    .filter((family) => family === 4 || family === 6))];
   if (!normalizedPorts.length) {
     appendRouteProbeProgress("直连端口心跳：没有可用候选端口（已排除本机服务端口）");
     return { results: [], error: "direct_port_candidates_empty" };
   }
+  if (!normalizedFamilies.length) {
+    appendRouteProbeProgress("直连端口心跳：未检测到公网 IPv4 或 IPv6 地址");
+    return { results: [], error: "direct_public_address_unavailable" };
+  }
 
-  appendRouteProbeProgress(`直连端口心跳：准备本机临时监听 TCP ${normalizedPorts.join(",")}`);
-  const listeners = await Promise.all(normalizedPorts.map((port) => createDirectPortListener(port)));
-  const listeningPorts = listeners.filter((entry) => entry.status === "listening").map((entry) => entry.port);
+  const familyLabel = normalizedFamilies.map((family) => directFamilyName(family).toUpperCase()).join("/");
+  appendRouteProbeProgress(`直连端口心跳：准备本机 ${familyLabel} 临时监听 TCP ${normalizedPorts.join(",")}`);
+  const listeners = await Promise.all(normalizedPorts.flatMap((port) => (
+    normalizedFamilies.map((family) => createDirectPortListener(port, family))
+  )));
   appendRouteProbeProgress(
-    `本机临时监听结果：${formatDirectProbeResults(listeners)}；可供 Worker 回访：${listeningPorts.join(",") || "无"}`
+    `本机临时监听结果：${listeners.map((entry) => `${entry.port}/${String(entry.family).toUpperCase()}=${entry.status}`).join(", ")}`
   );
-  let remoteResults = [];
+  const remoteByFamily = new Map();
+  const requestErrors = new Map();
 
   try {
-    if (listeningPorts.length > 0) {
-      appendRouteProbeProgress(`请求 Worker 通过本机 IPv4 出口，从公网回访 TCP ${listeningPorts.join(",")}`);
-      const response = await postTeamNodeSync(
-        "/api/internal/nodejs-argo/direct-port-probe",
-        { uuid: UUID, ports: listeningPorts },
-        "nodejs_argo_direct_port_probe",
-        { forceIpv4: true }
-      );
-      if (!response || response.status !== 200) {
-        throw new Error(`direct_port_probe_rejected_${response?.status || "unknown"}`);
+    await Promise.all(normalizedFamilies.map(async (family) => {
+      const familyName = directFamilyName(family);
+      const listeningPorts = listeners
+        .filter((entry) => entry.family === familyName && entry.status === "listening")
+        .map((entry) => entry.port);
+      if (!listeningPorts.length) return;
+      appendRouteProbeProgress(`请求 Worker 通过本机 ${familyName.toUpperCase()} 出口，从公网回访 TCP ${listeningPorts.join(",")}`);
+      try {
+        const response = await postTeamNodeSync(
+          "/api/internal/nodejs-argo/direct-port-probe",
+          { uuid: UUID, ports: listeningPorts, family: familyName },
+          "nodejs_argo_direct_port_probe",
+          { ipFamily: family }
+        );
+        if (!response || response.status !== 200) {
+          throw new Error(`direct_port_probe_rejected_${response?.status || "unknown"}`);
+        }
+        const remoteResults = Array.isArray(response.data?.results) ? response.data.results : [];
+        remoteByFamily.set(familyName, new Map(remoteResults.map((result) => [Number(result?.port), result])));
+        appendRouteProbeProgress(
+          `Worker ${familyName.toUpperCase()} 外部回访结果：公网 IP ${response.data?.host || "unknown"}；${formatDirectProbeResults(remoteResults) || "无结果"}`
+        );
+      } catch (error) {
+        const message = String(error?.response?.data?.error || error?.message || "probe_error").slice(0, 128);
+        requestErrors.set(familyName, message);
+        appendRouteProbeProgress(`Worker ${familyName.toUpperCase()} 外部回访请求失败：${message}`);
       }
-      remoteResults = Array.isArray(response.data?.results) ? response.data.results : [];
-      appendRouteProbeProgress(
-        `Worker 外部回访结果：公网 IP ${response.data?.host || "unknown"}；${formatDirectProbeResults(remoteResults) || "无结果"}`
-      );
-    }
-  } catch (error) {
-    appendRouteProbeProgress(`Worker 外部回访请求失败：${String(error?.message || "probe_error").slice(0, 128)}`);
-    return {
-      results: listeners.map((entry) => entry.status === "listening"
-        ? { port: entry.port, status: "unknown", reason: String(error?.message || "probe_error").slice(0, 64) }
-        : { port: entry.port, status: entry.status, reason: entry.reason }),
-      error: String(error?.message || "direct_port_probe_failed").slice(0, 128)
-    };
+    }));
   } finally {
     await Promise.all(listeners.map((entry) => closeDirectPortListener(entry.server)));
   }
 
-  const remoteByPort = new Map(remoteResults.map((result) => [Number(result?.port), result]));
+  const results = normalizedPorts.map((port) => {
+    const families = {};
+    for (const family of normalizedFamilies) {
+      const familyName = directFamilyName(family);
+      const local = listeners.find((entry) => entry.port === port && entry.family === familyName);
+      if (!local || local.status !== "listening") {
+        families[familyName] = {
+          status: local?.status || "local_unavailable",
+          reason: local?.reason || "local_listener_missing"
+        };
+        continue;
+      }
+      families[familyName] = remoteByFamily.get(familyName)?.get(port) || {
+        port,
+        status: "unknown",
+        reason: requestErrors.get(familyName) || "probe_result_missing"
+      };
+    }
+    const openFamilies = Object.entries(families)
+      .filter(([, result]) => result?.status === "open")
+      .map(([family]) => family);
+    return {
+      port,
+      status: openFamilies.length === normalizedFamilies.length
+        ? "open"
+        : openFamilies.length > 0
+          ? "partial"
+          : "blocked",
+      openFamilies,
+      families
+    };
+  });
   return {
-    results: listeners.map((entry) => entry.status === "listening"
-      ? remoteByPort.get(entry.port) || { port: entry.port, status: "unknown", reason: "probe_result_missing" }
-      : { port: entry.port, status: entry.status, reason: entry.reason })
+    results,
+    error: requestErrors.size === normalizedFamilies.length
+      ? [...requestErrors.values()].join(";").slice(0, 128)
+      : ""
   };
 }
 
-function selectDirectFallbackPlan(results) {
+function selectDirectFallbackPlan(results, { addressFamilies = configuredDirectAddressFamilies(), requireAllFamilies = false } = {}) {
   const byPort = new Map(
     (Array.isArray(results) ? results : [])
       .map((result) => [Number(result?.port), result])
   );
-  const isOpen = (port) => byPort.get(port)?.status === "open";
+  const familyNames = [...new Set((Array.isArray(addressFamilies) ? addressFamilies : [])
+    .map((family) => directFamilyName(family)))];
+  const openFamilies = (port) => {
+    const result = byPort.get(port);
+    if (!result) return [];
+    if (result.families && typeof result.families === "object") {
+      return familyNames.filter((family) => result.families[family]?.status === "open");
+    }
+    return result.status === "open" ? familyNames : [];
+  };
+  const qualifyingFamilies = (ports) => familyNames.filter((family) => (
+    ports.every((port) => openFamilies(port).includes(family))
+  ));
+  const familiesQualify = (families) => families.length > 0
+    && (!requireAllFamilies || families.length === familyNames.length);
   const nginxAvailable = fs.existsSync(NGINX_BIN);
   const certificatePaths = getDirectCertificatePaths();
   const tlsAvailable = DIRECT_TLS_ENABLED && nginxAvailable && (
@@ -1123,11 +1256,13 @@ function selectDirectFallbackPlan(results) {
 
   if (!nginxAvailable) return null;
 
-  if (tlsAvailable && isOpen(443) && isOpen(80)) {
+  const tlsFamilies = qualifyingFamilies([443, 80]);
+  if (tlsAvailable && familiesQualify(tlsFamilies)) {
     return {
       tlsEnabled: true,
       port: 443,
       httpPort: 80,
+      addressFamilies: tlsFamilies,
       reason: "https_443_and_http_80"
     };
   }
@@ -1137,18 +1272,34 @@ function selectDirectFallbackPlan(results) {
     .filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535);
   const fallbackOrder = [80, 8080, 8443, 8880, 2053, 2083, 2087, 2096, 443, ...DIRECT_PORT_CANDIDATES, ...resultPorts]
     .filter((candidate) => !LOCAL_SERVICE_PORTS.has(candidate));
-  const port = [...new Set(fallbackOrder)].find((candidate) => isOpen(candidate));
+  const port = [...new Set(fallbackOrder)].find((candidate) => familiesQualify(openFamilies(candidate)));
   if (!port) return null;
+  const selectedFamilies = openFamilies(port);
 
   return {
     tlsEnabled: false,
     port,
     httpPort: port,
+    addressFamilies: selectedFamilies,
     reason: "http_fallback_port_available"
   };
 }
 
 async function discoverDirectPortPlan() {
+  const publicAddresses = await resolveNodePublicAddresses({ force: true });
+  const addressFamilies = [
+    ...(publicAddresses.ipv4 ? [4] : []),
+    ...(publicAddresses.ipv6 ? [6] : [])
+  ];
+  if (!addressFamilies.length) {
+    appendRouteProbeProgress("直连端口心跳结束：未检测到公网 IPv4 或 IPv6 地址");
+    return { plan: null, results: [], error: "direct_public_address_unavailable" };
+  }
+  const requireAllFamilies = addressFamilies.length > 1;
+  appendRouteProbeProgress(
+    `直连公网地址：${publicAddresses.ipv4 ? `IPv4 ${publicAddresses.ipv4}` : "IPv4 不可用"}；`
+    + `${publicAddresses.ipv6 ? `IPv6 ${publicAddresses.ipv6}` : "IPv6 不可用"}`
+  );
   appendRouteProbeProgress(
     `开始直连初始候选端口心跳：${DIRECT_PORT_CANDIDATES.join(",") || "无"}；本机端口 ${[...LOCAL_SERVICE_PORTS].join(",")} 已排除`
   );
@@ -1158,12 +1309,13 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress(`优先检查标准入口端口：${priorityPorts.join(",")}`);
   }
   const priorityProbe = priorityPorts.length > 0
-    ? await probeDirectPortCandidates(priorityPorts)
+    ? await probeDirectPortCandidates(priorityPorts, addressFamilies)
     : { results: [], error: "" };
   const allResults = [...priorityProbe.results];
-  let plan = selectDirectFallbackPlan(allResults);
+  let plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies });
   if (plan) {
-    appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+    plan = { ...plan, publicAddresses };
+    appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
     return { plan, results: allResults };
   }
 
@@ -1174,12 +1326,13 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress(
       `直连其余候选端口心跳批次 ${Math.floor(index / DIRECT_PORT_PROBE_BATCH_SIZE) + 1}/${initialBatches}：${batch.join(",")}`
     );
-    const probe = await probeDirectPortCandidates(batch);
+    const probe = await probeDirectPortCandidates(batch, addressFamilies);
     allResults.push(...probe.results);
     if (probe.error) lastError = probe.error;
-    plan = selectDirectFallbackPlan(allResults);
+    plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies });
     if (plan) {
-      appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+      plan = { ...plan, publicAddresses };
+      appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
       return { plan, results: allResults };
     }
   }
@@ -1191,12 +1344,25 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress(
       `直连扩展端口心跳批次 ${Math.floor(index / DIRECT_PORT_PROBE_BATCH_SIZE) + 1}/${totalBatches}：${batch.join(",")}`
     );
-    const probe = await probeDirectPortCandidates(batch);
+    const probe = await probeDirectPortCandidates(batch, addressFamilies);
     allResults.push(...probe.results);
     if (probe.error) lastError = probe.error;
-    plan = selectDirectFallbackPlan(allResults);
+    plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies });
     if (plan) {
-      appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+      plan = { ...plan, publicAddresses };
+      appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
+      return { plan, results: allResults };
+    }
+  }
+
+  if (requireAllFamilies) {
+    plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies: false });
+    if (plan) {
+      plan = { ...plan, publicAddresses };
+      appendRouteProbeProgress(
+        `未找到 IPv4/IPv6 同时可达的共同端口，降级使用 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} `
+        + `${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}；不会发布不可达地址族的 DNS 记录`
+      );
       return { plan, results: allResults };
     }
   }
@@ -1219,6 +1385,9 @@ function writeDirectFallbackEnv(plan) {
   if (!fs.existsSync(resolvedEnvFile)) {
     throw new Error(`环境文件不存在：${resolvedEnvFile}`);
   }
+  const planFamilies = Array.isArray(plan.addressFamilies) && plan.addressFamilies.length > 0
+    ? plan.addressFamilies
+    : configuredDirectAddressFamilies().map((family) => directFamilyName(family));
 
   const updates = {
     DIRECT_MODE: "true",
@@ -1226,11 +1395,15 @@ function writeDirectFallbackEnv(plan) {
     DIRECT_TLS_ENABLED: plan.tlsEnabled ? "true" : "false",
     DIRECT_PORT: String(plan.port),
     DIRECT_HTTP_PORT: String(plan.httpPort),
+    DIRECT_IPV4_ENABLED: planFamilies.includes("ipv4") ? "true" : "false",
+    DIRECT_IPV6_ENABLED: planFamilies.includes("ipv6") ? "true" : "false",
     CFPORT: String(plan.port),
     CFIP: DIRECT_DOMAIN,
     CF_DNS_ENABLED: CF_API_TOKEN ? "true" : "false",
     CF_DNS_RECORD_NAME: DIRECT_DOMAIN,
     CF_DNS_REPLACE_CNAME: "true",
+    DIRECT_LAST_PUBLIC_IPV4: String(plan.publicAddresses?.ipv4 || ""),
+    DIRECT_LAST_PUBLIC_IPV6: String(plan.publicAddresses?.ipv6 || ""),
     // DIRECT_MODE 会阻止 Tunnel 启动，因此保留自动探测，让重启后的
     // 直连模式继续验证公网端口；如果全部端口失效，启动流程会停止。
     AUTO_DIRECT_FALLBACK: "true",
@@ -1310,7 +1483,7 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
 
     writeDirectFallbackEnv(plan);
     console.warn(
-      `Cloudflare Tunnel 连续异常，已选择直连 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
+      `Cloudflare Tunnel 连续异常，已选择直连 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
       + `${plan.tlsEnabled ? "（证书将申请/续期）" : "（不申请证书）"}，正在重启服务应用新配置`
     );
     await stopRuntimeProcesses();
@@ -1378,7 +1551,7 @@ async function activateDirectFallbackAtStartup(tunnelConnectivity) {
   removeCloudflaredRuntimeArtifacts();
   await shutdownTeamNodeSync("startup_direct_fallback");
   console.warn(
-    `Tunnel 心跳失败，已选择直连 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
+    `Tunnel 心跳失败，已选择直连 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
     + `${plan.tlsEnabled ? "（443+80 可达，重启后申请/续期证书）" : "（不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
@@ -1408,15 +1581,17 @@ async function prepareDirectModeStartup() {
   const samePlan = directDomainConfigCurrent
     && DIRECT_TLS_ENABLED === plan.tlsEnabled
     && DIRECT_PORT === plan.port
-    && DIRECT_HTTP_PORT === plan.httpPort;
+    && DIRECT_HTTP_PORT === plan.httpPort
+    && DIRECT_IPV4_ENABLED === plan.addressFamilies.includes("ipv4")
+    && DIRECT_IPV6_ENABLED === plan.addressFamilies.includes("ipv6");
   if (samePlan) {
-    console.log(`直连端口发现心跳通过：${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+    console.log(`直连端口发现心跳通过：${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
     return false;
   }
 
   writeDirectFallbackEnv(plan);
   console.warn(
-    `直连配置已调整为 ${DIRECT_DOMAIN} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
+    `直连配置已调整为 ${DIRECT_DOMAIN} ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
     + `${plan.tlsEnabled ? "（443+80 可达，准备证书）" : "（443+80 不同时可达，不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
@@ -1910,6 +2085,10 @@ function validateDirectMode() {
   if (DIRECT_TLS_ENABLED && Boolean(DIRECT_CERT_FILE) !== Boolean(DIRECT_KEY_FILE)) {
     throw new Error("DIRECT_CERT_FILE 和 DIRECT_KEY_FILE 必须同时配置，或同时留空");
   }
+
+  if (!DIRECT_IPV4_ENABLED && !DIRECT_IPV6_ENABLED) {
+    throw new Error("DIRECT_IPV4_ENABLED 和 DIRECT_IPV6_ENABLED 不能同时关闭");
+  }
 }
 
 function validateCloudflareDnsMode() {
@@ -1930,6 +2109,14 @@ function validateCloudflareDnsMode() {
 
 function nginxConfigValue(value) {
   return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+function nginxDirectListenDirectives(port, { ssl = false } = {}) {
+  const suffix = ssl ? " ssl" : "";
+  const directives = [];
+  if (DIRECT_IPV4_ENABLED) directives.push(`    listen ${port}${suffix};`);
+  if (DIRECT_IPV6_ENABLED) directives.push(`    listen [::]:${port}${suffix} ipv6only=on;`);
+  return directives.length > 0 ? directives : [`    listen ${port}${suffix};`];
 }
 
 function getDirectCertificatePaths() {
@@ -1991,7 +2178,7 @@ function buildDirectHttpOnlyNginxConfig() {
       : "  access_log off;",
     "",
     "  server {",
-    "    listen " + DIRECT_PORT + ";",
+    ...nginxDirectListenDirectives(DIRECT_PORT),
     "    server_name " + domain + ";",
     "",
     "    location = /vless-argo {",
@@ -2068,7 +2255,7 @@ function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly =
       : "  access_log off;",
     "",
     "  server {",
-    `    listen ${DIRECT_HTTP_PORT};`,
+    ...nginxDirectListenDirectives(DIRECT_HTTP_PORT),
     `    server_name ${domain};`,
     "",
     "    location ^~ /.well-known/acme-challenge/ {",
@@ -2086,7 +2273,7 @@ function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly =
     lines.push(
       "",
       "  server {",
-      `    listen ${DIRECT_PORT} ssl;`,
+      ...nginxDirectListenDirectives(DIRECT_PORT, { ssl: true }),
       `    server_name ${domain};`,
       `    ssl_certificate ${nginxConfigValue(path.resolve(certificateFile))};`,
       `    ssl_certificate_key ${nginxConfigValue(path.resolve(keyFile))};`,
@@ -2390,16 +2577,20 @@ async function resolveNodePublicAddresses({ force = false } = {}) {
   return { ...nodePublicAddressCache };
 }
 
-async function resolvePublicIpv4() {
-  if (CF_DNS_PUBLIC_IP) return CF_DNS_PUBLIC_IP.trim();
-
-  const response = await axios.get("https://api.ipify.org?format=json", { timeout: 8000 });
-  const publicIp = response.data && response.data.ip;
-  if (!publicIp || net.isIP(publicIp) !== 4) {
-    throw new Error("公网 IP 查询结果不是有效的 IPv4 地址，请配置 CF_DNS_PUBLIC_IP");
+async function resolveDirectPublicAddresses() {
+  const detected = await resolveNodePublicAddresses({ force: true });
+  const configuredIpv4 = String(CF_DNS_PUBLIC_IP || "").trim();
+  const configuredIpv6 = String(CF_DNS_PUBLIC_IPV6 || "").trim();
+  if (configuredIpv4 && net.isIP(configuredIpv4) !== 4) {
+    throw new Error(`CF_DNS_PUBLIC_IP 不是有效的 IPv4 地址：${configuredIpv4}`);
   }
-
-  return String(publicIp).trim();
+  if (configuredIpv6 && net.isIP(configuredIpv6) !== 6) {
+    throw new Error(`CF_DNS_PUBLIC_IPV6 不是有效的 IPv6 地址：${configuredIpv6}`);
+  }
+  return {
+    ipv4: configuredIpv4 || detected.ipv4 || (net.isIP(DIRECT_LAST_PUBLIC_IPV4) === 4 ? DIRECT_LAST_PUBLIC_IPV4 : null),
+    ipv6: configuredIpv6 || detected.ipv6 || (net.isIP(DIRECT_LAST_PUBLIC_IPV6) === 6 ? DIRECT_LAST_PUBLIC_IPV6 : null)
+  };
 }
 
 async function syncCloudflareDnsRecord() {
@@ -2421,10 +2612,7 @@ async function syncCloudflareDnsRecord() {
 
   const client = getCloudflareApiClient();
   const zoneId = await resolveCloudflareZoneId(client);
-  const publicIp = await resolvePublicIpv4();
-  if (net.isIP(publicIp) !== 4) {
-    throw new Error(`CF_DNS_PUBLIC_IP 不是有效的 IPv4 地址：${publicIp}`);
-  }
+  const publicAddresses = await resolveDirectPublicAddresses();
 
   const listResponse = await client.get(`/zones/${zoneId}/dns_records`, {
     params: { name: CF_DNS_RECORD_NAME, per_page: 100 }
@@ -2434,55 +2622,80 @@ async function syncCloudflareDnsRecord() {
   }
 
   const records = Array.isArray(listResponse.data.result) ? listResponse.data.result : [];
-  const current = records.find((record) => record.type === "A");
-  const conflictingRecord = records.find((record) => record.type !== "A");
-  if (!current && conflictingRecord) {
-    if (conflictingRecord.type !== "CNAME" || !CF_DNS_REPLACE_CNAME) {
-      throw new Error(`Cloudflare DNS 中已存在 ${CF_DNS_RECORD_NAME} 的 ${conflictingRecord.type} 记录，请先处理冲突后再启用自动解析`);
-    }
+  const unmanagedConflict = records.find((record) => !["A", "AAAA", "CNAME"].includes(record.type));
+  if (unmanagedConflict) {
+    throw new Error(`Cloudflare DNS 中已存在 ${CF_DNS_RECORD_NAME} 的 ${unmanagedConflict.type} 记录，请先处理冲突后再启用自动解析`);
+  }
 
-    const deleteResponse = await client.delete(`/zones/${zoneId}/dns_records/${conflictingRecord.id}`);
+  const cnameRecords = records.filter((record) => record.type === "CNAME");
+  if (cnameRecords.length > 0 && !CF_DNS_REPLACE_CNAME) {
+    throw new Error(`Cloudflare DNS 中已存在 ${CF_DNS_RECORD_NAME} 的 CNAME，且 CF_DNS_REPLACE_CNAME=false`);
+  }
+  for (const record of cnameRecords) {
+    const deleteResponse = await client.delete(`/zones/${zoneId}/dns_records/${record.id}`);
     if (!deleteResponse.data || !deleteResponse.data.success) {
       throw new Error(`Cloudflare DNS CNAME 删除失败：${CF_DNS_RECORD_NAME}`);
     }
-    console.log(`直连域名上的旧 CNAME 已移除，准备创建 DNS-only A 记录：${CF_DNS_RECORD_NAME}`);
+    console.log(`直连域名上的旧 CNAME 已移除：${CF_DNS_RECORD_NAME}`);
   }
-  const desired = {
-    type: "A",
-    name: CF_DNS_RECORD_NAME,
-    content: publicIp,
-    ttl: Number.isInteger(CF_DNS_TTL) && CF_DNS_TTL >= 1 ? CF_DNS_TTL : 120,
-    proxied: false
+
+  const desiredByType = {
+    A: DIRECT_IPV4_ENABLED ? publicAddresses.ipv4 : null,
+    AAAA: DIRECT_IPV6_ENABLED ? publicAddresses.ipv6 : null
   };
-
-  if (
-    current &&
-    current.content === desired.content &&
-    current.proxied === desired.proxied &&
-    current.ttl === desired.ttl
-  ) {
-    console.log(`Cloudflare DNS 已是最新：${CF_DNS_RECORD_NAME} -> ${publicIp}（DNS-only）`);
-    return;
+  const enabledByType = { A: DIRECT_IPV4_ENABLED, AAAA: DIRECT_IPV6_ENABLED };
+  if (!Object.values(desiredByType).some(Boolean)) {
+    throw new Error("直连模式未获得可发布的公网 IPv4/IPv6 地址");
   }
 
-  if (current) {
-    const updateResponse = await client.put(`/zones/${zoneId}/dns_records/${current.id}`, {
-      ...desired
-    });
-    if (!updateResponse.data || !updateResponse.data.success) {
-      throw new Error("Cloudflare DNS 记录更新失败");
+  for (const type of ["A", "AAAA"]) {
+    const existing = records.filter((record) => record.type === type);
+    const address = desiredByType[type];
+    if (!enabledByType[type]) {
+      for (const record of existing) {
+        const deleteResponse = await client.delete(`/zones/${zoneId}/dns_records/${record.id}`);
+        if (!deleteResponse.data || !deleteResponse.data.success) {
+          throw new Error(`Cloudflare DNS ${type} 记录删除失败`);
+        }
+      }
+      if (existing.length > 0) console.log(`Cloudflare DNS 已移除不可达地址族：${CF_DNS_RECORD_NAME} ${type}`);
+      continue;
     }
-    console.log(`Cloudflare DNS 已更新：${CF_DNS_RECORD_NAME} -> ${publicIp}（DNS-only）`);
-    return;
-  }
+    if (!address) {
+      console.warn(`未检测到已启用地址族的公网地址，保留现有 ${type} 记录：${CF_DNS_RECORD_NAME}`);
+      continue;
+    }
 
-  const createResponse = await client.post(`/zones/${zoneId}/dns_records`, {
-    ...desired
-  });
-  if (!createResponse.data || !createResponse.data.success) {
-    throw new Error("Cloudflare DNS 记录创建失败");
+    const desired = {
+      type,
+      name: CF_DNS_RECORD_NAME,
+      content: address,
+      ttl: Number.isInteger(CF_DNS_TTL) && CF_DNS_TTL >= 1 ? CF_DNS_TTL : 120,
+      proxied: false
+    };
+    const current = existing[0];
+    if (!current) {
+      const createResponse = await client.post(`/zones/${zoneId}/dns_records`, desired);
+      if (!createResponse.data || !createResponse.data.success) {
+        throw new Error(`Cloudflare DNS ${type} 记录创建失败`);
+      }
+      console.log(`Cloudflare DNS 已创建：${CF_DNS_RECORD_NAME} ${type} ${address}（DNS-only）`);
+    } else if (current.content !== desired.content || current.proxied !== false || current.ttl !== desired.ttl) {
+      const updateResponse = await client.put(`/zones/${zoneId}/dns_records/${current.id}`, desired);
+      if (!updateResponse.data || !updateResponse.data.success) {
+        throw new Error(`Cloudflare DNS ${type} 记录更新失败`);
+      }
+      console.log(`Cloudflare DNS 已更新：${CF_DNS_RECORD_NAME} ${type} ${address}（DNS-only）`);
+    } else {
+      console.log(`Cloudflare DNS 已是最新：${CF_DNS_RECORD_NAME} ${type} ${address}（DNS-only）`);
+    }
+    for (const duplicate of existing.slice(1)) {
+      const deleteResponse = await client.delete(`/zones/${zoneId}/dns_records/${duplicate.id}`);
+      if (!deleteResponse.data || !deleteResponse.data.success) {
+        throw new Error(`Cloudflare DNS 重复 ${type} 记录删除失败`);
+      }
+    }
   }
-  console.log(`Cloudflare DNS 已创建：${CF_DNS_RECORD_NAME} -> ${publicIp}（DNS-only）`);
 }
 
 function startCloudflareDnsSyncLoop() {
@@ -2511,7 +2724,7 @@ async function startDirectGateway() {
   if (!DIRECT_TLS_ENABLED) {
     writeDirectNginxConfig({ tlsEnabled: false });
     await startNginx();
-    console.log(`直连 HTTP 模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}`);
+    console.log(`直连 HTTP 模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}（${configuredDirectAddressFamilies().map((family) => directFamilyName(family).toUpperCase()).join("/")}）`);
     return false;
   }
   let certificate;
@@ -2792,7 +3005,7 @@ async function startProcesses() {
         setTimeout(() => process.exit(0), 100);
         return true;
       }
-      console.log(`直连模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}，HTTP ${DIRECT_HTTP_PORT} 用于证书验证和跳转`);
+      console.log(`直连模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}（${configuredDirectAddressFamilies().map((family) => directFamilyName(family).toUpperCase()).join("/")}），HTTP ${DIRECT_HTTP_PORT} 用于证书验证和跳转`);
     } catch (error) {
       console.error(`直连网关启动失败：${error.message}`);
       throw error;

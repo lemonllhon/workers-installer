@@ -37,7 +37,7 @@ Workers & Pages
 | --- | --- | --- |
 | `TEAMNODE_SYNC_SECRET` | Secret | TeamNode 主密钥，只在 Worker 代理请求时使用 |
 | `TEAMNODE_SYNC_ENROLL_PASSWORD` | Secret | 目标机器安装时输入的兑换密码 |
-| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 DNS-only A 记录；安装兑换时按请求下发到目标机器的 0600 `.env` |
+| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 DNS-only A/AAAA 记录；安装兑换时按请求下发到目标机器的 0600 `.env` |
 
 如果需要根页面在线机器面板，再添加：
 
@@ -161,6 +161,8 @@ Tunnel：boxd06.openlemon.cyou
 - `ARGO_PORT`：Tunnel 连接的本地端口，默认 `8001`；
 - `CLOUDFLARED_PROTOCOL`：Tunnel 传输协议，可选 `http2`、`quic`、`auto`，默认 `http2`；
 - `AUTO_CONFIGURE_FIREWALL`：root 安装时是否自动配置已启用的主机防火墙，默认 `true`；Tunnel 模式配置出站 7844，直连探测还会放行 `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT`、`DIRECT_HTTP_PORT` 和 `DIRECT_PORT_SCAN_PORTS` 中明确列出的入站 TCP 端口；
+- `DIRECT_IPV4_ENABLED`、`DIRECT_IPV6_ENABLED`：控制直连 Nginx 与 DNS 启用的地址族，默认都为 `true`；自动路线选择会根据 Worker 的实际公网回访结果重写这两个值，不会发布未通过回访的地址族；
+- `CF_DNS_PUBLIC_IP`、`CF_DNS_PUBLIC_IPV6`：可选的固定公网 IPv4/IPv6；不设置时节点分别自动检测，直连域名对应创建 DNS-only `A`/`AAAA` 记录；
 - `CFIP`：节点连接地址，例如 `cdst.lemon.vin`；
 - `NAME`：节点名称前缀；
 - `UUID`：新机器不设置时自动随机生成；覆盖已有安装且不设置时，自动复用旧 `.env` 中的 UUID；显式指定时优先使用指定值；
@@ -386,13 +388,39 @@ env \
 | Cloudflare Edge `7844/TCP` | 本机出站 | `http2` 或 `auto` 时做 TCP 连接心跳 | 确认 Tunnel 的 HTTP/2 传输路径 |
 | Cloudflare Edge `7844/UDP` | 本机出站 | `quic` 或 `auto` 时做最佳努力 UDP 心跳 | 提前发现明显的 UDP 阻断；最终以 cloudflared 的 QUIC 握手为准 |
 | `SERVER_PORT`（默认 3000）和 `ARGO_PORT`（默认 8001） | 本机监听 | 服务启动后用 `ss` 检查 | 应用内部端口，不属于公网入口，不会交给 Worker 探测 |
-| `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT_SCAN_PORTS`、`DIRECT_PORT_SCAN_RANGE` | 公网入站 | 服务启动后临时监听，Worker 通过节点本次请求的公网 IPv4 分批回访 TCP 端口 | 覆盖云安全组、上游网络和运营商入口限制，决定直连端口；3000/8001 不参与 |
+| `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT_SCAN_PORTS`、`DIRECT_PORT_SCAN_RANGE` | 公网入站 | 服务启动后分别建立 IPv4/IPv6 临时监听；节点强制使用对应地址族请求 Worker，Worker 再分别回访公网 TCP 端口 | 覆盖两种地址族各自的云安全组、上游网络和运营商入口限制，决定直连端口；3000/8001 不参与 |
 
 阶段 1 的 7844 预检会逐项显示协议、Edge 地址、端口和序号，每个 Edge 使用 6 秒硬超时，因此不会在空白状态下无限等待。所选协议的 7844 被明确判定为阻断后，安装器会跳过 cloudflared 下载、Tunnel 防火墙配置和 Tunnel 启动，节点直接进入 Worker 直连端口心跳；只有结果可用或无法可靠判断时才保留 Tunnel 路线。阶段 1 不能提前判断直连入站端口，因为此时节点还没有监听这些端口；直连端口必须在启动后的 Worker 外部回访中确认。即使扫描范围包含 `SERVER_PORT` 或 `ARGO_PORT`，安装器和节点也会把这两个本机端口从直连探测及直连防火墙候选中排除。安装器只有在本机服务监听检查和最终公网路线检查都通过后才完成安装。
 
 启动阶段的 Tunnel 路由心跳默认最多重试 5 次、每次间隔 4 秒；可用 `STARTUP_TUNNEL_PROBE_ATTEMPTS` 和 `STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS` 调整。Tunnel 心跳包括节点到 Cloudflare Edge 的 7844 出站连通性，以及 Worker 对最终 `ARGO_DOMAIN` 的回访；Worker 不会把 `install.lemon.vin:7844` 当作 Tunnel 目标，因为 7844 是节点到 Cloudflare Edge 的传输端口。
 
-安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES`、当前直连端口以及 `DIRECT_PORT_SCAN_PORTS` 明确列出的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会为当前一批候选端口建立临时 IPv4 TCP 监听，再通过 IPv4 请求 `install.lemon.vin`，使 Worker 回访本次请求对应的公网 IPv4。这一步能够覆盖云平台安全组、上游防火墙和运营商入口策略，避免节点通过 IPv6 访问 Worker 时误探测 IPv6。如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时把自动派生的 `zhilian...` 直连域名创建为 DNS-only A 记录；证书申请默认最多尝试 3 次、每次失败后等待 30 秒，最终仍失败则自动改用 HTTP。如果 `443` 和 `80` 不同时可达，则选择第一个可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。能够从 `ARGO_AUTH` 解析固定 Tunnel ID 时，安装器还会保留或恢复 `ARGO_DOMAIN -> <Tunnel-ID>.cfargotunnel.com` 的代理 CNAME；旧版本遗留在 `ARGO_DOMAIN` 上的直连 A/AAAA 记录会被迁移掉。直连网关启动后，Worker 会从公网向 `zhilian...` 最终域名发起一次 HTTP/HTTPS 请求；只有 TCP 和最终请求都通过，节点才会注册到面板。
+安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES`、当前直连端口以及 `DIRECT_PORT_SCAN_PORTS` 明确列出的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会检测公网 IPv4/IPv6，为当前一批候选端口分别建立 `0.0.0.0` 与 `[::]` 临时 TCP 监听，再强制通过对应地址族请求 `install.lemon.vin`，使 Worker 分别回访本次请求对应的公网地址。这一步能够独立覆盖 IPv4/IPv6 的云平台安全组、上游防火墙和运营商入口策略，不再把两种地址族混用。如果 TCP `443` 和 `80` 在所有启用地址族上都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书；Nginx 同时监听 IPv4/IPv6，自动派生的 `zhilian...` 直连域名创建 DNS-only `A`/`AAAA` 记录。证书申请默认最多尝试 3 次、每次失败后等待 30 秒，最终仍失败则自动改用 HTTP。如果 `443` 和 `80` 不同时可达，则优先寻找 IPv4/IPv6 共同可用的非标准 HTTP 端口；扫描结束仍没有共同端口时，才降级到单一可达地址族，并删除另一地址族的直连 DNS 记录。如果初始候选端口全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。能够从 `ARGO_AUTH` 解析固定 Tunnel ID 时，安装器还会保留或恢复 `ARGO_DOMAIN -> <Tunnel-ID>.cfargotunnel.com` 的代理 CNAME；旧版本遗留在 `ARGO_DOMAIN` 上的直连 A/AAAA 记录会被迁移掉。直连网关启动后，Worker 会按启用地址族分别检查公网 TCP，再向 `zhilian...` 最终域名发起 HTTP/HTTPS 请求；只有所有启用地址族和最终请求都通过，节点才会注册到面板。
+
+直连地址族会按机器实际网络能力自动选择：
+
+| 机器网络和公网回访结果 | Nginx 监听 | Cloudflare DNS | 持久化配置 |
+| --- | --- | --- | --- |
+| 仅 IPv4 可用 | `0.0.0.0:端口` | 只创建 DNS-only `A` | `DIRECT_IPV4_ENABLED=true`、`DIRECT_IPV6_ENABLED=false` |
+| 仅 IPv6 可用 | `[::]:端口` | 只创建 DNS-only `AAAA` | `DIRECT_IPV4_ENABLED=false`、`DIRECT_IPV6_ENABLED=true` |
+| IPv4、IPv6 都可用且存在共同端口 | 同时监听 `0.0.0.0` 和 `[::]` | 同时创建 DNS-only `A`、`AAAA` | 两个变量都为 `true` |
+| 双栈机器没有共同端口，但其中一个地址族存在可达端口 | 只监听最终选中的可达地址族 | 删除不可达地址族记录，只保留可达的 `A` 或 `AAAA` | 根据实际回访结果启用一个地址族 |
+| IPv4、IPv6 都没有公网可达端口 | 不启动直连网关 | 不发布新的直连记录 | 写入 `.no-route` 并以退出码 `78` 停止 |
+
+默认的自动路线会根据 Worker 外部回访结果重写 `DIRECT_IPV4_ENABLED` 和 `DIRECT_IPV6_ENABLED`，不需要在安装命令中指定。只有手动设置 `DIRECT_MODE=true` 并关闭自动探测时，才需要自行指定。例如 IPv4-only：
+
+```bash
+DIRECT_IPV4_ENABLED=true
+DIRECT_IPV6_ENABLED=false
+```
+
+IPv6-only：
+
+```bash
+DIRECT_IPV4_ENABLED=false
+DIRECT_IPV6_ENABLED=true
+```
+
+这两个变量不能同时设置为 `false`。公网地址默认分别自动检测；需要固定地址时可使用 `CF_DNS_PUBLIC_IP` 和 `CF_DNS_PUBLIC_IPV6`。
 
 如果 Tunnel 和直连都探测不到可用路线，程序不会继续空转重启：会在数据目录写入 `.no-route`，以退出码 `78` 停止，systemd、Supervisor 和 PM2 也会停止拉起。修复云平台安全组、上游防火墙或运营商网络后，重新运行安装器会清除该标记并再次按 Tunnel 优先顺序探测。直连模式下不会启动 Cloudflare Tunnel，也不会删除 Cloudflare 控制台中的远端 Tunnel 资源；仅清理本机运行进程和凭据文件，避免误删共享 Tunnel。
 
@@ -406,12 +434,12 @@ DIRECT_PORT_SCAN_MAX=256
 
 实际探测顺序如下：
 
-1. 第一批只并发检查标准入口 `80,443`。如果两者都开放且证书组件可用，则选择 HTTPS 443；如果只开放其中一个，则直接选择该端口的 HTTP。
-2. 标准入口都不可用时，按默认顺序检查 `8080,8443,8880,2053,2083,2087,2096`，每批最多 4 个端口。
+1. 第一批只并发检查标准入口 `80,443`，但 IPv4 和 IPv6 分成两个 Worker 请求独立回访。如果两种地址族的两个端口都开放且证书组件可用，则选择双栈 HTTPS 443；只有一个公网地址族时，对该地址族应用相同规则。
+2. 标准入口不能形成可用方案时，按默认顺序检查 `8080,8443,8880,2053,2083,2087,2096`，每批最多 4 个端口；检测到双栈机器时优先选择两种地址族共同开放的端口。
 3. 初始候选全部失败后，先检查 `DIRECT_PORT_SCAN_PORTS` 明确列出的端口，再从 `DIRECT_PORT_SCAN_RANGE` 中均匀抽样补足到 `DIRECT_PORT_SCAN_MAX`，仍然每批最多 4 个端口。范围扫描不是逐个检查 `1024-65535` 的全部端口。
-4. 同一批端口在节点上并发建立临时监听，Worker 也并发回访；批次之间串行执行。单端口公网 TCP 回访硬超时为 3.5 秒，发现首个可用端口后立即停止后续批次，并在 `finally` 阶段关闭整批临时监听。
+4. 同一批端口在节点上按地址族并发建立临时监听，Worker 分别回访 IPv4/IPv6；批次之间串行执行。单端口公网 TCP 回访硬超时为 3.5 秒，发现满足当前地址族要求的端口后停止后续批次，并在 `finally` 阶段关闭整批临时监听。双栈机器扫描结束仍没有共同端口时，会保留至少一个真正可达的地址族，而不是发布不可达的 `A` 或 `AAAA`。
 
-Worker 接口最多接受每批 4 个端口，为 Cloudflare Worker 的并发外连限制保留余量。默认选择顺序是 `80,8080,8443,8880,2053,2083,2087,2096,443`，然后才是其余自定义或扩展结果；非标准端口被选中时使用普通 HTTP。`SERVER_PORT`（默认 3000）和 `ARGO_PORT`（默认 8001）始终排除，扩展扫描还会排除 `22,25,53,110,143,587,3306,3389`。
+Worker 接口按每个地址族最多接受每批 4 个端口，为 Cloudflare Worker 的并发外连限制保留余量；IPv4/IPv6 使用两个独立请求，不会把 8 条连接塞进同一个 Worker 请求。默认选择顺序是 `80,8080,8443,8880,2053,2083,2087,2096,443`，然后才是其余自定义或扩展结果；非标准端口被选中时使用普通 HTTP。`SERVER_PORT`（默认 3000）和 `ARGO_PORT`（默认 8001）始终排除，扩展扫描还会排除 `22,25,53,110,143,587,3306,3389`。
 
 将 `DIRECT_PORT_SCAN_MAX` 设置为 `0` 可关闭扩展扫描，最大值为 `4096`。默认 256 个端口在全部表现为超时的理论最坏情况下约需 `256 / 4 × 3.5 = 224` 秒，加上批次请求开销可能超过安装器默认的 180 秒等待时间。需要大范围探测时建议同时设置：
 

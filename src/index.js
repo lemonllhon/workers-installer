@@ -140,6 +140,25 @@ function normalizeTunnelConnectivity(value) {
       .filter((protocol) => ["TCP", "UDP"].includes(protocol))
       .slice(0, 2)
     : [];
+  const directAddressFamilies = Array.isArray(value.directAddressFamilies)
+    ? [...new Set(value.directAddressFamilies
+      .map((family) => String(family || "").toLowerCase())
+      .filter((family) => ["ipv4", "ipv6"].includes(family)))]
+    : [];
+  const publicProbeFamilies = {};
+  if (value.publicProbeFamilies && typeof value.publicProbeFamilies === "object") {
+    for (const family of ["ipv4", "ipv6"]) {
+      const probe = value.publicProbeFamilies[family];
+      if (!probe || typeof probe !== "object") continue;
+      publicProbeFamilies[family] = {
+        ok: probe.ok === true,
+        externalStatus: probe.externalStatus === "reachable" ? "reachable" : "blocked",
+        reason: String(probe.reason || "unknown").slice(0, 64),
+        host: family === "ipv4" ? normalizeIpv4(probe.host) || null : normalizeIpv6(probe.host) || null,
+        httpStatus: Number.isFinite(Number(probe.httpStatus)) ? Number(probe.httpStatus) : null
+      };
+    }
+  }
 
   return {
     status,
@@ -163,6 +182,8 @@ function normalizeTunnelConnectivity(value) {
     mode: ["direct", "platform"].includes(String(value.mode || "")) ? String(value.mode) : null,
     directPort: Number.isFinite(directPort) && directPort > 0 && directPort <= 65535 ? directPort : null,
     directHttpPort: Number.isFinite(directHttpPort) && directHttpPort > 0 && directHttpPort <= 65535 ? directHttpPort : null,
+    directAddressFamilies,
+    publicProbeFamilies,
     tlsEnabled: value.tlsEnabled === true
   };
 }
@@ -611,8 +632,11 @@ function tunnelConnectivityView(node) {
   const portRequirement = tunnelPortRequirement(info);
   const directPort = Number(info.directPort) > 0 ? Number(info.directPort) : Number(info.port) > 0 ? Number(info.port) : null;
   const directProtocol = info.tlsEnabled === false ? "HTTP" : "HTTPS";
+  const directFamilyLabel = Array.isArray(info.directAddressFamilies) && info.directAddressFamilies.length > 0
+    ? info.directAddressFamilies.map((family) => String(family).toUpperCase()).join("/")
+    : "IPv4";
   const portLabel = directMode
-    ? `${directProtocol} ${directPort || "端口"} 已可用`
+    ? `${directFamilyLabel} ${directProtocol} ${directPort || "端口"} 已可用`
     : info.portStatus === "open"
     ? `${portRequirement} 已放行`
     : info.portStatus === "blocked"
@@ -1242,8 +1266,11 @@ async function dashboardPageResponse(request, env) {
         const portRequirement = tunnelPortRequirement(info);
         const directPort = Number(info.directPort) > 0 ? Number(info.directPort) : Number(info.port) > 0 ? Number(info.port) : null;
         const directProtocol = info.tlsEnabled === false ? "HTTP" : "HTTPS";
+        const directFamilyLabel = Array.isArray(info.directAddressFamilies) && info.directAddressFamilies.length > 0
+          ? info.directAddressFamilies.map((family) => String(family).toUpperCase()).join("/")
+          : "IPv4";
         const portLabel = directMode
-          ? directProtocol + " " + (directPort || "端口") + " 已可用"
+          ? directFamilyLabel + " " + directProtocol + " " + (directPort || "端口") + " 已可用"
           : info.portStatus === "open"
           ? portRequirement + " 已放行"
           : info.portStatus === "blocked"
@@ -1672,8 +1699,9 @@ function normalizeIpv4(value) {
   return octets.join(".");
 }
 
-function requestIpv4(request) {
-  return normalizeIpv4(request.headers.get("CF-Connecting-IP"));
+function requestIpAddress(request, family) {
+  const sourceIp = request.headers.get("CF-Connecting-IP");
+  return family === "ipv6" ? normalizeIpv6(sourceIp) : normalizeIpv4(sourceIp);
 }
 
 function publicRouteHostname(value) {
@@ -1750,6 +1778,9 @@ async function publicRouteProbeResponse(request, env) {
   const port = Number.parseInt(String(payload?.port || ""), 10);
   const httpPort = Number.parseInt(String(payload?.httpPort || ""), 10);
   const tlsEnabled = payload?.tlsEnabled !== false;
+  const family = ["ipv4", "ipv6"].includes(String(payload?.family || ""))
+    ? String(payload.family)
+    : mode === "direct" ? "ipv4" : "";
   if (!uuid || !mode || !domain || (mode === "direct" && (
     !Number.isInteger(port) || port < 1 || port > 65535
     || (tlsEnabled && (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535))
@@ -1760,12 +1791,12 @@ async function publicRouteProbeResponse(request, env) {
   const authError = await authorizeNodeRelayRequest(request, env, uuid);
   if (authError) return authError;
 
-  // 直连探测请求由节点强制通过 IPv4 访问 Worker。只信任本次请求中
-  // Cloudflare 看到的出口地址，避免旧节点记录或 IPv6 出口指向错误入口。
+  // 直连探测请求由节点强制通过指定地址族访问 Worker。只信任本次请求中
+  // Cloudflare 看到的出口地址，避免把 IPv4/IPv6 或旧节点记录相互混用。
   const host = mode === "direct"
-    ? requestIpv4(request)
+    ? requestIpAddress(request, family)
     : "";
-  if (mode === "direct" && !host) return json({ error: "node_public_ipv4_unavailable" }, 409);
+  if (mode === "direct" && !host) return json({ error: `node_public_${family}_unavailable` }, 409);
 
   const ports = mode === "direct"
     ? [...new Set([port, ...(tlsEnabled ? [httpPort] : [])])]
@@ -1778,6 +1809,7 @@ async function publicRouteProbeResponse(request, env) {
     return json({
       ok: false,
       mode,
+      family,
       domain,
       host,
       port,
@@ -1797,6 +1829,7 @@ async function publicRouteProbeResponse(request, env) {
   return json({
     ok,
     mode,
+    family,
     domain,
     host: mode === "direct" ? host : null,
     port: mode === "direct" ? port : 7844,
@@ -1820,6 +1853,9 @@ async function directPortProbeResponse(request, env) {
   }
 
   const uuid = safeNodeId(payload?.uuid);
+  const family = ["ipv4", "ipv6"].includes(String(payload?.family || ""))
+    ? String(payload.family)
+    : "ipv4";
   const ports = Array.isArray(payload?.ports)
     ? [...new Set(payload.ports.map((port) => Number.parseInt(String(port), 10)).filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535))].slice(0, DIRECT_PORT_PROBE_LIMIT)
     : [];
@@ -1828,13 +1864,13 @@ async function directPortProbeResponse(request, env) {
   const authError = await authorizeNodeRelayRequest(request, env, uuid);
   if (authError) return authError;
 
-  // 节点会强制通过 IPv4 请求此端点，因此这里得到的地址与直连 A 记录、
-  // IPv4 临时监听器属于同一地址族。不要回退到可能过期或为 IPv6 的注册地址。
-  const host = requestIpv4(request);
-  if (!host) return json({ error: "node_public_ipv4_unavailable" }, 409);
+  // 节点会强制通过指定地址族请求此端点，因此这里得到的地址与对应的
+  // A/AAAA 记录和临时监听器属于同一地址族。
+  const host = requestIpAddress(request, family);
+  if (!host) return json({ error: `node_public_${family}_unavailable` }, 409);
 
   const results = await Promise.all(ports.map((port) => probePublicTcpPort(host, port)));
-  return json({ ok: true, checkedAt: Date.now(), host, results });
+  return json({ ok: true, checkedAt: Date.now(), family, host, results });
 }
 
 async function relayTeamNodeRequest(request, env, ctx) {
