@@ -553,6 +553,7 @@ function tunnelConnectivityView(node) {
     dns_error: "Tunnel 域名解析失败",
     origin_error: "Tunnel 已到达，但源站异常",
     endpoint_missing: "未配置 Tunnel 域名",
+    endpoint_not_cloudflare: "域名未经过 Cloudflare Tunnel",
     not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
     not_checked: "等待节点上报检查结果",
     unknown: "暂无检查结果"
@@ -1137,6 +1138,7 @@ async function dashboardPageResponse(request, env) {
           dns_error: "Tunnel 域名解析失败",
           origin_error: "Tunnel 已到达，但源站异常",
           endpoint_missing: "未配置 Tunnel 域名",
+          endpoint_not_cloudflare: "域名未经过 Cloudflare Tunnel",
           not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
           not_checked: "等待节点上报检查结果",
           unknown: "暂无检查结果"
@@ -1579,9 +1581,17 @@ async function directPortProbeResponse(request, env) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ uuid })
   });
-  if (!sourceResponse.ok) return new Response(sourceResponse.body, { status: sourceResponse.status, headers: sourceResponse.headers });
-  const source = await sourceResponse.json();
-  const host = String(source?.sourceIp || "").trim();
+  let source = null;
+  if (sourceResponse.ok) {
+    source = await sourceResponse.json();
+  } else if (sourceResponse.status !== 404) {
+    return new Response(sourceResponse.body, { status: sourceResponse.status, headers: sourceResponse.headers });
+  }
+
+  // 启动阶段节点还没有完成首次注册，Durable Object 中没有 sourceIp。
+  // Worker 本身看到的 CF-Connecting-IP 就是这次探测请求的公网出口 IP，
+  // 可用于首次 Tunnel 失败后的直连探测；注册完成后优先使用已记录地址。
+  const host = String(source?.sourceIp || request.headers.get("CF-Connecting-IP") || "").trim();
   if (!host) return json({ error: "node_public_ip_unavailable" }, 409);
 
   const results = await Promise.all(ports.map((port) => probePublicTcpPort(host, port)));

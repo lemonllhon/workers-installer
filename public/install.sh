@@ -132,8 +132,9 @@ auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后�
 如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
 CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
 AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
-AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；Tunnel 连续异常后，节点会由 Worker 从公网探测直连端口，443+80 都可达时申请 Let's Encrypt，否则使用探测到的 HTTP 端口。
+AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；节点启动后先验证 Cloudflare Tunnel，Tunnel 不可用时立即由 Worker 从公网探测直连端口，443+80 都可达时申请 Let's Encrypt，否则使用探测到的 HTTP 端口。
 候选端口全部失败后，会按 DIRECT_PORT_SCAN_PORTS 和 DIRECT_PORT_SCAN_RANGE 扩展探测；DIRECT_PORT_SCAN_MAX 默认 256，避免一次性扫描全部端口。
+Tunnel 和直连都没有可用路线时，节点会写入 `.no-route` 标记并以退出码 78 停止，systemd、Supervisor 和 PM2 不会继续反复拉起；修复云安全组/上游网络后重新运行安装器即可清除标记并重新探测。
 USAGE
 }
 
@@ -872,6 +873,8 @@ JSON
 write_env_file() {
   : > "${ENV_FILE}"
   chmod 0600 "${ENV_FILE}"
+  # 重新安装/更新时允许节点重新进行 Tunnel 优先探测。
+  rm -f -- "${FILE_PATH}/.no-route"
   write_env_value "NODE_ENV" "production"
   write_env_value "SERVER_PORT" "${SERVER_PORT}"
   write_env_value "PORT" "${SERVER_PORT}"
@@ -936,7 +939,13 @@ ENV_FILE="${ENV_FILE}"
 NODE_BIN="${NODE_BIN}"
 APP_DIR="${APP_DIR}"
 LOG_FILE="${FILE_PATH}/nodejs-argo.log"
+STOP_MARKER="${FILE_PATH}/.no-route"
 child_pid=""
+
+if [[ -f "\${STOP_MARKER}" ]]; then
+  printf '[runner] no usable Tunnel or direct route was detected; remove \${STOP_MARKER} after fixing network access\n' >>"\${LOG_FILE}"
+  exit 78
+fi
 
 stop_runner() {
   if [[ -n "\${child_pid}" ]] && kill -0 "\${child_pid}" >/dev/null 2>&1; then
@@ -960,6 +969,10 @@ while true; do
   wait "\${child_pid}"
   status="\$?"
   child_pid=""
+  if [[ "\${status}" -eq 78 || -f "\${STOP_MARKER}" ]]; then
+    printf '[runner] node stopped because no usable route was detected\n' >>"\${LOG_FILE}"
+    exit 78
+  fi
   printf '[runner] node exited with code %s; restarting in 10 seconds\\n' "\${status}" >>"\${LOG_FILE}"
   sleep 10
 done
@@ -983,6 +996,7 @@ WorkingDirectory=${APP_DIR}/app
 ExecStart=${RUNNER_SCRIPT}
 Restart=always
 RestartSec=10
+RestartPreventExitStatus=78
 NoNewPrivileges=true
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -1084,7 +1098,8 @@ command=${RUNNER_SCRIPT}
 directory=${APP_DIR}/app
 user=${SERVICE_USER}
 autostart=true
-autorestart=true
+autorestart=unexpected
+exitcodes=0,78
 stopsignal=TERM
 stopasgroup=true
 killasgroup=true
@@ -1207,6 +1222,7 @@ start_pm2_service() {
       --interpreter "${BASH_BIN}" \
       --instances 1 \
       --restart-delay 10000 \
+      --stop-exit-codes 78 \
       --time \
       --update-env
   run_as_service_user env \

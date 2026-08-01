@@ -139,6 +139,8 @@ const directNginxPidPath = path.join(FILE_PATH, "nginx.pid");
 const directAcmePath = path.join(FILE_PATH, "acme");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
+const noRouteMarkerPath = path.resolve(FILE_PATH, ".no-route");
+const NO_ROUTE_EXIT_CODE = 78;
 const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
 const CERTBOT_BIN = process.env.CERTBOT_BIN || "/usr/bin/certbot";
 
@@ -586,13 +588,23 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
     });
     const bodyText = typeof response.data === "string" ? response.data.slice(0, 512) : "";
     const isTunnelInactive = response.status === 530 || /error\s*code:\s*1033/i.test(bodyText);
+    const responseHeaders = response.headers || {};
+    const isCloudflareEdge = Boolean(responseHeaders["cf-ray"])
+      || /cloudflare/i.test(String(responseHeaders.server || ""));
+    const endpointNotTunnel = !isCloudflareEdge && !isTunnelInactive;
     const value = {
       ...baseResult,
       ...portResult,
-      status: isTunnelInactive ? "offline" : response.status >= 500 ? "degraded" : "connected",
+      status: isTunnelInactive || endpointNotTunnel
+        ? "offline"
+        : response.status >= 500 ? "degraded" : "connected",
       httpStatus: Number.isFinite(Number(response.status)) ? Number(response.status) : null,
       latencyMs: Math.max(0, Date.now() - startedAt),
-      reason: isTunnelInactive ? "tunnel_inactive" : response.status >= 500 ? "origin_error" : "edge_reachable"
+      reason: isTunnelInactive
+        ? "tunnel_inactive"
+        : endpointNotTunnel
+          ? "endpoint_not_cloudflare"
+          : response.status >= 500 ? "origin_error" : "edge_reachable"
     };
     tunnelConnectivityCache = { key: cacheKey, value };
     return value;
@@ -965,7 +977,9 @@ function writeDirectFallbackEnv(plan) {
     CF_DNS_ENABLED: CF_API_TOKEN ? "true" : "false",
     CF_DNS_RECORD_NAME: ARGO_DOMAIN,
     CF_DNS_REPLACE_CNAME: "true",
-    AUTO_DIRECT_FALLBACK: "false",
+    // DIRECT_MODE 会阻止 Tunnel 启动，因此保留自动探测，让重启后的
+    // 直连模式继续验证公网端口；如果全部端口失效，启动流程会停止。
+    AUTO_DIRECT_FALLBACK: "true",
     CF_API_TOKEN,
     CLOUDFLARE_API_KEY: CF_API_TOKEN
   };
@@ -1006,7 +1020,8 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
     "port_blocked",
     "edge_timeout",
     "edge_request_failed",
-    "tunnel_inactive"
+    "tunnel_inactive",
+    "endpoint_not_cloudflare"
   ]);
   if (!fallbackReasons.has(String(tunnelConnectivity?.reason || ""))) {
     return false;
@@ -1020,16 +1035,16 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
   }
 
   if (!CF_API_TOKEN) {
-    console.error("Cloudflare Tunnel 不可用，但未配置 Cloudflare API Token，无法自动更新 ARGO_DOMAIN DNS；保持 Tunnel 模式");
-    return false;
+    await stopForNoRoute("未配置 Cloudflare API Token，无法把 ARGO_DOMAIN 切换为直连 DNS");
+    return true;
   }
   if (!NODEJS_ARGO_ENV_FILE) {
-    console.error("Cloudflare Tunnel 不可用，但未配置 NODEJS_ARGO_ENV_FILE，无法自动持久化直连模式；保持 Tunnel 模式");
-    return false;
+    await stopForNoRoute("未配置 NODEJS_ARGO_ENV_FILE，无法持久化直连模式");
+    return true;
   }
   if (!TEAMNODE_SYNC_RELAY_TOKEN) {
-    console.error("Cloudflare Tunnel 不可用，但当前 TeamNode 不是 Worker 中继模式，无法由 Worker 探测公网端口；保持 Tunnel 模式");
-    return false;
+    await stopForNoRoute("未配置 TeamNode Worker 中继令牌，无法从公网探测直连端口");
+    return true;
   }
 
   directFallbackPromise = (async () => {
@@ -1045,11 +1060,19 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
       + `${plan.tlsEnabled ? "（证书将申请/续期）" : "（不申请证书）"}，正在重启服务应用新配置`
     );
     await stopRuntimeProcesses();
+    await stopArgoGateway();
+    removeCloudflaredRuntimeArtifacts();
     await shutdownTeamNodeSync("direct_fallback");
     setTimeout(() => process.exit(0), 100);
     return true;
   })()
     .catch((error) => {
+      if (error?.code === "NO_ROUTE_DETECTED") {
+        stopForNoRoute(error.message).catch((stopError) => {
+          console.error(`停止无路线节点失败：${stopError.message}`);
+        });
+        return true;
+      }
       console.error(`自动切换直连失败：${error.message}`);
       directFallbackPromise = null;
       return false;
@@ -1058,22 +1081,79 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
   return directFallbackPromise;
 }
 
-async function normalizeDirectModePorts() {
-  if (!DIRECT_MODE || !AUTO_DIRECT_FALLBACK || !TEAMNODE_SYNC_RELAY_TOKEN || !NODEJS_ARGO_ENV_FILE) {
-    return false;
+function findTemporaryTunnelDomain() {
+  for (const logPath of [bootLogPath, cloudflaredBootLogPath]) {
+    try {
+      if (!fs.existsSync(logPath)) continue;
+      const content = fs.readFileSync(logPath, "utf8");
+      const match = content.match(/https?:\/\/([^\s/]+\.trycloudflare\.com)/i);
+      if (match?.[1]) return match[1];
+    } catch {
+      // 日志可能还在被 cloudflared 写入，下一次启动会再次探测。
+    }
+  }
+  return "";
+}
+
+async function activateDirectFallbackAtStartup(tunnelConnectivity) {
+  if (!AUTO_DIRECT_FALLBACK) {
+    throw noRouteError(`Cloudflare Tunnel 不可用（${tunnelConnectivity?.reason || "unknown"}），且已关闭 AUTO_DIRECT_FALLBACK`);
+  }
+  if (!CF_API_TOKEN) {
+    throw noRouteError("未配置 Cloudflare API Token，无法把 ARGO_DOMAIN 切换为直连 DNS");
+  }
+  if (!NODEJS_ARGO_ENV_FILE) {
+    throw noRouteError("未配置 NODEJS_ARGO_ENV_FILE，无法持久化直连模式");
+  }
+  if (!TEAMNODE_SYNC_RELAY_TOKEN) {
+    throw noRouteError("未配置 TeamNode Worker 中继令牌，无法从公网探测直连端口");
   }
 
   const discovery = await discoverDirectPortPlan();
   const plan = discovery.plan;
   if (!plan) {
-    console.warn(`候选端口和扩展扫描均未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}，继续使用现有配置`);
-    return false;
+    throw noRouteError(
+      `候选端口和扩展扫描均未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}`
+    );
+  }
+
+  writeDirectFallbackEnv(plan);
+  await stopRuntimeProcesses();
+  await stopArgoGateway();
+  removeCloudflaredRuntimeArtifacts();
+  await shutdownTeamNodeSync("startup_direct_fallback");
+  console.warn(
+    `Tunnel 启动探测失败，已选择直连 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
+    + `${plan.tlsEnabled ? "（443+80 可达，重启后申请/续期证书）" : "（不申请证书）"}，正在重启服务`
+  );
+  setTimeout(() => process.exit(0), 100);
+  return true;
+}
+
+async function prepareDirectModeStartup() {
+  if (!DIRECT_MODE) return false;
+  // 直连模式不启动 Tunnel；删除本地凭据/配置，避免旧 Tunnel 残留。
+  removeCloudflaredRuntimeArtifacts();
+  if (!AUTO_DIRECT_FALLBACK) return false;
+  if (!TEAMNODE_SYNC_RELAY_TOKEN || !NODEJS_ARGO_ENV_FILE) {
+    throw noRouteError("直连模式缺少 Worker 中继令牌或 NODEJS_ARGO_ENV_FILE，无法验证公网端口");
+  }
+
+  const discovery = await discoverDirectPortPlan();
+  const plan = discovery.plan;
+  if (!plan) {
+    throw noRouteError(
+      `直连模式启动探测未找到可用 HTTP/HTTPS 端口${discovery.error ? `：${discovery.error}` : ""}`
+    );
   }
 
   const samePlan = DIRECT_TLS_ENABLED === plan.tlsEnabled
     && DIRECT_PORT === plan.port
     && DIRECT_HTTP_PORT === plan.httpPort;
-  if (samePlan) return false;
+  if (samePlan) {
+    console.log(`直连启动探测通过：${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`);
+    return false;
+  }
 
   writeDirectFallbackEnv(plan);
   console.warn(
@@ -1082,6 +1162,24 @@ async function normalizeDirectModePorts() {
   );
   setTimeout(() => process.exit(0), 100);
   return true;
+}
+
+async function prepareTunnelStartup() {
+  if (DIRECT_MODE || PLATFORM_PROXY_MODE) return false;
+
+  const probeDomain = ARGO_DOMAIN || findTemporaryTunnelDomain();
+  const tunnelConnectivity = await checkCloudflareTunnelConnectivity(probeDomain, { force: true });
+  console.log(
+    `启动时 Cloudflare Tunnel 探测：${tunnelConnectivity.status}；`
+    + `${tunnelConnectivity.reason}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port}`
+  );
+  if (tunnelConnectivity.status === "connected") {
+    console.log("Cloudflare Tunnel 启动探测通过，继续使用 Tunnel 模式");
+    return false;
+  }
+
+  console.warn(`Cloudflare Tunnel 启动探测失败：${tunnelConnectivity.reason}，开始探测直连端口`);
+  return activateDirectFallbackAtStartup(tunnelConnectivity);
 }
 
 async function syncNodeToTeamNode(context) {
@@ -2108,12 +2206,62 @@ function stopProcessByPid(pid) {
   }
 }
 
+function removeCloudflaredRuntimeArtifacts() {
+  for (const filePath of [tunnelJsonPath, tunnelYamlPath]) {
+    try {
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (error) {
+      console.warn(`清理 Cloudflare Tunnel 配置失败：${filePath}；${error.message}`);
+    }
+  }
+}
+
+async function stopArgoGateway() {
+  if (!argoGatewayServer || argoGatewayServer === appServer) {
+    argoGatewayServer = null;
+    return;
+  }
+
+  const server = argoGatewayServer;
+  argoGatewayServer = null;
+  await new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    server.close(finish);
+    setTimeout(finish, 1000).unref?.();
+  });
+}
+
 async function stopRuntimeProcesses() {
   stopProcessByPid(cloudflaredProcessId);
   stopProcessByPid(xrayProcessId);
   cloudflaredProcessId = null;
   xrayProcessId = null;
   await new Promise((resolve) => setTimeout(resolve, 250));
+}
+
+function noRouteError(message) {
+  const error = new Error(message);
+  error.code = "NO_ROUTE_DETECTED";
+  return error;
+}
+
+async function stopForNoRoute(message) {
+  console.error(`Tunnel 和直连均未探测到可用路线，程序停止：${message}`);
+  try {
+    fs.writeFileSync(noRouteMarkerPath, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
+  } catch (error) {
+    console.error(`无法写入无路线标记：${error.message}`);
+  }
+  await shutdownTeamNodeSync("no_route_detected");
+  await stopRuntimeProcesses();
+  await stopArgoGateway();
+  removeCloudflaredRuntimeArtifacts();
+  process.exit(NO_ROUTE_EXIT_CODE);
 }
 
 // 启动 Xray、cloudflared
@@ -2509,7 +2657,7 @@ async function startserver() {
     validateDirectMode();
     validatePlatformProxyMode();
     validateCloudflareDnsMode();
-    if (await normalizeDirectModePorts()) return;
+    if (await prepareDirectModeStartup()) return;
     await syncCloudflareDnsRecord();
     startCloudflareDnsSyncLoop();
     deleteNodes();
@@ -2517,9 +2665,14 @@ async function startserver() {
     argoType();
     await generateConfig();
     await startProcesses();
+    if (await prepareTunnelStartup()) return;
     await extractDomains();
     await AddVisitTask();
   } catch (error) {
+    if (error?.code === "NO_ROUTE_DETECTED") {
+      await stopForNoRoute(error.message);
+      return;
+    }
     console.error("startserver 执行失败:", error);
   }
 }
