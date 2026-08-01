@@ -97,6 +97,9 @@ const TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT = parseBoolean(
 const TEAMNODE_SYNC_SHUTDOWN_TIMEOUT_MS = 3000;
 const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
 const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
+const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
+const PUBLIC_ROUTE_PROBE_ATTEMPTS = 5;
+const PUBLIC_ROUTE_PROBE_RETRY_DELAY_MS = 3000;
 
 // Docker 镜像内置二进制目录
 const BIN_PATH = process.env.BIN_PATH || "/usr/local/bin";
@@ -141,9 +144,16 @@ const directAcmePath = path.join(FILE_PATH, "acme");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
 const noRouteMarkerPath = path.resolve(FILE_PATH, ".no-route");
+const routeReadyMarkerPath = path.resolve(FILE_PATH, ".route-ready");
 const NO_ROUTE_EXIT_CODE = 78;
 const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
 const CERTBOT_BIN = process.env.CERTBOT_BIN || "/usr/bin/certbot";
+
+try {
+  fs.rmSync(routeReadyMarkerPath, { force: true });
+} catch {
+  // 后续公网验证通过后仍会覆盖成功标记。
+}
 
 let teamnodeSyncTimer = null;
 let tunnelTestCommandPollTimer = null;
@@ -155,6 +165,7 @@ let directCertificateRenewalTimer = null;
 let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
 let tunnelConnectivityCache = null;
+let publicRouteProbeCache = null;
 let tunnelFailureStreak = 0;
 let directFallbackPromise = null;
 let xrayProcessId = null;
@@ -860,6 +871,102 @@ function createDirectPortListener(port) {
   });
 }
 
+async function probePublicRoute({ domain = ARGO_DOMAIN, mode = DIRECT_MODE ? "direct" : "tunnel", port = DIRECT_PORT, httpPort = DIRECT_HTTP_PORT, tlsEnabled = DIRECT_TLS_ENABLED } = {}) {
+  if (!TEAMNODE_SYNC_RELAY_TOKEN) {
+    return { ok: false, externalStatus: "blocked", reason: "relay_token_missing", checkedAt: Date.now() };
+  }
+
+  try {
+    const response = await postTeamNodeSync(
+      PUBLIC_ROUTE_PROBE_PATH,
+      {
+        uuid: UUID,
+        domain,
+        mode,
+        port: mode === "direct" ? port : 7844,
+        httpPort: mode === "direct" && tlsEnabled ? httpPort : null,
+        tlsEnabled: mode === "direct" ? tlsEnabled : true
+      },
+      "nodejs_argo_public_route_probe"
+    );
+    if (!response || response.status !== 200 || !response.data) {
+      return {
+        ok: false,
+        externalStatus: "blocked",
+        reason: `public_probe_rejected_${response?.status || "unknown"}`,
+        checkedAt: Date.now()
+      };
+    }
+    return response.data;
+  } catch (error) {
+    return {
+      ok: false,
+      externalStatus: "blocked",
+      reason: String(error?.response?.data?.error || error?.message || "public_probe_failed").slice(0, 64),
+      checkedAt: Date.now()
+    };
+  }
+}
+
+function mergePublicRouteProbe(connectivity, publicProbe) {
+  if (!connectivity || !publicProbe) return connectivity;
+  const reachable = publicProbe.ok === true || publicProbe.externalStatus === "reachable";
+  const directMode = connectivity.mode === "direct";
+  return {
+    ...connectivity,
+    publicProbeStatus: reachable ? "reachable" : "blocked",
+    publicProbeAt: Number(publicProbe.checkedAt || Date.now()),
+    publicProbeReason: String(publicProbe.reason || "unknown").slice(0, 64),
+    publicProbeHttpStatus: Number.isFinite(Number(publicProbe.httpStatus)) ? Number(publicProbe.httpStatus) : null,
+    publicProbeBlockedPort: Number.isFinite(Number(publicProbe.blockedPort)) ? Number(publicProbe.blockedPort) : null,
+    ...(reachable
+      ? {}
+      : { status: "offline", reason: String(publicProbe.reason || "public_probe_failed").slice(0, 64) })
+  };
+}
+
+async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ARGO_DOMAIN } = {}) {
+  const mode = DIRECT_MODE ? "direct" : "tunnel";
+  let lastProbe = null;
+  for (let attempt = 1; attempt <= PUBLIC_ROUTE_PROBE_ATTEMPTS; attempt += 1) {
+    lastProbe = await probePublicRoute({
+      domain,
+      mode,
+      port: DIRECT_MODE ? DIRECT_PORT : 7844,
+      httpPort: DIRECT_MODE && DIRECT_TLS_ENABLED ? DIRECT_HTTP_PORT : null,
+      tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
+    });
+    if (lastProbe?.ok) {
+      publicRouteProbeCache = { ...lastProbe, mode, domain };
+      console.log(
+        `Worker 公网路由探测通过：${mode === "direct" ? (DIRECT_TLS_ENABLED ? "HTTPS" : "HTTP") : "Tunnel"}`
+        + ` ${domain}${DIRECT_MODE ? `:${DIRECT_PORT}` : ""}`
+        + `${lastProbe.httpStatus ? `（HTTP ${lastProbe.httpStatus}）` : ""}`
+      );
+      return lastProbe;
+    }
+    console.warn(`Worker 公网路由探测失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`);
+    if (attempt < PUBLIC_ROUTE_PROBE_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, PUBLIC_ROUTE_PROBE_RETRY_DELAY_MS));
+    }
+  }
+
+  publicRouteProbeCache = lastProbe ? { ...lastProbe, mode, domain } : null;
+  if (throwOnFailure) {
+    throw noRouteError(`install.lemon.vin 公网探测未通过：${lastProbe?.reason || "public_route_unreachable"}`);
+  }
+  return lastProbe || { ok: false, reason: "public_route_unreachable" };
+}
+
+function markRouteReady() {
+  try {
+    fs.writeFileSync(routeReadyMarkerPath, `${new Date().toISOString()} ${ARGO_DOMAIN || "platform"}\n`, { mode: 0o600 });
+    console.log("公网路由启动验证通过，已允许节点注册");
+  } catch (error) {
+    throw new Error(`无法写入公网路由成功标记：${error.message}`);
+  }
+}
+
 function closeDirectPortListener(server) {
   if (!server) return Promise.resolve();
   return new Promise((resolve) => {
@@ -1193,8 +1300,17 @@ async function prepareTunnelStartup() {
     + `${tunnelConnectivity.reason}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port}`
   );
   if (tunnelConnectivity.status === "connected") {
-    console.log("Cloudflare Tunnel 启动探测通过，继续使用 Tunnel 模式");
-    return false;
+    const publicProbe = await verifyPublicRouteAtStartup({ throwOnFailure: false, domain: probeDomain });
+    if (publicProbe?.ok) {
+      console.log("Cloudflare Tunnel 本机和 Worker 公网启动探测均通过，继续使用 Tunnel 模式");
+      return false;
+    }
+    console.warn(`Cloudflare Tunnel 本机探测通过，但 Worker 公网探测失败：${publicProbe?.reason || "unknown"}`);
+    return activateDirectFallbackAtStartup({
+      ...tunnelConnectivity,
+      status: "offline",
+      reason: publicProbe?.reason || "public_route_unreachable"
+    });
   }
 
   console.warn(`Cloudflare Tunnel 启动探测失败：${tunnelConnectivity.reason}，开始探测直连端口`);
@@ -1206,19 +1322,30 @@ async function syncNodeToTeamNode(context) {
     return null;
   }
 
-  const [ipRisk, tunnelConnectivity] = await Promise.all([
+  const [ipRisk, tunnelConnectivity, publicProbe] = await Promise.all([
     context.ipRisk && !teamnodeSyncRegistered
       ? context.ipRisk
       : resolveTeamNodeIpRiskInfo(),
-    checkCloudflareTunnelConnectivity(context.argoDomain)
+    checkCloudflareTunnelConnectivity(context.argoDomain),
+    probePublicRoute({
+      domain: context.argoDomain,
+      mode: DIRECT_MODE ? "direct" : "tunnel",
+      port: DIRECT_MODE ? DIRECT_PORT : 7844,
+      tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
+    })
   ]);
+  const verifiedTunnelConnectivity = mergePublicRouteProbe(tunnelConnectivity, publicProbe);
   const syncContext = {
     ...context,
     ipRisk,
-    tunnelConnectivity
+    tunnelConnectivity: verifiedTunnelConnectivity
   };
 
-  console.log(`Cloudflare Tunnel 连通性：${tunnelConnectivity.status}；${tunnelConnectivity.requiredProtocols.join("/")} ${tunnelConnectivity.port} ${tunnelConnectivity.portStatus}`);
+  console.log(
+    `Cloudflare Tunnel 连通性：${verifiedTunnelConnectivity.status}；`
+    + `${verifiedTunnelConnectivity.requiredProtocols.join("/")} ${verifiedTunnelConnectivity.port} ${verifiedTunnelConnectivity.portStatus}；`
+    + `Worker 公网探测：${verifiedTunnelConnectivity.publicProbeStatus || "unknown"}`
+  );
 
   teamnodeSyncContext = syncContext;
 
@@ -1226,7 +1353,7 @@ async function syncNodeToTeamNode(context) {
     const response = teamnodeSyncRegistered
       ? await syncNodeHeartbeatToTeamNode(syncContext)
       : await syncNodeRegistrationToTeamNode(syncContext);
-    await maybeActivateDirectFallback(syncContext, tunnelConnectivity);
+    await maybeActivateDirectFallback(syncContext, verifiedTunnelConnectivity);
     return response;
   } catch (error) {
     const status = error?.response?.status ? ` (HTTP ${error.response.status})` : "";
@@ -2273,6 +2400,7 @@ async function stopForNoRoute(message) {
   console.error(`Tunnel 和直连均未探测到可用路线，程序停止：${message}`);
   try {
     fs.writeFileSync(noRouteMarkerPath, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
+    fs.rmSync(routeReadyMarkerPath, { force: true });
   } catch (error) {
     console.error(`无法写入无路线标记：${error.message}`);
   }
@@ -2685,6 +2813,10 @@ async function startserver() {
     await generateConfig();
     await startProcesses();
     if (await prepareTunnelStartup()) return;
+    if (DIRECT_MODE) {
+      await verifyPublicRouteAtStartup();
+    }
+    markRouteReady();
     await extractDomains();
     await AddVisitTask();
   } catch (error) {

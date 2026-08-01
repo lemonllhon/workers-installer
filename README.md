@@ -368,7 +368,7 @@ env \
 
 安装器会检测已启用的 UFW、firewalld、nftables 或 iptables，并按 `CLOUDFLARED_PROTOCOL` 尝试幂等放行出站 `7844`：`http2` 为 TCP，`quic` 为 UDP，`auto` 为 TCP 和 UDP。Cloudflare Tunnel 是出站连接，不需要为了 Tunnel 打开入站 `7844`。云平台安全组、VPS 上游防火墙或服务商网络策略不在机器内部，安装器无法代为修改；面板会通过节点探测结果显示端口是否仍被阻断。
 
-安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES` 的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会让 Worker 从公网探测本机临时监听的候选端口。如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时将 `ARGO_DOMAIN` 更新为 DNS-only A 记录；如果证书组件不可用或这两个端口不同时可达，则选择可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多扫描 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。探测到直连路线后会写入 `.env`、清理本地 Tunnel 配置并重启服务，重启后面板显示“直连模式”。
+安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES` 的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会让 `install.lemon.vin` 从公网向本机临时监听的候选端口建立 TCP 连接，这一步能够覆盖云平台安全组、上游防火墙和运营商入口策略。如果 TCP `443` 和 `80` 都能从公网到达，则切换为 HTTPS 直连，在应用目录内申请并定期续期 Let's Encrypt 证书，同时将 `ARGO_DOMAIN` 更新为 DNS-only A 记录；如果证书组件不可用或这两个端口不同时可达，则选择可用端口使用 HTTP，不强制申请证书。如果初始候选端口也全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多扫描 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。直连网关启动后，Worker 还会从公网向最终域名发起一次 HTTP/HTTPS 请求；只有 TCP 和最终请求都通过，节点才会注册到面板。
 
 如果 Tunnel 和直连都探测不到可用路线，程序不会继续空转重启：会在数据目录写入 `.no-route`，以退出码 `78` 停止，systemd、Supervisor 和 PM2 也会停止拉起。修复云平台安全组、上游防火墙或运营商网络后，重新运行安装器会清除该标记并再次按 Tunnel 优先顺序探测。直连模式下不会启动 Cloudflare Tunnel，也不会删除 Cloudflare 控制台中的远端 Tunnel 资源；仅清理本机运行进程和凭据文件，避免误删共享 Tunnel。
 
@@ -384,13 +384,13 @@ DIRECT_PORT_SCAN_MAX=256
 
 安装器只能修改目标机器上的 UFW、firewalld、nftables 或 iptables；云厂商安全组、上游防火墙和运营商网络仍需在厂商控制台放行。当前使用的 Cloudflare API Token 只应授予目标 Zone 的 DNS Read/Edit 权限，不要把 Token 放入 GitHub、公开安装命令或日志；如果曾经暴露过 Token，应先在 Cloudflare 中撤销并重新创建。
 
-面板每台在线机器的 Cloudflare Tunnel 状态旁提供“立即检测”。点击后由 `install.lemon.vin` 排队并下发一次性检测指令，目标机器本地执行 7844 探测，再把结果回传到面板；Worker 或浏览器本身不会冒充目标机器测试。默认每 15 秒轮询一次指令，节点收到后会绕过缓存立即检测。对 `http2`，本机 TCP 7844 连接超时或失败会显示“出站端口被阻断”；这表示本机已经执行探测。若机器离线、服务未运行或没有在指令有效期内收到指令，面板会显示“本机未响应检测指令”，不能把这种情况直接等同于端口关闭。`quic` 的 UDP 端口不能用普通 TCP 连接判断，面板会以 cloudflared 实际 Tunnel 状态和协议要求为准。
+面板每台在线机器的 Cloudflare Tunnel 状态旁提供“立即检测”。点击后由 `install.lemon.vin` 排队并下发一次性检测指令，目标机器本地执行 7844 探测，再把结果回传到面板；启动前和每次心跳还会由 Worker 从公网验证最终 Tunnel/直连域名。7844 是 Tunnel 的出站传输端口，Worker 不能通过“连接本机入站 7844”判断 Tunnel；最终域名的公网请求才是 Tunnel 路由是否真正可访问的验证。对 `http2`，本机 TCP 7844 连接超时或失败会显示“出站端口被阻断”；这表示本机已经执行探测。若机器离线、服务未运行或没有在指令有效期内收到指令，面板会显示“本机未响应检测指令”，不能把这种情况直接等同于端口关闭。`quic` 的 UDP 端口不能用普通 TCP 连接判断，面板会以 cloudflared 实际 Tunnel 状态和协议要求为准。
 
 ### 安装完成后检查心跳
 
 兑换成功只说明 Worker 已签发中继令牌，还需要确认 Node.js 已加载 `.env` 并成功发送心跳：
 
-安装器会按 `1/10` 到 `10/10` 显示阶段进度，包括兑换令牌、下载并校验组件、写入配置、启动服务和运行检查。交互式终端下载组件时还会显示下载进度；安装结束前会等待 `SERVER_PORT` 和 `ARGO_PORT` 进入监听状态，端口未启动会明确报错，不会直接显示安装成功。
+安装器会按 `1/10` 到 `10/10` 显示阶段进度，包括兑换令牌、下载并校验组件、写入配置、启动服务和运行检查。交互式终端下载组件时还会显示下载进度。安装检查分为两层：首先只在本机等待 `SERVER_PORT` 和 `ARGO_PORT` 进入监听状态；随后单独等待 Worker 从公网验证最终 Tunnel/直连路线。3000/8001 等本机服务端口不会被当成公网入口探测，只有两层都通过才会显示安装成功。
 
 ```bash
 APP_DIR=/opt/nodejs-argo-no-docker
@@ -491,7 +491,7 @@ systemd → OpenRC → SysV/init.d → Supervisor → rc.local → cron/crond
 节点路由选择顺序为：
 
 ```text
-Cloudflare Tunnel 启动并验证 → 直连候选端口/扩展端口探测 → 两者都失败则退出码 78 停止
+启动前 Worker 公网候选端口探测 → Cloudflare Tunnel 启动并验证 → Worker 公网最终路由验证 → 直连候选端口/扩展端口探测 → 两者都失败则退出码 78 停止
 ```
 
 切换到直连时会停止本机 `cloudflared`、删除本机 `tunnel.json`/`tunnel.yml`，并在下一次启动时只运行直连网关。远端 Cloudflare Tunnel 不会被自动删除。

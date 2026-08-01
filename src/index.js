@@ -13,6 +13,7 @@ const DASHBOARD_TUNNEL_TEST_PATH = "/api/nodes/tunnel-test";
 const TUNNEL_TEST_COMMANDS_PATH = "/api/internal/nodejs-argo/tunnel-test-commands";
 const TUNNEL_TEST_RESULTS_PATH = "/api/internal/nodejs-argo/tunnel-test-results";
 const DIRECT_PORT_PROBE_PATH = "/api/internal/nodejs-argo/direct-port-probe";
+const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
 const DEFAULT_TEAMNODE_UPSTREAM_BASE_URL = "https://teamnode.lemon.vin";
 const DEFAULT_TEAMNODE_KEY_ID = "nodejs-argo-prod";
 const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
@@ -100,9 +101,16 @@ function normalizeTunnelConnectivity(value) {
   const portStatus = portStatusValues.includes(String(value.portStatus || ""))
     ? String(value.portStatus)
     : "unknown";
+  const publicProbeStatusValues = ["reachable", "blocked", "unknown"];
+  const publicProbeStatus = publicProbeStatusValues.includes(String(value.publicProbeStatus || ""))
+    ? String(value.publicProbeStatus)
+    : "unknown";
   const checkedAt = Number(value.checkedAt);
+  const publicProbeAt = Number(value.publicProbeAt);
   const port = Number.parseInt(String(value.port || ""), 10);
   const httpStatus = Number.parseInt(String(value.httpStatus || ""), 10);
+  const publicProbeHttpStatus = Number.parseInt(String(value.publicProbeHttpStatus || ""), 10);
+  const publicProbeBlockedPort = Number.parseInt(String(value.publicProbeBlockedPort || ""), 10);
   const latencyMs = Number.parseInt(String(value.latencyMs || ""), 10);
   const directPort = Number.parseInt(String(value.directPort || ""), 10);
   const directHttpPort = Number.parseInt(String(value.directHttpPort || ""), 10);
@@ -120,6 +128,15 @@ function normalizeTunnelConnectivity(value) {
     requiredProtocols,
     port: Number.isFinite(port) && port > 0 && port <= 65535 ? port : 7844,
     portStatus,
+    publicProbeStatus,
+    publicProbeAt: Number.isFinite(publicProbeAt) && publicProbeAt > 0 ? publicProbeAt : null,
+    publicProbeReason: String(value.publicProbeReason || "unknown").slice(0, 64),
+    publicProbeHttpStatus: Number.isFinite(publicProbeHttpStatus) && publicProbeHttpStatus > 0 && publicProbeHttpStatus <= 999
+      ? publicProbeHttpStatus
+      : null,
+    publicProbeBlockedPort: Number.isFinite(publicProbeBlockedPort) && publicProbeBlockedPort > 0 && publicProbeBlockedPort <= 65535
+      ? publicProbeBlockedPort
+      : null,
     httpStatus: Number.isFinite(httpStatus) && httpStatus > 0 && httpStatus <= 999 ? httpStatus : null,
     latencyMs: Number.isFinite(latencyMs) && latencyMs >= 0 && latencyMs <= 120000 ? latencyMs : null,
     reason: String(value.reason || "unknown").slice(0, 64),
@@ -532,8 +549,9 @@ function tunnelPortRequirement(info = {}) {
 function tunnelConnectivityView(node) {
   const info = node?.tunnelConnectivity || {};
   const directMode = info.mode === "direct";
+  const publicProbeBlocked = info.publicProbeStatus === "blocked";
   const status = directMode
-    ? "connected"
+    ? publicProbeBlocked ? "offline" : "connected"
     : ["connected", "degraded", "offline", "unknown", "not_applicable"].includes(info.status)
     ? info.status
     : "unknown";
@@ -554,6 +572,12 @@ function tunnelConnectivityView(node) {
     origin_error: "Tunnel 已到达，但源站异常",
     endpoint_missing: "未配置 Tunnel 域名",
     endpoint_not_cloudflare: "域名未经过 Cloudflare Tunnel",
+    public_tcp_blocked: "公网 TCP 端口不可达",
+    public_http_timeout: "公网 HTTP/HTTPS 请求超时",
+    public_http_failed: "公网 HTTP/HTTPS 请求失败",
+    public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
+    public_route_reachable: "install.lemon.vin 公网探测通过",
+    relay_token_missing: "缺少 Worker 中继令牌",
     not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
     not_checked: "等待节点上报检查结果",
     unknown: "暂无检查结果"
@@ -569,8 +593,18 @@ function tunnelConnectivityView(node) {
       ? `需放行出站 ${portRequirement}`
       : portRequirement;
   const reason = directMode
-    ? `已切换直连模式${info.directHttpPort ? `；HTTP ${info.directHttpPort}` : ""}`
+    ? publicProbeBlocked
+      ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
+      : `已切换直连模式${info.directHttpPort ? `；HTTP ${info.directHttpPort}` : ""}`
     : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
+  const publicProbeDetail = info.publicProbeStatus === "reachable"
+    ? "install.lemon.vin 公网探测通过"
+    : info.publicProbeStatus === "blocked"
+      ? "install.lemon.vin 公网探测失败"
+      : "";
+  const publicProbePortDetail = info.publicProbeStatus === "blocked" && Number(info.publicProbeBlockedPort) > 0
+    ? ` · 端口 ${Number(info.publicProbeBlockedPort)} 不可达`
+    : "";
   const checkedAt = Number(info.checkedAt) > 0 ? dashboardTime(info.checkedAt) : "未检查";
   const httpStatus = Number(info.httpStatus) > 0 ? ` · HTTP ${Number(info.httpStatus)}` : "";
   const tunnelTestStatus = String(node?.tunnelTest?.status || "");
@@ -585,8 +619,8 @@ function tunnelConnectivityView(node) {
           : "";
   return {
     status,
-    label: directMode ? "直连模式" : statusLabels[status],
-    detail: `${portLabel} · ${reason}${httpStatus}${tunnelTestDetail}`,
+    label: directMode ? (publicProbeBlocked ? "直连不可达" : "直连模式") : statusLabels[status],
+    detail: `${portLabel} · ${reason}${publicProbeDetail ? ` · ${publicProbeDetail}` : ""}${publicProbePortDetail}${httpStatus}${tunnelTestDetail}`,
     checkedAt,
     title: `最后检查：${checkedAt}${tunnelTestDetail}`
   };
@@ -1127,8 +1161,9 @@ async function dashboardPageResponse(request, env) {
       function tunnelConnectivityView(node) {
         const info = node?.tunnelConnectivity || {};
         const directMode = info.mode === "direct";
+        const publicProbeBlocked = info.publicProbeStatus === "blocked";
         const statuses = ["connected", "degraded", "offline", "unknown", "not_applicable"];
-        const status = directMode ? "connected" : statuses.includes(info.status) ? info.status : "unknown";
+        const status = directMode ? (publicProbeBlocked ? "offline" : "connected") : statuses.includes(info.status) ? info.status : "unknown";
         const statusLabels = {
           connected: "已连接",
           degraded: "部分异常",
@@ -1146,6 +1181,12 @@ async function dashboardPageResponse(request, env) {
           origin_error: "Tunnel 已到达，但源站异常",
           endpoint_missing: "未配置 Tunnel 域名",
           endpoint_not_cloudflare: "域名未经过 Cloudflare Tunnel",
+          public_tcp_blocked: "公网 TCP 端口不可达",
+          public_http_timeout: "公网 HTTP/HTTPS 请求超时",
+          public_http_failed: "公网 HTTP/HTTPS 请求失败",
+          public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
+          public_route_reachable: "install.lemon.vin 公网探测通过",
+          relay_token_missing: "缺少 Worker 中继令牌",
           not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
           not_checked: "等待节点上报检查结果",
           unknown: "暂无检查结果"
@@ -1161,8 +1202,18 @@ async function dashboardPageResponse(request, env) {
             ? "需放行出站 " + portRequirement
             : portRequirement;
         const reason = directMode
-          ? "已切换直连模式" + (info.directHttpPort ? "；HTTP " + info.directHttpPort : "")
+          ? publicProbeBlocked
+            ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
+            : "已切换直连模式" + (info.directHttpPort ? "；HTTP " + info.directHttpPort : "")
           : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
+        const publicProbeDetail = info.publicProbeStatus === "reachable"
+          ? "install.lemon.vin 公网探测通过"
+          : info.publicProbeStatus === "blocked"
+            ? "install.lemon.vin 公网探测失败"
+            : "";
+        const publicProbePortDetail = info.publicProbeStatus === "blocked" && Number(info.publicProbeBlockedPort) > 0
+          ? " · 端口 " + Number(info.publicProbeBlockedPort) + " 不可达"
+          : "";
         const checkedAt = Number(info.checkedAt) > 0 ? formatTime(info.checkedAt) : "未检查";
         const httpStatus = Number(info.httpStatus) > 0 ? " · HTTP " + Number(info.httpStatus) : "";
         const tunnelTestStatus = String(node?.tunnelTest?.status || "");
@@ -1177,8 +1228,8 @@ async function dashboardPageResponse(request, env) {
                 : "";
         return {
           status,
-          label: directMode ? "直连模式" : statusLabels[status],
-          detail: portLabel + " · " + reason + httpStatus + tunnelTestDetail,
+          label: directMode ? (publicProbeBlocked ? "直连不可达" : "直连模式") : statusLabels[status],
+          detail: portLabel + " · " + reason + (publicProbeDetail ? " · " + publicProbeDetail : "") + publicProbePortDetail + httpStatus + tunnelTestDetail,
           checkedAt,
           title: "最后检查：" + checkedAt + tunnelTestDetail
         };
@@ -1562,6 +1613,152 @@ async function probePublicTcpPort(host, port) {
   }
 }
 
+function publicRouteHostname(value) {
+  const raw = String(value || "").trim();
+  if (!raw || raw.length > 253) return "";
+  try {
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `https://${raw}`);
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) return "";
+    return url.hostname;
+  } catch {
+    return "";
+  }
+}
+
+function publicRouteUrl(domain, mode, port, tlsEnabled) {
+  const hostname = publicRouteHostname(domain);
+  if (!hostname) return "";
+  const scheme = mode === "direct" && tlsEnabled === false ? "http" : "https";
+  const url = new URL(`${scheme}://${hostname}/`);
+  if (mode === "direct" && Number.isInteger(port) && port > 0 && port <= 65535) {
+    url.port = String(port);
+  }
+  return url.toString();
+}
+
+async function probePublicHttpEndpoint(url, mode) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DIRECT_PORT_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      redirect: "manual",
+      headers: { "User-Agent": "install-lemon-public-route-probe/1.0" },
+      signal: controller.signal
+    });
+    const tunnelInactive = mode === "tunnel"
+      && (response.status === 530 || response.status === 1033);
+    const httpUnavailable = response.status >= 500;
+    return {
+      status: tunnelInactive || httpUnavailable ? "blocked" : "reachable",
+      httpStatus: response.status,
+      reason: tunnelInactive
+        ? "tunnel_inactive"
+        : httpUnavailable
+          ? "public_http_unavailable"
+          : "public_http_reachable"
+    };
+  } catch (error) {
+    return {
+      status: "blocked",
+      httpStatus: null,
+      reason: error?.name === "AbortError" ? "public_http_timeout" : "public_http_failed"
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function publicRouteProbeResponse(request, env) {
+  if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return json({ error: "invalid_json" }, 400);
+  }
+
+  const uuid = safeNodeId(payload?.uuid);
+  const mode = ["tunnel", "direct"].includes(String(payload?.mode || ""))
+    ? String(payload.mode)
+    : "";
+  const domain = publicRouteHostname(payload?.domain);
+  const port = Number.parseInt(String(payload?.port || ""), 10);
+  const httpPort = Number.parseInt(String(payload?.httpPort || ""), 10);
+  const tlsEnabled = payload?.tlsEnabled !== false;
+  if (!uuid || !mode || !domain || (mode === "direct" && (
+    !Number.isInteger(port) || port < 1 || port > 65535
+    || (tlsEnabled && (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535))
+  ))) {
+    return json({ error: "invalid_public_route_probe" }, 400);
+  }
+
+  const authError = await authorizeNodeRelayRequest(request, env, uuid);
+  if (authError) return authError;
+
+  let source = null;
+  if (mode === "direct") {
+    const stub = getRegistryStub(env);
+    if (!stub) return json({ error: "node_registry_unavailable" }, 503);
+    const sourceResponse = await stub.fetch("https://node-registry/source", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ uuid })
+    });
+    if (sourceResponse.ok) {
+      source = await sourceResponse.json();
+    } else if (sourceResponse.status !== 404) {
+      return new Response(sourceResponse.body, { status: sourceResponse.status, headers: sourceResponse.headers });
+    }
+  }
+
+  // 优先使用本次节点请求的出口 IP，避免旧节点记录把探测指向历史机器。
+  const host = mode === "direct"
+    ? String(request.headers.get("CF-Connecting-IP") || source?.sourceIp || "").trim()
+    : "";
+  if (mode === "direct" && !host) return json({ error: "node_public_ip_unavailable" }, 409);
+
+  const ports = mode === "direct"
+    ? [...new Set([port, ...(tlsEnabled ? [httpPort] : [])])]
+    : [];
+  const tcpResults = mode === "direct"
+    ? await Promise.all(ports.map((candidate) => probePublicTcpPort(host, candidate)))
+    : [];
+  const blockedTcp = tcpResults.find((result) => result.status !== "open");
+  if (blockedTcp) {
+    return json({
+      ok: false,
+      mode,
+      domain,
+      port,
+      checkedAt: Date.now(),
+      externalStatus: "blocked",
+      reason: "public_tcp_blocked",
+      blockedPort: blockedTcp.port,
+      tcpReason: blockedTcp.reason || "connect_failed",
+      ports: tcpResults,
+      httpStatus: null
+    });
+  }
+
+  const url = publicRouteUrl(domain, mode, port, tlsEnabled);
+  const http = await probePublicHttpEndpoint(url, mode);
+  const ok = http.status === "reachable" && tcpResults.every((result) => result.status === "open");
+  return json({
+    ok,
+    mode,
+    domain,
+    port: mode === "direct" ? port : 7844,
+    checkedAt: Date.now(),
+    externalStatus: ok ? "reachable" : "blocked",
+    reason: ok ? "public_route_reachable" : http.reason,
+    httpStatus: http.httpStatus,
+    httpReason: http.reason,
+    ports: tcpResults
+  });
+}
+
 async function directPortProbeResponse(request, env) {
   if (request.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
@@ -1598,7 +1795,8 @@ async function directPortProbeResponse(request, env) {
   // 启动阶段节点还没有完成首次注册，Durable Object 中没有 sourceIp。
   // Worker 本身看到的 CF-Connecting-IP 就是这次探测请求的公网出口 IP，
   // 可用于首次 Tunnel 失败后的直连探测；注册完成后优先使用已记录地址。
-  const host = String(source?.sourceIp || request.headers.get("CF-Connecting-IP") || "").trim();
+  // 启动阶段优先使用本次节点请求的出口 IP，避免旧记录影响当前机器探测。
+  const host = String(request.headers.get("CF-Connecting-IP") || source?.sourceIp || "").trim();
   if (!host) return json({ error: "node_public_ip_unavailable" }, 409);
 
   const results = await Promise.all(ports.map((port) => probePublicTcpPort(host, port)));
@@ -1978,6 +2176,10 @@ export default {
 
     if (url.pathname === DIRECT_PORT_PROBE_PATH) {
       return directPortProbeResponse(request, env);
+    }
+
+    if (url.pathname === PUBLIC_ROUTE_PROBE_PATH) {
+      return publicRouteProbeResponse(request, env);
     }
 
     if (url.pathname === TEAMNODE_REDEEM_PATH) {

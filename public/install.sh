@@ -1936,6 +1936,34 @@ verify_runtime() {
   die "程序未正常启动；安装已中止，请先修复日志中的错误"
 }
 
+verify_public_route() {
+  local route_ready_marker="${FILE_PATH}/.route-ready"
+  local no_route_marker="${FILE_PATH}/.no-route"
+  local no_route_reason=""
+
+  log "公网路由检查：等待 Worker 完成外部连通性验证（最多 60 秒）"
+  for _ in 1 2 3 4 5 6 7 8 9 10 \
+    11 12 13 14 15 16 17 18 19 20 \
+    21 22 23 24 25 26 27 28 29 30 \
+    31 32 33 34 35 36 37 38 39 40 \
+    41 42 43 44 45 46 47 48 49 50 \
+    51 52 53 54 55 56 57 58 59 60; do
+    if [[ -f "${no_route_marker}" ]]; then
+      no_route_reason="$(head -c 512 "${no_route_marker}" 2>/dev/null || true)"
+      die "Worker 公网路由探测失败；${no_route_reason:-请检查云平台安全组、上游网络和最终域名}"
+    fi
+    if [[ -f "${route_ready_marker}" ]]; then
+      log "公网路由检查通过：Worker 已从公网验证最终访问路线"
+      return 0
+    fi
+    sleep 1
+  done
+
+  warn "Worker 公网路由验证未完成；未找到 ${route_ready_marker}"
+  warn "请查看运行日志：${FILE_PATH}/nodejs-argo.log"
+  die "程序未完成公网启动验证；安装已中止，请先修复云平台安全组、上游网络或最终域名"
+}
+
 stop_supervisor_service() {
   local config_file="${SUPERVISOR_CONF_FILE:-}"
   local candidate
@@ -2123,6 +2151,7 @@ main() {
 
   stage "验证节点运行状态"
   verify_runtime
+  verify_public_route
 
   stage "安装完成"
   log "安装完成"
