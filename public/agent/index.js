@@ -3,6 +3,7 @@ const app = express();
 const http = require("http");
 const axios = require("axios");
 const crypto = require("crypto");
+const dns = require("dns");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -455,10 +456,14 @@ function normalizeTunnelConnectivityReason(error) {
   return "edge_request_failed";
 }
 
-function probeTcpPort(host, port, timeoutMs) {
+function probeTcpPort(host, port, timeoutMs, address = host, family = undefined) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
-    const socket = net.createConnection({ host, port });
+    const socket = net.createConnection({
+      host: address,
+      port,
+      ...(family ? { family } : {})
+    });
     let settled = false;
 
     const finish = (result) => {
@@ -468,6 +473,7 @@ function probeTcpPort(host, port, timeoutMs) {
       resolve({
         ...result,
         host,
+        address,
         port,
         latencyMs: Math.max(0, Date.now() - startedAt)
       });
@@ -480,6 +486,21 @@ function probeTcpPort(host, port, timeoutMs) {
       error: String(error?.code || error?.message || "connect_error").slice(0, 64)
     }));
   });
+}
+
+async function resolveCloudflareTunnelAddresses(host) {
+  try {
+    const addresses = await dns.promises.lookup(host, { all: true, verbatim: true });
+    if (Array.isArray(addresses) && addresses.length > 0) {
+      return addresses.map((entry) => ({
+        address: String(entry.address),
+        family: Number(entry.family) === 6 ? 6 : 4
+      }));
+    }
+  } catch {
+    // 解析失败交给后续探测返回具体错误，不把它误报为端口已开放。
+  }
+  return [{ address: host, family: undefined }];
 }
 
 async function probeCloudflareTunnelPort(protocol) {
@@ -496,9 +517,12 @@ async function probeCloudflareTunnelPort(protocol) {
     && CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS > 0
     ? CLOUDFLARED_CONNECTIVITY_TIMEOUT_MS
     : 3000;
-  const probes = await Promise.all(
-    CLOUDFLARED_EDGE_HOSTS.map((host) => probeTcpPort(host, CLOUDFLARED_TUNNEL_PORT, timeoutMs))
-  );
+  const probes = (await Promise.all(CLOUDFLARED_EDGE_HOSTS.map(async (host) => {
+    const addresses = await resolveCloudflareTunnelAddresses(host);
+    return Promise.all(addresses.map(({ address, family }) => (
+      probeTcpPort(host, CLOUDFLARED_TUNNEL_PORT, timeoutMs, address, family)
+    )));
+  }))).flat();
   const successfulProbe = probes.find((probe) => probe.ok);
   if (successfulProbe) {
     return {
@@ -564,17 +588,6 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
     portHost: portProbe.host,
     latencyMs: portProbe.latencyMs
   };
-  if (protocol === "http2" && portProbe.status === "blocked") {
-    const value = {
-      ...baseResult,
-      ...portResult,
-      status: "offline",
-      reason: "port_blocked"
-    };
-    tunnelConnectivityCache = { key: cacheKey, value };
-    return value;
-  }
-
   const startedAt = Date.now();
   try {
     const response = await axios.get(`https://${domain}/`, {
@@ -592,12 +605,18 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
     const isCloudflareEdge = Boolean(responseHeaders["cf-ray"])
       || /cloudflare/i.test(String(responseHeaders.server || ""));
     const endpointNotTunnel = !isCloudflareEdge && !isTunnelInactive;
+    const edgeStatus = isTunnelInactive || endpointNotTunnel
+      ? "offline"
+      : response.status >= 500 ? "degraded" : "connected";
     const value = {
       ...baseResult,
       ...portResult,
-      status: isTunnelInactive || endpointNotTunnel
-        ? "offline"
-        : response.status >= 500 ? "degraded" : "connected",
+      // Tunnel 的公网响应证明实际路线已经建立；不要因为单个
+      // Cloudflare 地址的原始 TCP 探测失败而覆盖真实 Tunnel 状态。
+      portStatus: edgeStatus === "connected" && portProbe.status === "blocked"
+        ? "open"
+        : portProbe.status,
+      status: edgeStatus,
       httpStatus: Number.isFinite(Number(response.status)) ? Number(response.status) : null,
       latencyMs: Math.max(0, Date.now() - startedAt),
       reason: isTunnelInactive
