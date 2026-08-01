@@ -970,14 +970,16 @@ stop_runner() {
 }
 
 trap stop_runner TERM INT
-set -a
-. "\${ENV_FILE}"
-set +a
 export HOME="${APP_DIR}/home"
 export PM2_HOME="${APP_DIR}/pm2-home"
 cd "\${APP_DIR}/app"
 
 while true; do
+  # 节点会在 Tunnel 失败后把 DIRECT_MODE 和选中的端口写回 .env，
+  # 因此每次子进程重启前都必须重新加载环境，不能沿用 runner 启动时的旧值。
+  set -a
+  . "\${ENV_FILE}"
+  set +a
   "\${NODE_BIN}" "\${APP_DIR}/app/index.js" >>"\${LOG_FILE}" 2>&1 &
   child_pid="\$!"
   wait "\${child_pid}"
