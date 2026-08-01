@@ -726,7 +726,8 @@ async function dashboardPageResponse(request, env) {
     .brand-context { margin-left: 8px; color: var(--muted); font-size: 14px; font-weight: 500; }
     .live-meta { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
     .live-dot { width: 9px; height: 9px; border-radius: 50%; background: #22a652; box-shadow: 0 0 0 4px #22a6521c; }
-    .system-status-overview { display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; justify-content: stretch; gap: 14px; min-width: 0; padding: 0; }
+    .system-status-title-block { display: grid; grid-template-rows: auto minmax(0, 1fr); align-items: start; min-width: 0; }
+    .system-status-overview { display: grid; place-items: center; min-width: 0; min-height: 32px; padding-top: 10px; }
     .system-status-overview-copy { display: grid; width: 100%; min-width: 0; gap: 2px; align-content: center; text-align: left; }
     .system-status-summary { display: grid; justify-items: start; gap: 2px; min-width: 0; text-align: left; }
     .hero-icon { display: grid; flex: 0 0 32px; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--green); background: var(--green-soft); font-size: 18px; font-weight: 800; }
@@ -739,8 +740,7 @@ async function dashboardPageResponse(request, env) {
     .section { margin-top: 12px; }
     .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; margin-bottom: 16px; }
     .system-status-layout { display: grid; grid-template-columns: minmax(320px, .95fr) minmax(0, 2.05fr); align-items: stretch; gap: 18px; padding: 14px; background: var(--soft-surface); border: 1px solid var(--line); border-radius: 12px; }
-    .system-status-heading { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto; align-items: start; gap: 12px; min-width: 0; padding: 0 2px; }
-    .system-status-overview { justify-self: stretch; }
+    .system-status-heading { display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: stretch; gap: 14px; min-width: 0; padding: 0 2px; }
     .system-status-heading > div:first-child { min-width: 0; }
     .section-title { display: flex; align-items: baseline; gap: 10px; }
     h2 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
@@ -850,8 +850,9 @@ async function dashboardPageResponse(request, env) {
       .brand-context { display: block; margin: 3px 0 0; }
       .live-meta { padding-top: 7px; }
       .system-status-layout { padding: 14px; }
-      .system-status-overview { grid-template-columns: 96px minmax(0, 1fr); gap: 10px; padding: 0; }
+      .system-status-overview { padding-top: 0; }
       .system-status-heading { grid-template-columns: 1fr; gap: 10px; }
+      .system-status-title-block { grid-template-rows: auto auto; gap: 8px; }
       .system-status-overview-copy { gap: 3px; }
       .system-status-summary { display: grid; text-align: center; }
       .hero-detail { margin-top: 4px; }
@@ -892,14 +893,16 @@ async function dashboardPageResponse(request, env) {
     <section class="section">
       <div class="system-status-layout">
         <div class="system-status-heading">
-          <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
-          <div class="system-status-overview" aria-live="polite">
-            <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
-            <div class="system-status-overview-copy">
-              <div class="system-status-summary">
-                <h1 id="overview-label">${overviewLabel}</h1>
-                <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
-              </div>
+          <div class="system-status-title-block">
+            <div><p class="eyebrow">System status</p><h2>系统状态</h2></div>
+            <div class="system-status-overview" aria-live="polite">
+              <div id="overview-icon" class="hero-icon ${overviewClass}" aria-label="${overviewLabel}">${overviewSymbol}</div>
+            </div>
+          </div>
+          <div class="system-status-overview-copy">
+            <div class="system-status-summary">
+              <h1 id="overview-label">${overviewLabel}</h1>
+              <p id="overview-detail" class="hero-detail">${overviewDetail}</p>
             </div>
           </div>
         </div>
