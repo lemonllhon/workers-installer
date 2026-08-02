@@ -835,7 +835,7 @@ async function dashboardPageResponse(request, env) {
           <div class="heartbeat-strip${node.online ? " heartbeat-active" : ""}" aria-label="最近心跳记录">${heartbeatSegments(node, env)}</div>
           <div class="heartbeat-scale"><span>现在</span><span>${ttlMinutes} 分钟前</span></div>
           <div class="node-fields">
-            <div><span>IP 地址</span>${nodeAddressMarkup(node)}</div>
+            <div class="node-address-field"><span>IP 地址</span>${nodeAddressMarkup(node)}</div>
             <div><span>地区</span><strong>${htmlEscape(node.country || node.countryName || "-")}</strong></div>
             <div><span>Provider</span><strong>${htmlEscape(node.provider || "-")}</strong></div>
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
@@ -948,6 +948,7 @@ async function dashboardPageResponse(request, env) {
     .node-cards .node-row-header { display: grid; gap: 12px; }
     .node-cards .node-last-seen { text-align: left; }
     .node-cards .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .node-cards .node-address-field { grid-column: 1 / -1; }
     .node-row-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
     .node-identity { display: flex; align-items: flex-start; gap: 14px; min-width: 0; }
     .node-title { display: grid; min-width: 0; gap: 4px; }
@@ -973,14 +974,15 @@ async function dashboardPageResponse(request, env) {
     @keyframes node-border-run { from { --node-border-angle: 0deg; } to { --node-border-angle: 360deg; } }
     @keyframes heartbeat-charge { 0% { opacity: 0; transform: translateX(0); } 12% { opacity: .45; } 82% { opacity: .45; } 100% { opacity: 0; transform: translateX(565%); } }
     .heartbeat-scale { display: flex; justify-content: space-between; margin-top: 3px; color: var(--muted); font-size: 10px; }
-    .node-fields { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid #f0f1f2; }
+    .node-fields { display: grid; grid-template-columns: max-content repeat(5, minmax(0, 1fr)); gap: 12px; margin-top: 11px; padding-top: 10px; border-top: 1px solid #f0f1f2; }
     .node-fields div { display: grid; min-width: 0; gap: 5px; }
     .node-fields span { color: var(--muted); font-size: 11px; }
     .node-fields strong { overflow-wrap: anywhere; font-size: 13px; font-weight: 600; }
     .node-fields .node-address-list { display: grid; gap: 3px; }
     .node-fields .node-address-line { display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: baseline; gap: 5px; min-width: 0; }
     .node-address-line b { color: var(--muted); font-size: 10px; font-weight: 700; }
-    .node-address-line code { overflow-wrap: anywhere; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; font-weight: 600; }
+    .node-address-field { max-width: 100%; overflow-x: auto; scrollbar-width: thin; }
+    .node-address-line code { overflow-wrap: normal; word-break: normal; white-space: nowrap; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; font-size: 12px; font-weight: 600; }
     .node-fields .tunnel-row { grid-column: 1 / -1; display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; }
     .node-fields .tunnel-row > span { flex: 0 0 auto; }
     .tunnel-field { display: inline-flex; align-items: baseline; flex-wrap: wrap; gap: 7px; min-width: 0; }
@@ -1022,6 +1024,7 @@ async function dashboardPageResponse(request, env) {
       .service-row:last-child { border-bottom: 0; }
       .node-row { padding: 14px 16px; }
       .node-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+      .node-address-field { grid-column: 1 / -1; }
       .heartbeat-strip { gap: 2px; }
       .node-list.node-cards { grid-template-columns: 1fr; padding: 0; }
       .node-section-head { grid-template-columns: 1fr; align-items: stretch; gap: 10px; padding: 12px 10px; }
@@ -1540,7 +1543,7 @@ async function dashboardPageResponse(request, env) {
             + '<div class="heartbeat-strip' + (node.online ? " heartbeat-active" : "") + (heartbeatLimit < 72 ? " heartbeat-short" : "") + '" aria-label="最近心跳记录">' + renderHeartbeatSegments(node, heartbeatLimit) + '</div>'
             + '<div class="heartbeat-scale"><span>现在</span><span>' + heartbeatWindowMinutes + ' 分钟前</span></div>'
             + '<div class="node-fields">'
-            + '<div><span>IP 地址</span>' + renderNodeAddresses(node) + '</div>'
+            + '<div class="node-address-field"><span>IP 地址</span>' + renderNodeAddresses(node) + '</div>'
             + '<div><span>地区</span><strong>' + escapeHtml(node.country || node.countryName || "-") + '</strong></div>'
             + '<div><span>Provider</span><strong>' + escapeHtml(node.provider || "-") + '</strong></div>'
             + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
