@@ -1311,6 +1311,140 @@ function selectDirectFallbackPlan(results, { addressFamilies = configuredDirectA
   };
 }
 
+function mergeDirectProbeResults(...resultSets) {
+  const byPort = new Map();
+  const portOrder = [];
+  for (const results of resultSets) {
+    for (const result of Array.isArray(results) ? results : []) {
+      const port = Number(result?.port);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+      if (!byPort.has(port)) {
+        byPort.set(port, { port, families: {} });
+        portOrder.push(port);
+      }
+      const current = byPort.get(port);
+      if (result?.families && typeof result.families === "object") {
+        current.families = { ...current.families, ...result.families };
+      }
+    }
+  }
+
+  return portOrder.map((port) => {
+    const current = byPort.get(port);
+    const familyEntries = Object.entries(current.families);
+    const openFamilies = familyEntries
+      .filter(([, result]) => result?.status === "open")
+      .map(([family]) => family);
+    return {
+      port,
+      status: openFamilies.length === familyEntries.length && familyEntries.length > 0
+        ? "open"
+        : openFamilies.length > 0 ? "partial" : "blocked",
+      openFamilies,
+      families: current.families
+    };
+  });
+}
+
+function directPlanRequiredPorts(plan) {
+  if (!plan) return [];
+  return [...new Set([
+    Number(plan.port),
+    ...(plan.tlsEnabled ? [Number(plan.httpPort)] : [])
+  ].filter((port) => Number.isInteger(port) && port >= 1 && port <= 65535))];
+}
+
+function directPlanIsOpenForFamily(results, plan, family) {
+  const familyName = directFamilyName(family);
+  const byPort = new Map((Array.isArray(results) ? results : []).map((result) => [Number(result?.port), result]));
+  return directPlanRequiredPorts(plan).every((port) => (
+    byPort.get(port)?.families?.[familyName]?.status === "open"
+  ));
+}
+
+function addAddressFamilyToDirectPlan(plan, family) {
+  const familyName = directFamilyName(family);
+  return {
+    ...plan,
+    addressFamilies: [...new Set([...(plan.addressFamilies || []), familyName])],
+    reason: "same_port_available_on_both_families"
+  };
+}
+
+async function probeDirectPortBatchByFamily(ports, addressFamilies, { preferSecureStandard = false } = {}) {
+  const families = [...new Set((Array.isArray(addressFamilies) ? addressFamilies : [])
+    .map((family) => Number(family))
+    .filter((family) => family === 4 || family === 6))]
+    .sort((left, right) => left - right);
+  if (!families.length) {
+    return { plan: null, results: [], error: "direct_public_address_unavailable" };
+  }
+
+  let results = [];
+  let lastError = "";
+  const probeFamily = async (family, familyPorts) => {
+    const familyName = directFamilyName(family).toUpperCase();
+    appendRouteProbeProgress(`地址族隔离检查：检查 ${familyName} TCP ${familyPorts.join(",")}`);
+    const probe = await probeDirectPortCandidates(familyPorts, [family]);
+    results = mergeDirectProbeResults(results, probe.results);
+    if (probe.error) lastError = probe.error;
+    return {
+      probe,
+      plan: selectDirectFallbackPlan(probe.results, {
+        addressFamilies: [family],
+        requireAllFamilies: true
+      })
+    };
+  };
+
+  const primaryFamily = families[0];
+  const primary = await probeFamily(primaryFamily, ports);
+  if (families.length === 1) {
+    return { plan: primary.plan, results, error: lastError };
+  }
+
+  const secondaryFamily = families[1];
+  if (primary.plan && (!preferSecureStandard || primary.plan.tlsEnabled)) {
+    const requiredPorts = directPlanRequiredPorts(primary.plan);
+    appendRouteProbeProgress(
+      `${directFamilyName(primaryFamily).toUpperCase()} 已找到 ${primary.plan.tlsEnabled ? "HTTPS" : "HTTP"} ${primary.plan.port}；`
+      + `只复验 ${directFamilyName(secondaryFamily).toUpperCase()} 的相同端口 ${requiredPorts.join(",")}`
+    );
+    await probeFamily(secondaryFamily, requiredPorts);
+    const plan = directPlanIsOpenForFamily(results, primary.plan, secondaryFamily)
+      ? addAddressFamilyToDirectPlan(primary.plan, secondaryFamily)
+      : primary.plan;
+    appendRouteProbeProgress(
+      directPlanIsOpenForFamily(results, primary.plan, secondaryFamily)
+        ? `相同端口同时支持 IPv4/IPv6，选择双栈 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
+        : `${directFamilyName(secondaryFamily).toUpperCase()} 相同端口不可达，立即选择 ${directFamilyName(primaryFamily).toUpperCase()} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
+    );
+    return { plan, results, error: lastError };
+  }
+
+  if (primary.plan && preferSecureStandard) {
+    appendRouteProbeProgress(
+      `${directFamilyName(primaryFamily).toUpperCase()} 标准端口只能使用 HTTP；继续独立检查 ${directFamilyName(secondaryFamily).toUpperCase()} 的 80/443`
+    );
+  } else {
+    appendRouteProbeProgress(
+      `${directFamilyName(primaryFamily).toUpperCase()} 本批没有可用端口；继续独立检查 ${directFamilyName(secondaryFamily).toUpperCase()}`
+    );
+  }
+  const secondary = await probeFamily(secondaryFamily, ports);
+
+  if (preferSecureStandard && secondary.plan?.tlsEnabled) {
+    return { plan: secondary.plan, results, error: lastError };
+  }
+  if (primary.plan) {
+    const plan = directPlanIsOpenForFamily(results, primary.plan, secondaryFamily)
+      ? addAddressFamilyToDirectPlan(primary.plan, secondaryFamily)
+      : primary.plan;
+    return { plan, results, error: lastError };
+  }
+  return { plan: secondary.plan, results, error: lastError };
+}
+
 async function probeReusableDirectPlan(publicAddresses) {
   if (!DIRECT_REUSE_ENABLED) return null;
 
@@ -1371,7 +1505,6 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress("直连端口心跳结束：未检测到公网 IPv4 或 IPv6 地址");
     return { plan: null, results: [], error: "direct_public_address_unavailable" };
   }
-  const requireAllFamilies = addressFamilies.length > 1;
   appendRouteProbeProgress(
     `直连公网地址：${publicAddresses.ipv4 ? `IPv4 ${publicAddresses.ipv4}` : "IPv4 不可用"}；`
     + `${publicAddresses.ipv6 ? `IPv6 ${publicAddresses.ipv6}` : "IPv6 不可用"}`
@@ -1387,28 +1520,14 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress(`优先检查标准入口端口：${priorityPorts.join(",")}`);
   }
   const priorityProbe = priorityPorts.length > 0
-    ? await probeDirectPortCandidates(priorityPorts, addressFamilies)
-    : { results: [], error: "" };
-  const allResults = [...priorityProbe.results];
-  let plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies });
+    ? await probeDirectPortBatchByFamily(priorityPorts, addressFamilies, { preferSecureStandard: true })
+    : { plan: null, results: [], error: "" };
+  let allResults = [...priorityProbe.results];
+  let plan = priorityProbe.plan;
   if (plan) {
     plan = { ...plan, publicAddresses };
     appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
     return { plan, results: allResults };
-  }
-  if (requireAllFamilies) {
-    const singleFamilyStandardPlan = selectDirectFallbackPlan(allResults, {
-      addressFamilies,
-      requireAllFamilies: false
-    });
-    if (singleFamilyStandardPlan?.tlsEnabled) {
-      plan = { ...singleFamilyStandardPlan, publicAddresses };
-      appendRouteProbeProgress(
-        `标准 HTTPS 已在 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} 通过公网回访，`
-        + "立即使用 443/80；不会为不可达地址族继续扫描非标准端口"
-      );
-      return { plan, results: allResults };
-    }
   }
 
   let lastError = priorityProbe.error || "";
@@ -1418,10 +1537,10 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress(
       `直连其余候选端口心跳批次 ${Math.floor(index / DIRECT_PORT_PROBE_BATCH_SIZE) + 1}/${initialBatches}：${batch.join(",")}`
     );
-    const probe = await probeDirectPortCandidates(batch, addressFamilies);
-    allResults.push(...probe.results);
+    const probe = await probeDirectPortBatchByFamily(batch, addressFamilies);
+    allResults = mergeDirectProbeResults(allResults, probe.results);
     if (probe.error) lastError = probe.error;
-    plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies });
+    plan = probe.plan;
     if (plan) {
       plan = { ...plan, publicAddresses };
       appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
@@ -1436,25 +1555,13 @@ async function discoverDirectPortPlan() {
     appendRouteProbeProgress(
       `直连扩展端口心跳批次 ${Math.floor(index / DIRECT_PORT_PROBE_BATCH_SIZE) + 1}/${totalBatches}：${batch.join(",")}`
     );
-    const probe = await probeDirectPortCandidates(batch, addressFamilies);
-    allResults.push(...probe.results);
+    const probe = await probeDirectPortBatchByFamily(batch, addressFamilies);
+    allResults = mergeDirectProbeResults(allResults, probe.results);
     if (probe.error) lastError = probe.error;
-    plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies });
+    plan = probe.plan;
     if (plan) {
       plan = { ...plan, publicAddresses };
       appendRouteProbeProgress(`直连端口心跳已选择 ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}（${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")}）`);
-      return { plan, results: allResults };
-    }
-  }
-
-  if (requireAllFamilies) {
-    plan = selectDirectFallbackPlan(allResults, { addressFamilies, requireAllFamilies: false });
-    if (plan) {
-      plan = { ...plan, publicAddresses };
-      appendRouteProbeProgress(
-        `未找到 IPv4/IPv6 同时可达的共同端口，降级使用 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} `
-        + `${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}；不会发布不可达地址族的 DNS 记录`
-      );
       return { plan, results: allResults };
     }
   }
