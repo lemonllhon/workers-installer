@@ -650,13 +650,6 @@ function tunnelConnectivityView(node) {
     : ["connected", "degraded", "offline", "unknown", "not_applicable"].includes(info.status)
     ? info.status
     : "unknown";
-  const statusLabels = {
-    connected: "已连接",
-    degraded: "部分异常",
-    offline: "未连接",
-    unknown: "未检测",
-    not_applicable: "不适用"
-  };
   const reasonLabels = {
     edge_reachable: "Cloudflare Edge 已响应",
     tunnel_inactive: "Tunnel 未连接（530/1033）",
@@ -717,7 +710,7 @@ function tunnelConnectivityView(node) {
           : "";
   return {
     status,
-    label: directMode ? (publicProbeBlocked ? "直连不可达" : "直连模式") : statusLabels[status],
+    label: directMode ? "直连模式" : "Tunnel模式",
     detail: `${portLabel} · ${reason}${publicProbeDetail ? ` · ${publicProbeDetail}` : ""}${publicProbePortDetail}${httpStatus}${tunnelTestDetail}`,
     checkedAt,
     title: `最后检查：${checkedAt}${tunnelTestDetail}`
@@ -735,8 +728,8 @@ function nodeAddressMarkup(node) {
     : "<strong>-</strong>";
 }
 
-function cloudflareRouteLabel(node) {
-  return node?.tunnelConnectivity?.mode === "direct" ? "Cloudflare" : "Cloudflare Tunnel 模式";
+function cloudflareRouteLabel() {
+  return "Cloudflare";
 }
 
 function tunnelConnectivityMarkup(node) {
@@ -769,22 +762,13 @@ async function dashboardPageResponse(request, env) {
     const tunnelProblemCount = nodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status)).length;
     const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status))).length;
     const visibleCount = nodes.length;
-    const timeoutMinutes = Math.max(1, Math.round(heartbeatTimeoutMs(env) / 60000));
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
     const hasAttention = timedOutCount > 0 || offlineCount > 0;
     const isOperational = onlineCount > 0 && !hasAttention;
-    const issueSummary = [
-      timedOutCount > 0 ? `${timedOutCount} 台机器超时` : "",
-      offlineCount > 0 ? `${offlineCount} 台机器离线` : ""
-    ].filter(Boolean).join("，");
     const overviewLabel = hasAttention
       ? "部分节点状态异常"
-      : isOperational ? "全部系统运行正常" : "暂无在线机器";
-    const overviewDetail = hasAttention
-      ? issueSummary + "；超过 " + String(ttlMinutes) + " 分钟未恢复心跳的节点会自动移除。"
-      : isOperational
-        ? String(onlineCount) + " 台机器正在发送心跳，最近 " + String(timeoutMinutes) + " 分钟内保持在线。"
-        : "等待机器发送心跳；超过 " + String(timeoutMinutes) + " 分钟后标记为超时，总计 " + String(ttlMinutes) + " 分钟后自动移出列表。";
+      : isOperational ? "系统运行正常" : "暂无在线机器";
+    const overviewDetail = `在线：${onlineCount}　超时：${timedOutCount}　离线：${offlineCount}`;
     const overviewClass = isOperational ? "operational" : hasAttention ? "attention" : "waiting";
     const heartbeatDescription = hasAttention
       ? String(offlineCount) + " 台离线，" + String(timedOutCount) + " 台超时，恢复后会自动变绿"
@@ -802,16 +786,7 @@ async function dashboardPageResponse(request, env) {
         ? "正常"
         : "等待中";
     const tunnelStateClass = tunnelState === "正常" ? "operational" : tunnelState === "等待中" ? "waiting" : "attention";
-    const tunnelPortText = nodes.length > 0
-      ? tunnelPortRequirement(nodes[0].tunnelConnectivity || {})
-      : "TCP/UDP 7844";
-    const tunnelDescription = tunnelProblemCount > 0
-      ? `${tunnelProblemCount} 台机器公网路线异常，已停止向 TeamNode 推送。`
-      : directModeCount > 0
-        ? `${directModeCount} 台机器已使用直连模式；Cloudflare Tunnel 不再参与转发。`
-      : tunnelConnectedCount > 0
-        ? `${tunnelConnectedCount} 台 Tunnel 已连接；端口状态随节点心跳更新。`
-        : `等待节点上报 Tunnel 连通性；需要放行出站 ${tunnelPortText}。`;
+    const tunnelDescription = `直连：${directModeCount}　Tunnel：${tunnelModeCount}`;
     const cloudflareServiceName = directModeCount > 0 && tunnelModeCount === 0
       ? "Cloudflare 直连模式"
       : directModeCount > 0 && tunnelModeCount > 0
@@ -841,7 +816,7 @@ async function dashboardPageResponse(request, env) {
             <div><span>操作系统</span><strong>${htmlEscape(runtime.system)}</strong></div>
             <div><span>系统架构</span><strong>${htmlEscape(runtime.arch)}</strong></div>
             <div><span>CPU / 内存</span><strong>${htmlEscape(runtime.resources)}</strong></div>
-            <div class="tunnel-row"><span>${cloudflareRouteLabel(node)}</span>${tunnelConnectivityMarkup(node)}</div>
+            <div class="tunnel-row"><span>${cloudflareRouteLabel()}</span>${tunnelConnectivityMarkup(node)}</div>
           </div>
         </article>`;
       }).join("")
@@ -1288,8 +1263,8 @@ async function dashboardPageResponse(request, env) {
           : '<strong>-</strong>';
       }
 
-      function renderCloudflareRouteLabel(node) {
-        return node?.tunnelConnectivity?.mode === "direct" ? "Cloudflare" : "Cloudflare Tunnel 模式";
+      function renderCloudflareRouteLabel() {
+        return "Cloudflare";
       }
 
       function tunnelPortRequirement(info) {
@@ -1306,13 +1281,6 @@ async function dashboardPageResponse(request, env) {
         const publicProbeBlocked = info.publicProbeStatus === "blocked";
         const statuses = ["connected", "degraded", "offline", "unknown", "not_applicable"];
         const status = directMode ? (publicProbeBlocked ? "offline" : "connected") : statuses.includes(info.status) ? info.status : "unknown";
-        const statusLabels = {
-          connected: "已连接",
-          degraded: "部分异常",
-          offline: "未连接",
-          unknown: "未检测",
-          not_applicable: "不适用"
-        };
         const reasonLabels = {
           edge_reachable: "Cloudflare Edge 已响应",
           tunnel_inactive: "Tunnel 未连接（530/1033）",
@@ -1373,7 +1341,7 @@ async function dashboardPageResponse(request, env) {
                 : "";
         return {
           status,
-          label: directMode ? (publicProbeBlocked ? "直连不可达" : "直连模式") : statusLabels[status],
+          label: directMode ? "直连模式" : "Tunnel模式",
           detail: portLabel + " · " + reason + (publicProbeDetail ? " · " + publicProbeDetail : "") + publicProbePortDetail + httpStatus + tunnelTestDetail,
           checkedAt,
           title: "最后检查：" + checkedAt + tunnelTestDetail
@@ -1549,7 +1517,7 @@ async function dashboardPageResponse(request, env) {
             + '<div><span>操作系统</span><strong>' + escapeHtml(runtime.system) + '</strong></div>'
             + '<div><span>系统架构</span><strong>' + escapeHtml(runtime.arch) + '</strong></div>'
             + '<div><span>CPU / 内存</span><strong>' + escapeHtml(runtime.resources) + '</strong></div>'
-            + '<div class="tunnel-row"><span>' + escapeHtml(renderCloudflareRouteLabel(node)) + '</span>' + renderTunnelConnectivity(node) + '</div>'
+            + '<div class="tunnel-row"><span>' + escapeHtml(renderCloudflareRouteLabel()) + '</span>' + renderTunnelConnectivity(node) + '</div>'
             + '</div></article>';
         }).join("");
       }
@@ -1577,17 +1545,8 @@ async function dashboardPageResponse(request, env) {
           const tunnelModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode !== "direct");
           const tunnelProblemNodes = visibleNodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status));
           const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)));
-          const tunnelPortText = visibleNodes.length > 0
-            ? tunnelPortRequirement(visibleNodes[0].tunnelConnectivity || {})
-            : "TCP/UDP 7844";
-          const timeoutMinutes = Math.max(1, Math.round(Number(data.heartbeatTimeoutMs || 300000) / 60000));
-          const ttlMinutes = Math.max(1, Math.round(Number(data.onlineTtlMs || 600000) / 60000));
           const hasAttention = timedOutNodes.length > 0 || offlineNodes.length > 0;
           const operational = onlineNodes.length > 0 && !hasAttention;
-          const issueSummary = [
-            timedOutNodes.length > 0 ? timedOutNodes.length + " 台机器超时" : "",
-            offlineNodes.length > 0 ? offlineNodes.length + " 台机器离线" : ""
-          ].filter(Boolean).join("，");
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
           currentNodes = visibleNodes;
           renderFilteredNodes();
@@ -1595,12 +1554,8 @@ async function dashboardPageResponse(request, env) {
           systemStatusLayoutElement.className = "system-status-layout " + overviewStatus;
           overviewLabelElement.textContent = hasAttention
             ? "部分节点状态异常"
-            : operational ? "全部系统运行正常" : "暂无在线机器";
-          overviewDetailElement.textContent = hasAttention
-            ? issueSummary + "；超过 " + ttlMinutes + " 分钟未恢复心跳的节点会自动移除。"
-            : operational
-              ? onlineNodes.length + " 台机器正在发送心跳，最近 " + timeoutMinutes + " 分钟内保持在线。"
-              : "等待机器发送心跳；超过 " + timeoutMinutes + " 分钟后标记为超时，总计 " + ttlMinutes + " 分钟后自动移出列表。";
+            : operational ? "系统运行正常" : "暂无在线机器";
+          overviewDetailElement.textContent = "在线：" + onlineNodes.length + "　超时：" + timedOutNodes.length + "　离线：" + offlineNodes.length;
           nodeCountElement.textContent = visibleNodes.length + " 台";
           heartbeatDescriptionElement.textContent = hasAttention
             ? offlineNodes.length + " 台离线，" + timedOutNodes.length + " 台超时，恢复后会自动变绿"
@@ -1617,13 +1572,7 @@ async function dashboardPageResponse(request, env) {
             : (tunnelConnectedNodes.length > 0 || directModeNodes.length > 0) && tunnelUnknownNodes.length === 0
               ? "正常"
               : "等待中";
-          tunnelDescriptionElement.textContent = tunnelProblemNodes.length > 0
-            ? tunnelProblemNodes.length + " 台机器公网路线异常，已停止向 TeamNode 推送。"
-            : directModeNodes.length > 0
-              ? directModeNodes.length + " 台机器已使用直连模式；Cloudflare Tunnel 不再参与转发。"
-            : tunnelConnectedNodes.length > 0
-              ? tunnelConnectedNodes.length + " 台 Tunnel 已连接；端口状态随节点心跳更新。"
-              : "等待节点上报 Tunnel 连通性；需要放行出站 " + tunnelPortText + "。";
+          tunnelDescriptionElement.textContent = "直连：" + directModeNodes.length + "　Tunnel：" + tunnelModeNodes.length;
           cloudflareServiceNameElement.textContent = directModeNodes.length > 0 && tunnelModeNodes.length === 0
             ? "Cloudflare 直连模式"
             : directModeNodes.length > 0 && tunnelModeNodes.length > 0
