@@ -500,6 +500,8 @@ root 安装默认目录：
 
 ### 2. 日志
 
+基础依赖安装不会再隐藏包管理器输出：apt 会分别显示软件源更新和 dpkg 安装过程，apk、dnf、yum、zypper 会显示各自的下载/安装进度；完成后安装器按 `1/7` 到 `7/7` 逐项显示 bash、curl、CA 证书、unzip、tar、Node.js、npm 的状态和可读取的版本。
+
 systemd：
 
 ```bash

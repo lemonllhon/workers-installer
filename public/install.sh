@@ -472,27 +472,87 @@ supervisorctl_exec() {
   fi
 }
 
+dependency_version_line() {
+  "$@" 2>/dev/null | sed -n '1p' | tr -d '\r' || true
+}
+
+report_basic_dependency_progress() {
+  local detail=""
+
+  has_command bash || die "基础依赖安装后仍未找到 bash"
+  detail="$(dependency_version_line bash --version)"
+  log "基础依赖进度 1/7：bash 已就绪${detail:+（${detail}）}"
+
+  has_command curl || die "基础依赖安装后仍未找到 curl"
+  detail="$(dependency_version_line curl --version)"
+  log "基础依赖进度 2/7：curl 已就绪${detail:+（${detail}）}"
+
+  local ca_bundle=""
+  local candidate
+  for candidate in \
+    /etc/ssl/certs/ca-certificates.crt \
+    /etc/pki/tls/certs/ca-bundle.crt \
+    /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    /var/lib/ca-certificates/ca-bundle.pem \
+    /etc/ssl/cert.pem; do
+    if [[ -s "${candidate}" ]]; then
+      ca_bundle="${candidate}"
+      break
+    fi
+  done
+  if [[ -n "${ca_bundle}" ]]; then
+    log "基础依赖进度 3/7：ca-certificates 已就绪（${ca_bundle}）"
+  else
+    warn "基础依赖进度 3/7：ca-certificates 包已安装，但未识别到常见 CA bundle 路径"
+  fi
+
+  has_command unzip || die "基础依赖安装后仍未找到 unzip"
+  detail="$(dependency_version_line unzip -v)"
+  log "基础依赖进度 4/7：unzip 已就绪${detail:+（${detail}）}"
+
+  has_command tar || die "基础依赖安装后仍未找到 tar"
+  detail="$(dependency_version_line tar --version)"
+  log "基础依赖进度 5/7：tar 已就绪${detail:+（${detail}）}"
+
+  has_command node || die "基础依赖安装后仍未找到 Node.js"
+  detail="$(node --version 2>/dev/null || true)"
+  log "基础依赖进度 6/7：Node.js 已就绪${detail:+（${detail}）}"
+
+  has_command npm || die "基础依赖安装后仍未找到 npm"
+  detail="$(npm --version 2>/dev/null || true)"
+  log "基础依赖进度 7/7：npm 已就绪${detail:+（v${detail}）}"
+}
+
 install_os_dependencies() {
   if [[ "${RUN_AS_ROOT}" != true ]]; then
     warn "非 root 安装不会修改系统软件包；将使用当前用户目录内的项目专用 Node.js。"
     return 0
   fi
-  log "安装基础依赖：bash、curl、ca-certificates、unzip、tar、Node.js、npm"
+  log "开始安装基础依赖：bash、curl、ca-certificates、unzip、tar、Node.js、npm"
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq bash ca-certificates curl coreutils iproute2 passwd tar xz-utils unzip util-linux nodejs npm >/dev/null
+    log "基础依赖安装阶段 1/2：apt-get 正在更新软件源（以下保留原始进度）"
+    apt-get update -o Acquire::Retries=3
+    log "基础依赖安装阶段 2/2：apt-get 正在安装软件包（以下保留 dpkg 进度）"
+    apt-get install -y -o Dpkg::Use-Pty=0 \
+      bash ca-certificates curl coreutils iproute2 passwd tar xz-utils unzip util-linux nodejs npm
   elif has_command apk; then
-    apk add --no-cache bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm >/dev/null
+    log "基础依赖安装阶段 1/1：apk 正在下载并安装软件包"
+    apk add --no-cache bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm
   elif has_command dnf; then
-    dnf install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils >/dev/null
+    log "基础依赖安装阶段 1/1：dnf 正在解析、下载并安装软件包"
+    dnf install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils
   elif has_command yum; then
-    yum install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils >/dev/null
+    log "基础依赖安装阶段 1/1：yum 正在解析、下载并安装软件包"
+    yum install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils
   elif has_command zypper; then
-    zypper --non-interactive install bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm >/dev/null
+    log "基础依赖安装阶段 1/1：zypper 正在解析、下载并安装软件包"
+    zypper --non-interactive install bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm
   else
     die "缺少依赖，且未找到 apt-get、apk、dnf、yum 或 zypper"
   fi
+  report_basic_dependency_progress
+  log "基础依赖安装完成：7/7 项均已检查"
 }
 
 can_run_as_service_user() {
