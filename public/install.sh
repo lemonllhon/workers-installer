@@ -56,6 +56,7 @@ AUTO_DIRECT_FALLBACK="${AUTO_DIRECT_FALLBACK:-true}"
 DIRECT_MODE="${DIRECT_MODE:-false}"
 DIRECT_DOMAIN=""
 DIRECT_TLS_ENABLED="${DIRECT_TLS_ENABLED:-true}"
+DIRECT_CLOUDFLARE_PROXY_ENABLED="${DIRECT_CLOUDFLARE_PROXY_ENABLED:-false}"
 DIRECT_IPV4_ENABLED="${DIRECT_IPV4_ENABLED:-true}"
 DIRECT_IPV6_ENABLED="${DIRECT_IPV6_ENABLED:-true}"
 # An in-place reinstall may reuse the last route that reached the final
@@ -156,7 +157,7 @@ auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后�
 如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
 CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
 AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
-AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx（以及可用时的 Certbot）；ARGO_DOMAIN 只供 Tunnel 使用，直连自动使用 zhilian+ARGO_DOMAIN。节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳，443+80 都可达时为直连域名申请 Let's Encrypt，否则使用发现到的 HTTP 端口。
+AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx；ARGO_DOMAIN 只供 Tunnel 使用，直连自动使用 zhilian+ARGO_DOMAIN。节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳。443+80 都可达时启用 Cloudflare 小黄云，由边缘提供 HTTPS、源站使用 HTTP 80；否则使用灰云和发现到的 HTTP 端口。
 阶段 1 会先检查 TeamNode Worker HTTPS 和按协议选择的 Cloudflare Edge 7844 出站心跳；3000/8001 只在节点启动后检查本机监听，直连候选端口只在节点启动临时监听后由 Worker 从公网心跳确认。
 候选端口全部失败后，会按 DIRECT_PORT_SCAN_PORTS 和 DIRECT_PORT_SCAN_RANGE 扩展进行端口发现；DIRECT_PORT_SCAN_MAX 默认 256，避免一次性检查全部端口。
 Tunnel 和直连都没有可用路线时，节点会写入 `.no-route` 标记并以退出码 78 停止，systemd、Supervisor 和 PM2 不会继续反复拉起；修复云安全组/上游网络后重新运行安装器即可清除标记并重新探测。
@@ -987,6 +988,7 @@ write_env_file() {
   write_env_value "XRAY_SNIFFING_ENABLED" "${XRAY_SNIFFING_ENABLED:-false}"
   write_env_value "DIRECT_MODE" "${DIRECT_MODE:-false}"
   write_env_value "DIRECT_TLS_ENABLED" "${DIRECT_TLS_ENABLED}"
+  write_env_value "DIRECT_CLOUDFLARE_PROXY_ENABLED" "${DIRECT_CLOUDFLARE_PROXY_ENABLED}"
   write_env_value "DIRECT_IPV4_ENABLED" "${DIRECT_IPV4_ENABLED}"
   write_env_value "DIRECT_IPV6_ENABLED" "${DIRECT_IPV6_ENABLED}"
   write_env_value "DIRECT_REUSE_ENABLED" "${DIRECT_REUSE_ENABLED}"
@@ -1042,6 +1044,7 @@ stop_runner() {
 trap stop_runner TERM INT
 export HOME="${APP_DIR}/home"
 export PM2_HOME="${APP_DIR}/pm2-home"
+ulimit -n 65535 >/dev/null 2>&1 || true
 cd "\${APP_DIR}/app"
 
 while true; do
@@ -1091,6 +1094,7 @@ ProtectHome=true
 ProtectSystem=full
 ReadWritePaths=${FILE_PATH} ${BIN_PATH} ${APP_DIR}/home ${APP_DIR}/npm-cache
 UMask=0077
+LimitNOFILE=65535
 TimeoutStopSec=15
 
 [Install]
@@ -1714,13 +1718,9 @@ install_direct_gateway_dependencies() {
   fi
 
   local nginx_missing=false
-  local certbot_missing=false
   local nginx_was_active=false
   has_command nginx || nginx_missing=true
-  if is_true "${DIRECT_TLS_ENABLED}"; then
-    has_command certbot || certbot_missing=true
-  fi
-  if [[ "${nginx_missing}" != true && "${certbot_missing}" != true ]]; then
+  if [[ "${nginx_missing}" != true ]]; then
     return 0
   fi
 
@@ -1728,38 +1728,31 @@ install_direct_gateway_dependencies() {
     nginx_was_active=true
   fi
 
-  local dependency_label="Nginx"
-  [[ "${certbot_missing}" == true ]] && dependency_label+="、Certbot"
-  log "准备直连网关依赖：${dependency_label}"
+  log "准备直连网关依赖：Nginx"
   local install_failed=false
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     local apt_packages=(nginx)
-    [[ "${certbot_missing}" == true ]] && apt_packages+=(certbot)
     apt-get install -y -qq "${apt_packages[@]}" >/dev/null || install_failed=true
   elif has_command apk; then
     local apk_packages=(nginx)
-    [[ "${certbot_missing}" == true ]] && apk_packages+=(certbot)
     apk add --no-cache "${apk_packages[@]}" >/dev/null || install_failed=true
   elif has_command dnf; then
     local dnf_packages=(nginx)
-    [[ "${certbot_missing}" == true ]] && dnf_packages+=(certbot)
     dnf install -y "${dnf_packages[@]}" >/dev/null || install_failed=true
   elif has_command yum; then
     local yum_packages=(nginx)
-    [[ "${certbot_missing}" == true ]] && yum_packages+=(certbot)
     yum install -y "${yum_packages[@]}" >/dev/null || install_failed=true
   elif has_command zypper; then
     local zypper_packages=(nginx)
-    [[ "${certbot_missing}" == true ]] && zypper_packages+=(certbot)
     zypper --non-interactive install "${zypper_packages[@]}" >/dev/null || install_failed=true
   else
     install_failed=true
   fi
 
   if [[ "${install_failed}" == true ]]; then
-    warn "无法自动安装 Nginx/Certbot；若 Tunnel 仍不可用，直连回退可能只能在已有组件可用时执行"
+    warn "无法自动安装 Nginx；若 Tunnel 仍不可用，直连回退只能在已有 Nginx 可用时执行"
   fi
 
   # 发行版安装 Nginx 时可能自动启动默认站点。仅在安装前没有运行 Nginx
@@ -1773,9 +1766,6 @@ install_direct_gateway_dependencies() {
 
   if ! has_command nginx; then
     warn "未找到 nginx；直连模式不会启动，Tunnel 模式仍可继续运行"
-  fi
-  if is_true "${DIRECT_TLS_ENABLED}" && ! has_command certbot; then
-    warn "未找到 certbot；如果 443+80 均可达，将按无证书 HTTP 模式处理"
   fi
 }
 

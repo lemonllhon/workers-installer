@@ -62,6 +62,12 @@ const PLATFORM_PUBLIC_PORT = Number.parseInt(process.env.PLATFORM_PUBLIC_PORT ||
 const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
 const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 10);
 const DIRECT_TLS_ENABLED = parseBoolean(process.env.DIRECT_TLS_ENABLED, true);
+// 标准直连由 Cloudflare 边缘终止 TLS，源站只提供 HTTP 80。旧环境中
+// 没有此变量时，根据已经选中的 443/80 HTTPS 方案自动迁移到小黄云。
+const DIRECT_CLOUDFLARE_PROXY_ENABLED = parseBoolean(
+  process.env.DIRECT_CLOUDFLARE_PROXY_ENABLED,
+  DIRECT_MODE && DIRECT_TLS_ENABLED && DIRECT_PORT === 443 && DIRECT_HTTP_PORT === 80
+);
 const DIRECT_IPV4_ENABLED = parseBoolean(process.env.DIRECT_IPV4_ENABLED, true);
 const DIRECT_IPV6_ENABLED = parseBoolean(process.env.DIRECT_IPV6_ENABLED, true);
 const DIRECT_REUSE_ENABLED = parseBoolean(process.env.DIRECT_REUSE_ENABLED, false);
@@ -87,11 +93,6 @@ const DIRECT_PORT_SCAN_MAX = Number.parseInt(process.env.DIRECT_PORT_SCAN_MAX ||
 // 多个被过滤端口占满连接槽后令整个心跳请求超时。
 const DIRECT_PORT_PROBE_BATCH_SIZE = 4;
 const DIRECT_FALLBACK_FAILURE_THRESHOLD = Number.parseInt(process.env.DIRECT_FALLBACK_FAILURE_THRESHOLD || "2", 10);
-const DIRECT_CERT_FILE = process.env.DIRECT_CERT_FILE || "";
-const DIRECT_KEY_FILE = process.env.DIRECT_KEY_FILE || "";
-const DIRECT_LETSENCRYPT_EMAIL = process.env.DIRECT_LETSENCRYPT_EMAIL || "admin@lemon.vin";
-const DIRECT_CERTIFICATE_ATTEMPTS = Math.max(1, Math.min(5, Number.parseInt(process.env.DIRECT_CERTIFICATE_ATTEMPTS || "3", 10) || 3));
-const DIRECT_CERTIFICATE_RETRY_DELAY_MS = Math.max(5000, Number.parseInt(process.env.DIRECT_CERTIFICATE_RETRY_DELAY_MS || "30000", 10) || 30000);
 const CF_DNS_ENABLED = parseBoolean(process.env.CF_DNS_ENABLED, false);
 const CF_API_TOKEN = process.env.CF_API_TOKEN || process.env.CLOUDFLARE_API_KEY || "";
 const CF_DNS_ZONE_ID = process.env.CF_DNS_ZONE_ID || "";
@@ -174,7 +175,6 @@ const directNginxConfigPath = path.join(FILE_PATH, "nginx-direct.conf");
 const directNginxAccessLogPath = path.join(FILE_PATH, "nginx-access.log");
 const directNginxErrorLogPath = path.join(FILE_PATH, "nginx-error.log");
 const directNginxPidPath = path.join(FILE_PATH, "nginx.pid");
-const directAcmePath = path.join(FILE_PATH, "acme");
 const tunnelJsonPath = path.join(FILE_PATH, "tunnel.json");
 const tunnelYamlPath = path.join(FILE_PATH, "tunnel.yml");
 const noRouteMarkerPath = path.resolve(FILE_PATH, ".no-route");
@@ -182,7 +182,6 @@ const routeReadyMarkerPath = path.resolve(FILE_PATH, ".route-ready");
 const routeProbeProgressPath = path.resolve(FILE_PATH, ".route-probe-progress");
 const NO_ROUTE_EXIT_CODE = 78;
 const NGINX_BIN = process.env.NGINX_BIN || "/usr/sbin/nginx";
-const CERTBOT_BIN = process.env.CERTBOT_BIN || "/usr/bin/certbot";
 
 try {
   fs.rmSync(routeReadyMarkerPath, { force: true });
@@ -197,7 +196,6 @@ let tunnelTestCommandPollPromise = null;
 let teamnodeSyncRegistered = false;
 let teamnodeSyncContext = null;
 let teamnodeShutdownPromise = null;
-let directCertificateRenewalTimer = null;
 let cloudflareDnsSyncTimer = null;
 let processShutdownRequested = false;
 let tunnelConnectivityCache = null;
@@ -638,7 +636,8 @@ async function checkCloudflareTunnelConnectivity(argoDomain, { force = false } =
       directAddressFamilies: DIRECT_MODE
         ? configuredDirectAddressFamilies().map((family) => directFamilyName(family))
         : [],
-      tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true
+      tlsEnabled: DIRECT_MODE ? DIRECT_TLS_ENABLED : true,
+      cloudflareProxied: DIRECT_MODE ? DIRECT_CLOUDFLARE_PROXY_ENABLED : false
     };
   }
   if (!domain) {
@@ -994,6 +993,7 @@ async function probePublicRouteForFamily({ domain, mode, port, httpPort, tlsEnab
         port: mode === "direct" ? port : 7844,
         httpPort: mode === "direct" && tlsEnabled ? httpPort : null,
         tlsEnabled: mode === "direct" ? tlsEnabled : true,
+        cloudflareProxied: mode === "direct" ? DIRECT_CLOUDFLARE_PROXY_ENABLED : false,
         family: mode === "direct" ? familyName : null
       },
       "nodejs_argo_public_route_probe",
@@ -1274,22 +1274,19 @@ function selectDirectFallbackPlan(results, { addressFamilies = configuredDirectA
   const familiesQualify = (families) => families.length > 0
     && (!requireAllFamilies || families.length === familyNames.length);
   const nginxAvailable = fs.existsSync(NGINX_BIN);
-  const certificatePaths = getDirectCertificatePaths();
-  const tlsAvailable = DIRECT_TLS_ENABLED && nginxAvailable && (
-    fs.existsSync(CERTBOT_BIN)
-    || (fs.existsSync(certificatePaths.certificateFile) && fs.existsSync(certificatePaths.keyFile))
-  );
+  const cloudflareProxyAvailable = Boolean(CF_API_TOKEN) && nginxAvailable;
 
   if (!nginxAvailable) return null;
 
   const tlsFamilies = qualifyingFamilies([443, 80]);
-  if (tlsAvailable && familiesQualify(tlsFamilies)) {
+  if (cloudflareProxyAvailable && familiesQualify(tlsFamilies)) {
     return {
       tlsEnabled: true,
+      cloudflareProxied: true,
       port: 443,
       httpPort: 80,
       addressFamilies: tlsFamilies,
-      reason: "https_443_and_http_80"
+      reason: "cloudflare_flexible_443_to_http_80"
     };
   }
 
@@ -1304,6 +1301,7 @@ function selectDirectFallbackPlan(results, { addressFamilies = configuredDirectA
 
   return {
     tlsEnabled: false,
+    cloudflareProxied: false,
     port,
     httpPort: port,
     addressFamilies: selectedFamilies,
@@ -1592,6 +1590,7 @@ function writeDirectFallbackEnv(plan) {
     DIRECT_MODE: "true",
     DIRECT_DOMAIN,
     DIRECT_TLS_ENABLED: plan.tlsEnabled ? "true" : "false",
+    DIRECT_CLOUDFLARE_PROXY_ENABLED: plan.cloudflareProxied ? "true" : "false",
     DIRECT_PORT: String(plan.port),
     DIRECT_HTTP_PORT: String(plan.httpPort),
     DIRECT_IPV4_ENABLED: planFamilies.includes("ipv4") ? "true" : "false",
@@ -1689,7 +1688,7 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
     writeDirectFallbackEnv(plan);
     console.warn(
       `Cloudflare Tunnel 连续异常，已选择直连 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
-      + `${plan.tlsEnabled ? "（证书将申请/续期）" : "（不申请证书）"}，正在重启服务应用新配置`
+      + `${plan.cloudflareProxied ? "（Cloudflare 小黄云，源站 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务应用新配置`
     );
     await stopRuntimeProcesses();
     await stopArgoGateway();
@@ -1757,7 +1756,7 @@ async function activateDirectFallbackAtStartup(tunnelConnectivity) {
   await shutdownTeamNodeSync("startup_direct_fallback");
   console.warn(
     `Tunnel 心跳失败，已选择直连 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
-    + `${plan.tlsEnabled ? "（443+80 可达，重启后申请/续期证书）" : "（不申请证书）"}，正在重启服务`
+    + `${plan.cloudflareProxied ? "（443+80 可达，启用 Cloudflare 小黄云，源站 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
   return true;
@@ -1785,6 +1784,7 @@ async function prepareDirectModeStartup() {
     && String(process.env.CF_DNS_RECORD_NAME || "").trim().toLowerCase() === DIRECT_DOMAIN;
   const samePlan = directDomainConfigCurrent
     && DIRECT_TLS_ENABLED === plan.tlsEnabled
+    && DIRECT_CLOUDFLARE_PROXY_ENABLED === Boolean(plan.cloudflareProxied)
     && DIRECT_PORT === plan.port
     && DIRECT_HTTP_PORT === plan.httpPort
     && DIRECT_IPV4_ENABLED === plan.addressFamilies.includes("ipv4")
@@ -1797,7 +1797,7 @@ async function prepareDirectModeStartup() {
   writeDirectFallbackEnv(plan);
   console.warn(
     `直连配置已调整为 ${DIRECT_DOMAIN} ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
-    + `${plan.tlsEnabled ? "（443+80 可达，准备证书）" : "（443+80 不同时可达，不申请证书）"}，正在重启服务`
+    + `${plan.cloudflareProxied ? "（443+80 可达，启用 Cloudflare 小黄云，源站 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
   return true;
@@ -2129,11 +2129,7 @@ function deleteNodes() {
 // 清理运行目录里的历史文件
 function cleanupOldFiles() {
   try {
-    const preservedFiles = new Set(
-      [DIRECT_CERT_FILE, DIRECT_KEY_FILE]
-        .filter(Boolean)
-        .map((filePath) => path.resolve(filePath))
-    );
+    const preservedFiles = new Set();
     const files = fs.readdirSync(FILE_PATH);
     files.forEach((file) => {
       const filePath = path.join(FILE_PATH, file);
@@ -2287,8 +2283,14 @@ function validateDirectMode() {
     throw new Error("DIRECT_PORT 和 DIRECT_HTTP_PORT 不能使用同一个端口");
   }
 
-  if (DIRECT_TLS_ENABLED && Boolean(DIRECT_CERT_FILE) !== Boolean(DIRECT_KEY_FILE)) {
-    throw new Error("DIRECT_CERT_FILE 和 DIRECT_KEY_FILE 必须同时配置，或同时留空");
+  if (DIRECT_CLOUDFLARE_PROXY_ENABLED && (
+    !DIRECT_TLS_ENABLED
+    || DIRECT_PORT !== 443
+    || DIRECT_HTTP_PORT !== 80
+    || !CF_DNS_ENABLED
+    || !CF_API_TOKEN
+  )) {
+    throw new Error("Cloudflare 小黄云直连要求 HTTPS 443、源站 HTTP 80、CF_DNS_ENABLED=true，并配置 Cloudflare API Token");
   }
 
   if (!DIRECT_IPV4_ENABLED && !DIRECT_IPV6_ENABLED) {
@@ -2316,31 +2318,14 @@ function nginxConfigValue(value) {
   return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function nginxDirectListenDirectives(port, { ssl = false } = {}) {
-  const suffix = ssl ? " ssl" : "";
+function nginxDirectListenDirectives(port) {
   const directives = [];
-  if (DIRECT_IPV4_ENABLED) directives.push(`    listen ${port}${suffix};`);
-  if (DIRECT_IPV6_ENABLED) directives.push(`    listen [::]:${port}${suffix} ipv6only=on;`);
-  return directives.length > 0 ? directives : [`    listen ${port}${suffix};`];
+  if (DIRECT_IPV4_ENABLED) directives.push(`    listen ${port};`);
+  if (DIRECT_IPV6_ENABLED) directives.push(`    listen [::]:${port} ipv6only=on;`);
+  return directives.length > 0 ? directives : [`    listen ${port};`];
 }
 
-function getDirectCertificatePaths() {
-  if (DIRECT_CERT_FILE && DIRECT_KEY_FILE) {
-    return {
-      certificateFile: path.resolve(DIRECT_CERT_FILE),
-      keyFile: path.resolve(DIRECT_KEY_FILE),
-      managedByCertbot: false
-    };
-  }
-
-  return {
-    certificateFile: path.join(FILE_PATH, "letsencrypt", "live", DIRECT_DOMAIN, "fullchain.pem"),
-    keyFile: path.join(FILE_PATH, "letsencrypt", "live", DIRECT_DOMAIN, "privkey.pem"),
-    managedByCertbot: true
-  };
-}
-
-function buildDirectHttpOnlyNginxConfig() {
+function buildDirectHttpOnlyNginxConfig({ listenPort = DIRECT_PORT } = {}) {
   const domain = String(DIRECT_DOMAIN).trim();
   const runtimePidPath = path.resolve(directNginxPidPath);
   const accessLogPath = path.resolve(directNginxAccessLogPath);
@@ -2350,12 +2335,13 @@ function buildDirectHttpOnlyNginxConfig() {
     "proxy_set_header Upgrade $http_upgrade;",
     "proxy_set_header Connection $connection_upgrade;",
     "proxy_set_header Host $host;",
-    "proxy_set_header X-Real-IP $remote_addr;",
+    "proxy_set_header X-Real-IP $proxy_real_ip;",
     "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-    "proxy_set_header X-Forwarded-Proto $scheme;",
+    "proxy_set_header X-Forwarded-Proto $proxy_forwarded_proto;",
     "proxy_connect_timeout 10s;",
     "proxy_read_timeout 86400s;",
     "proxy_send_timeout 86400s;",
+    "proxy_cache off;",
     "proxy_buffering off;",
     "proxy_request_buffering off;",
     "proxy_socket_keepalive on;"
@@ -2366,24 +2352,41 @@ function buildDirectHttpOnlyNginxConfig() {
     "pid " + nginxConfigValue(runtimePidPath) + ";",
     "error_log " + nginxConfigValue(errorLogPath) + " " + NGINX_LOG_LEVEL + ";",
     "events {",
-    "  worker_connections 4096;",
+    "  worker_connections 8192;",
+    "  multi_accept on;",
     "}",
     "http {",
     "  include /etc/nginx/mime.types;",
     "  default_type application/octet-stream;",
+    "  server_tokens off;",
+    "  underscores_in_headers on;",
     "  sendfile on;",
+    "  tcp_nopush on;",
     "  tcp_nodelay on;",
-    "  keepalive_timeout 65s;",
+    "  keepalive_timeout 75s;",
+    "  keepalive_requests 10000;",
+    "  reset_timedout_connection on;",
+    "  client_header_timeout 15s;",
+    "  client_body_timeout 60s;",
+    "  send_timeout 600s;",
     "  map $http_upgrade $connection_upgrade {",
     "    default upgrade;",
     "    '' close;",
+    "  }",
+    "  map $http_cf_connecting_ip $proxy_real_ip {",
+    "    default $http_cf_connecting_ip;",
+    "    '' $remote_addr;",
+    "  }",
+    "  map $http_x_forwarded_proto $proxy_forwarded_proto {",
+    "    default $http_x_forwarded_proto;",
+    "    '' $scheme;",
     "  }",
     DIRECT_NGINX_ACCESS_LOG_ENABLED
       ? "  access_log " + nginxConfigValue(accessLogPath) + " combined;"
       : "  access_log off;",
     "",
     "  server {",
-    ...nginxDirectListenDirectives(DIRECT_PORT),
+    ...nginxDirectListenDirectives(listenPort),
     "    server_name " + domain + ";",
     "",
     "    location = /vless-argo {",
@@ -2411,118 +2414,16 @@ function buildDirectHttpOnlyNginxConfig() {
   return lines.join("\n") + "\n";
 }
 
-function buildDirectNginxConfig({ certificateFile = "", keyFile = "", httpOnly = false, tlsEnabled = DIRECT_TLS_ENABLED } = {}) {
-  if (!httpOnly && !tlsEnabled) {
-    return buildDirectHttpOnlyNginxConfig();
-  }
-  const domain = String(DIRECT_DOMAIN).trim();
-  const runtimePidPath = path.resolve(directNginxPidPath);
-  const runtimeAcmePath = path.resolve(directAcmePath);
-  const accessLogPath = path.resolve(directNginxAccessLogPath);
-  const errorLogPath = path.resolve(directNginxErrorLogPath);
-  const httpsPortSuffix = DIRECT_PORT === 443 ? "" : `:${DIRECT_PORT}`;
-  const proxyHeaders = [
-    "proxy_http_version 1.1;",
-    "proxy_set_header Upgrade $http_upgrade;",
-    "proxy_set_header Connection $connection_upgrade;",
-    "proxy_set_header Host $host;",
-    "proxy_set_header X-Real-IP $remote_addr;",
-    "proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;",
-    "proxy_set_header X-Forwarded-Proto $scheme;",
-    "proxy_connect_timeout 10s;",
-    "proxy_read_timeout 86400s;",
-    "proxy_send_timeout 86400s;",
-    "proxy_buffering off;",
-    "proxy_request_buffering off;",
-    "proxy_socket_keepalive on;"
-  ];
-
-  const lines = [
-    "worker_processes auto;",
-    "worker_rlimit_nofile 65535;",
-    `pid ${nginxConfigValue(runtimePidPath)};`,
-    `error_log ${nginxConfigValue(errorLogPath)} ${NGINX_LOG_LEVEL};`,
-    "events {",
-    "  worker_connections 4096;",
-    "}",
-    "http {",
-    "  include /etc/nginx/mime.types;",
-    "  default_type application/octet-stream;",
-    "  sendfile on;",
-    "  tcp_nodelay on;",
-    "  keepalive_timeout 65s;",
-    "  map $http_upgrade $connection_upgrade {",
-    "    default upgrade;",
-    "    '' close;",
-    "  }",
-    DIRECT_NGINX_ACCESS_LOG_ENABLED
-      ? `  access_log ${nginxConfigValue(accessLogPath)} combined;`
-      : "  access_log off;",
-    "",
-    "  server {",
-    ...nginxDirectListenDirectives(DIRECT_HTTP_PORT),
-    `    server_name ${domain};`,
-    "",
-    "    location ^~ /.well-known/acme-challenge/ {",
-    `      root ${nginxConfigValue(runtimeAcmePath)};`,
-    "      try_files $uri =404;",
-    "    }",
-    "",
-    "    location / {",
-    `      return 301 https://$host${httpsPortSuffix}$request_uri;`,
-    "    }",
-    "  }"
-  ];
-
-  if (!httpOnly) {
-    lines.push(
-      "",
-      "  server {",
-      ...nginxDirectListenDirectives(DIRECT_PORT, { ssl: true }),
-      `    server_name ${domain};`,
-      `    ssl_certificate ${nginxConfigValue(path.resolve(certificateFile))};`,
-      `    ssl_certificate_key ${nginxConfigValue(path.resolve(keyFile))};`,
-      "    ssl_protocols TLSv1.2 TLSv1.3;",
-      "    ssl_session_cache shared:SSL:10m;",
-      "    ssl_session_timeout 10m;",
-      "",
-      "    location = /vless-argo {",
-      "      proxy_pass http://127.0.0.1:3002;",
-      ...proxyHeaders.map((line) => `      ${line}`),
-      "    }",
-      "",
-      "    location = /vmess-argo {",
-      "      proxy_pass http://127.0.0.1:3003;",
-      ...proxyHeaders.map((line) => `      ${line}`),
-      "    }",
-      "",
-      "    location = /trojan-argo {",
-      "      proxy_pass http://127.0.0.1:3004;",
-      ...proxyHeaders.map((line) => `      ${line}`),
-      "    }",
-      "",
-      "    location / {",
-      "      proxy_pass http://127.0.0.1:3000;",
-      ...proxyHeaders.map((line) => `      ${line}`),
-      "    }",
-      "  }"
-    );
-  }
-
-  lines.push("}", "");
-  return lines.join("\n");
-}
-
-function writeDirectNginxConfig(options = {}) {
-  fs.mkdirSync(directAcmePath, { recursive: true });
-  fs.writeFileSync(directNginxConfigPath, buildDirectNginxConfig(options));
+function writeDirectNginxConfig() {
+  const listenPort = DIRECT_CLOUDFLARE_PROXY_ENABLED ? DIRECT_HTTP_PORT : DIRECT_PORT;
+  fs.writeFileSync(directNginxConfigPath, buildDirectHttpOnlyNginxConfig({ listenPort }));
 }
 
 async function stopDirectNginx() {
   try {
     await exec(`${shellQuote(NGINX_BIN)} -c ${shellQuote(path.resolve(directNginxConfigPath))} -s stop`);
   } catch {
-    // 证书申请前可能还没有 Nginx 进程，忽略停止失败。
+    // 首次启动前可能还没有 Nginx 进程，忽略停止失败。
   }
 }
 
@@ -2531,106 +2432,6 @@ async function startNginx() {
   await exec(`${shellQuote(NGINX_BIN)} -t -c ${shellQuote(config)}`);
   await exec(`nohup ${shellQuote(NGINX_BIN)} -c ${shellQuote(config)} >>${shellQuote(nginxBootLogPath)} 2>&1 &`);
   await new Promise((resolve) => setTimeout(resolve, 500));
-}
-
-async function ensureDirectCertificate() {
-  const certificate = getDirectCertificatePaths();
-  const certificateExists = fs.existsSync(certificate.certificateFile);
-  const keyExists = fs.existsSync(certificate.keyFile);
-
-  if (certificateExists && keyExists) {
-    return certificate;
-  }
-
-  if (DIRECT_CERT_FILE || DIRECT_KEY_FILE) {
-    throw new Error(`直连模式证书文件不存在：${certificate.certificateFile} 或 ${certificate.keyFile}`);
-  }
-
-  if (!DIRECT_LETSENCRYPT_EMAIL) {
-    throw new Error("直连模式需要证书：请配置 DIRECT_CERT_FILE/DIRECT_KEY_FILE，或配置 DIRECT_LETSENCRYPT_EMAIL 自动申请 Let's Encrypt 证书");
-  }
-
-  writeDirectNginxConfig({ httpOnly: true });
-  await startNginx();
-  let certificateError = null;
-  try {
-    const webroot = path.resolve(directAcmePath);
-    const certbotArgs = [
-      "certonly",
-      "--webroot",
-      "--webroot-path",
-      webroot,
-      "--config-dir",
-      path.join(FILE_PATH, "letsencrypt"),
-      "--work-dir",
-      path.join(FILE_PATH, "letsencrypt-work"),
-      "--logs-dir",
-      path.join(FILE_PATH, "letsencrypt-logs"),
-      "--domain",
-      DIRECT_DOMAIN,
-      "--email",
-      DIRECT_LETSENCRYPT_EMAIL,
-      "--agree-tos",
-      "--non-interactive",
-      "--keep-until-expiring",
-      "--no-eff-email"
-    ].map(shellQuote).join(" ");
-    for (let attempt = 1; attempt <= DIRECT_CERTIFICATE_ATTEMPTS; attempt += 1) {
-      appendRouteProbeProgress(`Let's Encrypt 证书申请 ${attempt}/${DIRECT_CERTIFICATE_ATTEMPTS}：${DIRECT_DOMAIN}`);
-      try {
-        await exec(`${shellQuote(CERTBOT_BIN)} ${certbotArgs}`);
-        certificateError = null;
-        appendRouteProbeProgress(`Let's Encrypt 证书申请成功：${DIRECT_DOMAIN}`);
-        break;
-      } catch (error) {
-        certificateError = error;
-        appendRouteProbeProgress(
-          `Let's Encrypt 证书申请失败 ${attempt}/${DIRECT_CERTIFICATE_ATTEMPTS}：${String(error?.message || "certbot_failed").slice(0, 160)}`
-        );
-        if (attempt < DIRECT_CERTIFICATE_ATTEMPTS) {
-          appendRouteProbeProgress(`等待 ${Math.ceil(DIRECT_CERTIFICATE_RETRY_DELAY_MS / 1000)} 秒后重试证书，等待 DNS 缓存更新`);
-          await new Promise((resolve) => setTimeout(resolve, DIRECT_CERTIFICATE_RETRY_DELAY_MS));
-        }
-      }
-    }
-  } finally {
-    await stopDirectNginx();
-  }
-
-  if (certificateError) {
-    throw new Error(`Let's Encrypt 证书申请失败：${String(certificateError?.message || "certbot_failed").slice(0, 240)}`);
-  }
-
-  if (!fs.existsSync(certificate.certificateFile) || !fs.existsSync(certificate.keyFile)) {
-    throw new Error(`Let's Encrypt 申请完成后仍未找到证书：${certificate.certificateFile}`);
-  }
-
-  return certificate;
-}
-
-function startDirectCertificateRenewal() {
-  if (directCertificateRenewalTimer || !DIRECT_LETSENCRYPT_EMAIL || DIRECT_CERT_FILE || DIRECT_KEY_FILE) {
-    return;
-  }
-
-  directCertificateRenewalTimer = setInterval(async () => {
-    try {
-      await exec(
-        `${shellQuote(CERTBOT_BIN)} renew --quiet`
-        + ` --config-dir ${shellQuote(path.join(FILE_PATH, "letsencrypt"))}`
-        + ` --work-dir ${shellQuote(path.join(FILE_PATH, "letsencrypt-work"))}`
-        + ` --logs-dir ${shellQuote(path.join(FILE_PATH, "letsencrypt-logs"))}`
-      );
-      await exec(`${shellQuote(NGINX_BIN)} -c ${shellQuote(path.resolve(directNginxConfigPath))} -s reload`);
-      console.log("直连模式证书续期检查完成，Nginx 已重新加载");
-    } catch (error) {
-      console.error(`直连模式证书续期失败：${error.message}`);
-    }
-  }, 12 * 60 * 60 * 1000);
-
-  if (typeof directCertificateRenewalTimer.unref === "function") {
-    directCertificateRenewalTimer.unref();
-  }
 }
 
 function getCloudflareApiClient() {
@@ -2848,6 +2649,8 @@ async function syncCloudflareDnsRecord() {
     A: DIRECT_IPV4_ENABLED ? publicAddresses.ipv4 : null,
     AAAA: DIRECT_IPV6_ENABLED ? publicAddresses.ipv6 : null
   };
+  const proxied = DIRECT_CLOUDFLARE_PROXY_ENABLED;
+  const proxyLabel = proxied ? "Proxied/小黄云" : "DNS Only/灰云";
   const enabledByType = { A: DIRECT_IPV4_ENABLED, AAAA: DIRECT_IPV6_ENABLED };
   if (!Object.values(desiredByType).some(Boolean)) {
     throw new Error("直连模式未获得可发布的公网 IPv4/IPv6 地址");
@@ -2875,8 +2678,8 @@ async function syncCloudflareDnsRecord() {
       type,
       name: CF_DNS_RECORD_NAME,
       content: address,
-      ttl: Number.isInteger(CF_DNS_TTL) && CF_DNS_TTL >= 1 ? CF_DNS_TTL : 120,
-      proxied: false
+      ttl: proxied ? 1 : (Number.isInteger(CF_DNS_TTL) && CF_DNS_TTL >= 1 ? CF_DNS_TTL : 120),
+      proxied
     };
     const current = existing[0];
     if (!current) {
@@ -2884,15 +2687,15 @@ async function syncCloudflareDnsRecord() {
       if (!createResponse.data || !createResponse.data.success) {
         throw new Error(`Cloudflare DNS ${type} 记录创建失败`);
       }
-      console.log(`Cloudflare DNS 已创建：${CF_DNS_RECORD_NAME} ${type} ${address}（DNS-only）`);
-    } else if (current.content !== desired.content || current.proxied !== false || current.ttl !== desired.ttl) {
+      console.log(`Cloudflare DNS 已创建：${CF_DNS_RECORD_NAME} ${type} ${address}（${proxyLabel}）`);
+    } else if (current.content !== desired.content || current.proxied !== proxied || current.ttl !== desired.ttl) {
       const updateResponse = await client.put(`/zones/${zoneId}/dns_records/${current.id}`, desired);
       if (!updateResponse.data || !updateResponse.data.success) {
         throw new Error(`Cloudflare DNS ${type} 记录更新失败`);
       }
-      console.log(`Cloudflare DNS 已更新：${CF_DNS_RECORD_NAME} ${type} ${address}（DNS-only）`);
+      console.log(`Cloudflare DNS 已更新：${CF_DNS_RECORD_NAME} ${type} ${address}（${proxyLabel}）`);
     } else {
-      console.log(`Cloudflare DNS 已是最新：${CF_DNS_RECORD_NAME} ${type} ${address}（DNS-only）`);
+      console.log(`Cloudflare DNS 已是最新：${CF_DNS_RECORD_NAME} ${type} ${address}（${proxyLabel}）`);
     }
     for (const duplicate of existing.slice(1)) {
       const deleteResponse = await client.delete(`/zones/${zoneId}/dns_records/${duplicate.id}`);
@@ -2926,37 +2729,14 @@ function startCloudflareDnsSyncLoop() {
 async function startDirectGateway() {
   validateDirectMode();
   await stopDirectNginx();
-  if (!DIRECT_TLS_ENABLED) {
-    writeDirectNginxConfig({ tlsEnabled: false });
-    await startNginx();
-    console.log(`直连 HTTP 模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}（${configuredDirectAddressFamilies().map((family) => directFamilyName(family).toUpperCase()).join("/")}）`);
-    return false;
-  }
-  let certificate;
-  try {
-    certificate = await ensureDirectCertificate();
-  } catch (error) {
-    const fallbackPort = Number.parseInt(String(DIRECT_HTTP_PORT), 10);
-    if (
-      !AUTO_DIRECT_FALLBACK
-      || !NODEJS_ARGO_ENV_FILE
-      || !Number.isInteger(fallbackPort)
-      || fallbackPort < 1
-      || fallbackPort > 65535
-      || LOCAL_SERVICE_PORTS.has(fallbackPort)
-    ) {
-      throw error;
-    }
-    writeDirectFallbackEnv({ tlsEnabled: false, port: fallbackPort, httpPort: fallbackPort });
-    appendRouteProbeProgress(
-      `证书申请最终失败，按回退规则切换为 HTTP ${fallbackPort}；正在重启服务应用配置`
-    );
-    console.warn(`证书申请最终失败，自动降级为直连 HTTP ${fallbackPort}：${error.message}`);
-    return true;
-  }
-  writeDirectNginxConfig(certificate);
+  writeDirectNginxConfig();
   await startNginx();
-  startDirectCertificateRenewal();
+  const families = configuredDirectAddressFamilies().map((family) => directFamilyName(family).toUpperCase()).join("/");
+  if (DIRECT_CLOUDFLARE_PROXY_ENABLED) {
+    console.log(`直连 Cloudflare 代理模式已启动：公网 HTTPS ${DIRECT_DOMAIN}:443 -> 源站 HTTP ${DIRECT_HTTP_PORT}（${families}，无需本机证书）`);
+  } else {
+    console.log(`直连 DNS Only HTTP 模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}（${families}）`);
+  }
   return false;
 }
 
@@ -2990,21 +2770,28 @@ function proxyArgoWebSocket(req, socket, head) {
   const upstream = net.createConnection({ host: "127.0.0.1", port: targetPort });
   let connected = false;
   let closed = false;
+  socket.setTimeout(0);
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 30000);
+  upstream.setNoDelay(true);
+  upstream.setKeepAlive(true, 30000);
+  const connectTimeout = setTimeout(() => {
+    if (!connected) writeArgoGatewayResponse(socket, 502, "Xray upstream timeout");
+    closeBoth();
+  }, 10000);
+  if (typeof connectTimeout.unref === "function") connectTimeout.unref();
 
   const closeBoth = () => {
     if (closed) return;
     closed = true;
+    clearTimeout(connectTimeout);
     if (!socket.destroyed) socket.destroy();
     if (!upstream.destroyed) upstream.destroy();
   };
 
-  upstream.setTimeout(10000, () => {
-    if (!connected) writeArgoGatewayResponse(socket, 502, "Xray upstream timeout");
-    closeBoth();
-  });
-
   upstream.once("connect", () => {
     connected = true;
+    clearTimeout(connectTimeout);
     const requestLines = [
       `${req.method || "GET"} ${req.url || pathname} HTTP/${req.httpVersion || "1.1"}`
     ];
@@ -3036,9 +2823,21 @@ function proxyArgoWebSocket(req, socket, head) {
   socket.on("close", () => upstream.destroy());
 }
 
+function optimizeHttpServer(server) {
+  server.keepAliveTimeout = 75000;
+  server.headersTimeout = 80000;
+  server.requestTimeout = 0;
+  server.maxRequestsPerSocket = 0;
+  server.on("connection", (socket) => {
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30000);
+  });
+  return server;
+}
+
 function startHttpServer() {
   if (appServer) return appServer;
-  appServer = http.createServer(app);
+  appServer = optimizeHttpServer(http.createServer(app));
   appServer.listen(PORT, () => console.log(`HTTP 服务已运行，端口：${PORT}`));
   return appServer;
 }
@@ -3060,7 +2859,7 @@ function startArgoGateway() {
     return Promise.resolve();
   }
 
-  const server = http.createServer(app);
+  const server = optimizeHttpServer(http.createServer(app));
   server.on("upgrade", proxyArgoWebSocket);
   argoGatewayServer = server;
   return new Promise((resolve, reject) => {
@@ -3210,7 +3009,11 @@ async function startProcesses() {
         setTimeout(() => process.exit(0), 100);
         return true;
       }
-      console.log(`直连模式已启动：${DIRECT_DOMAIN}:${DIRECT_PORT}（${configuredDirectAddressFamilies().map((family) => directFamilyName(family).toUpperCase()).join("/")}），HTTP ${DIRECT_HTTP_PORT} 用于证书验证和跳转`);
+      console.log(
+        DIRECT_CLOUDFLARE_PROXY_ENABLED
+          ? `直连模式已启动：Cloudflare HTTPS ${DIRECT_DOMAIN}:443，源站 Nginx HTTP ${DIRECT_HTTP_PORT}`
+          : `直连模式已启动：DNS Only HTTP ${DIRECT_DOMAIN}:${DIRECT_PORT}`
+      );
     } catch (error) {
       console.error(`直连网关启动失败：${error.message}`);
       throw error;

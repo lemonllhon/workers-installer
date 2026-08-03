@@ -185,7 +185,8 @@ function normalizeTunnelConnectivity(value) {
     directHttpPort: Number.isFinite(directHttpPort) && directHttpPort > 0 && directHttpPort <= 65535 ? directHttpPort : null,
     directAddressFamilies,
     publicProbeFamilies,
-    tlsEnabled: value.tlsEnabled === true
+    tlsEnabled: value.tlsEnabled === true,
+    cloudflareProxied: value.cloudflareProxied === true
   };
 }
 
@@ -686,7 +687,9 @@ function tunnelConnectivityView(node) {
   const reason = directMode
     ? publicProbeBlocked
       ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
-      : `已切换直连模式${info.directHttpPort ? `；HTTP ${info.directHttpPort}` : ""}`
+      : info.cloudflareProxied
+        ? `Cloudflare 小黄云；源站 HTTP ${info.directHttpPort || 80}`
+        : `DNS Only；HTTP ${directPort || "端口"}`
     : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
   const publicProbeDetail = info.publicProbeStatus === "reachable"
       ? "install.lemon.vin 公网路由心跳通过"
@@ -1317,7 +1320,9 @@ async function dashboardPageResponse(request, env) {
         const reason = directMode
           ? publicProbeBlocked
             ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
-            : "已切换直连模式" + (info.directHttpPort ? "；HTTP " + info.directHttpPort : "")
+            : info.cloudflareProxied
+              ? "Cloudflare 小黄云；源站 HTTP " + (info.directHttpPort || 80)
+              : "DNS Only；HTTP " + (directPort || "端口")
           : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
         const publicProbeDetail = info.publicProbeStatus === "reachable"
           ? "install.lemon.vin 公网路由心跳通过"
@@ -1807,12 +1812,14 @@ async function publicRouteProbeResponse(request, env) {
   const port = Number.parseInt(String(payload?.port || ""), 10);
   const httpPort = Number.parseInt(String(payload?.httpPort || ""), 10);
   const tlsEnabled = payload?.tlsEnabled !== false;
+  const cloudflareProxied = mode === "direct" && payload?.cloudflareProxied === true;
   const family = ["ipv4", "ipv6"].includes(String(payload?.family || ""))
     ? String(payload.family)
     : mode === "direct" ? "ipv4" : "";
   if (!uuid || !mode || !domain || (mode === "direct" && (
     !Number.isInteger(port) || port < 1 || port > 65535
     || (tlsEnabled && (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535))
+    || (cloudflareProxied && (!tlsEnabled || port !== 443 || httpPort !== 80))
   ))) {
     return json({ error: "invalid_public_route_probe" }, 400);
   }
@@ -1828,7 +1835,7 @@ async function publicRouteProbeResponse(request, env) {
   if (mode === "direct" && !host) return json({ error: `node_public_${family}_unavailable` }, 409);
 
   const ports = mode === "direct"
-    ? [...new Set([port, ...(tlsEnabled ? [httpPort] : [])])]
+    ? [...new Set(cloudflareProxied ? [httpPort] : [port, ...(tlsEnabled ? [httpPort] : [])])]
     : [];
   const tcpResults = mode === "direct"
     ? await Promise.all(ports.map((candidate) => probePublicTcpPort(host, candidate)))
@@ -1842,6 +1849,7 @@ async function publicRouteProbeResponse(request, env) {
       domain,
       host,
       port,
+      cloudflareProxied,
       checkedAt: Date.now(),
       externalStatus: "blocked",
       reason: "public_tcp_blocked",
@@ -1862,6 +1870,7 @@ async function publicRouteProbeResponse(request, env) {
     domain,
     host: mode === "direct" ? host : null,
     port: mode === "direct" ? port : 7844,
+    cloudflareProxied,
     checkedAt: Date.now(),
     externalStatus: ok ? "reachable" : "blocked",
     reason: ok ? "public_route_reachable" : http.reason,

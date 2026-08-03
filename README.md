@@ -37,7 +37,7 @@ Workers & Pages
 | --- | --- | --- |
 | `TEAMNODE_SYNC_SECRET` | Secret | TeamNode 主密钥，只在 Worker 代理请求时使用 |
 | `TEAMNODE_SYNC_ENROLL_PASSWORD` | Secret | 目标机器安装时输入的兑换密码 |
-| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 DNS-only A/AAAA 记录；安装兑换时按请求下发到目标机器的 0600 `.env` |
+| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 A/AAAA 记录；标准 `443+80` 路线启用 Proxied（小黄云），其他端口使用 DNS Only（灰云）；安装兑换时按请求下发到目标机器的 0600 `.env` |
 
 如果需要根页面在线机器面板，再添加：
 
@@ -160,7 +160,7 @@ Tunnel：boxd06.openlemon.cyou
 直连： zhilianboxd06.openlemon.cyou
 ```
 
-切换直连后，Cloudflare DNS、Let's Encrypt 证书、Nginx `server_name`、Worker 最终回访以及 VLESS/VMess/Trojan 的 `add`、`host`、`sni` 都使用直连域名；`ARGO_DOMAIN` 继续保留给原 Cloudflare Tunnel。每台机器仍必须使用唯一的 `ARGO_DOMAIN`，以免两台机器派生出同一个直连域名。
+切换直连后，Cloudflare DNS、Nginx `server_name`、Worker 最终回访以及 VLESS/VMess/Trojan 的 `add`、`host`、`sni` 都使用直连域名；`ARGO_DOMAIN` 继续保留给原 Cloudflare Tunnel。每台机器仍必须使用唯一的 `ARGO_DOMAIN`，以免两台机器派生出同一个直连域名。标准 `443+80` 路线由 Cloudflare 边缘提供 HTTPS，源站不再申请或续期证书。
 
 常用可选参数：
 
@@ -168,7 +168,8 @@ Tunnel：boxd06.openlemon.cyou
 - `CLOUDFLARED_PROTOCOL`：Tunnel 传输协议，可选 `http2`、`quic`、`auto`，默认 `http2`；
 - `AUTO_CONFIGURE_FIREWALL`：root 安装时是否自动配置已启用的主机防火墙，默认 `true`；Tunnel 模式配置出站 7844，直连探测还会放行 `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT`、`DIRECT_HTTP_PORT` 和 `DIRECT_PORT_SCAN_PORTS` 中明确列出的入站 TCP 端口；
 - `DIRECT_IPV4_ENABLED`、`DIRECT_IPV6_ENABLED`：控制直连 Nginx 与 DNS 启用的地址族，默认都为 `true`；自动路线选择会根据 Worker 的实际公网回访结果重写这两个值，不会发布未通过回访的地址族；
-- `CF_DNS_PUBLIC_IP`、`CF_DNS_PUBLIC_IPV6`：可选的固定公网 IPv4/IPv6；不设置时节点分别自动检测，直连域名对应创建 DNS-only `A`/`AAAA` 记录；
+- `DIRECT_CLOUDFLARE_PROXY_ENABLED`：由自动路线选择维护；`443+80` 同时可达时为 `true`（小黄云、边缘 HTTPS、源站 HTTP 80），其他端口为 `false`（灰云 HTTP），通常不要手动设置；
+- `CF_DNS_PUBLIC_IP`、`CF_DNS_PUBLIC_IPV6`：可选的固定公网 IPv4/IPv6；不设置时节点分别自动检测。标准 `443+80` 路线创建小黄云 `A`/`AAAA`，其他 HTTP 端口创建灰云记录；
 - `CFIP`：节点连接地址，例如 `cdst.lemon.vin`；
 - `NAME`：节点名称前缀；
 - `UUID`：新机器不设置时自动随机生成；覆盖已有安装且不设置时，自动复用旧 `.env` 中的 UUID；显式指定时优先使用指定值；
@@ -402,15 +403,23 @@ env \
 
 启动阶段的 Tunnel 路由心跳默认最多重试 5 次、每次间隔 4 秒；可用 `STARTUP_TUNNEL_PROBE_ATTEMPTS` 和 `STARTUP_TUNNEL_PROBE_RETRY_DELAY_MS` 调整。Tunnel 心跳包括节点到 Cloudflare Edge 的 7844 出站连通性，以及 Worker 对最终 `ARGO_DOMAIN` 的回访；Worker 不会把 `install.lemon.vin:7844` 当作 Tunnel 目标，因为 7844 是节点到 Cloudflare Edge 的传输端口。
 
-安装器默认也会准备 Nginx 和 Certbot，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES`、当前直连端口以及 `DIRECT_PORT_SCAN_PORTS` 明确列出的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先启动并验证 Cloudflare Tunnel；Tunnel 失败后，节点会检测公网 IPv4/IPv6，并按地址族隔离执行公网回访。每个端口批次先建立 IPv4 临时监听并请求 Worker 回访；IPv4 找到可用端口后，只在 IPv6 上复验同一个端口。相同端口双向可达才启用双栈并发布 DNS-only `A`/`AAAA`；IPv6 同端口不可达则立即采用 IPv4，只发布 `A`，不再继续扫描其他端口来寻找共同端口。IPv4 本批没有可用端口时才检查同一批 IPv6；IPv6 找到端口就采用 IPv6 并只发布 `AAAA`，因此 IPv6-only 机器也能及时完成选择。标准端口 `443/80` 可形成 HTTPS 时优先使用 HTTPS，并自动申请、续期 Let's Encrypt 证书；非标准端口使用普通 HTTP。证书申请默认最多尝试 3 次、每次失败后等待 30 秒，最终仍失败则自动改用 HTTP。如果初始候选端口全部失败，节点会继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。能够从 `ARGO_AUTH` 解析固定 Tunnel ID 时，安装器还会保留或恢复 `ARGO_DOMAIN -> <Tunnel-ID>.cfargotunnel.com` 的代理 CNAME；旧版本遗留在 `ARGO_DOMAIN` 上的直连 A/AAAA 记录会被迁移掉。直连网关启动后，Worker 只按最终选中的地址族检查公网 TCP，再向 `zhilian...` 最终域名发起 HTTP/HTTPS 请求；选中的地址族和最终请求都通过后，节点才会注册到面板。未被选中的地址族不可达不会隔离整个 UUID。
+安装器默认准备 Nginx，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES`、当前直连端口以及 `DIRECT_PORT_SCAN_PORTS` 明确列出的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先验证 Cloudflare Tunnel；Tunnel 失败后，节点检测公网 IPv4/IPv6，并按地址族隔离执行公网回访。每个端口批次先建立 IPv4 临时监听并请求 Worker 回访；IPv4 找到可用端口后，只在 IPv6 上复验同一个端口。相同端口双向可达才启用双栈；IPv6 同端口不可达则立即采用 IPv4，不再为了双栈继续扫描。IPv4 本批没有可用端口时才检查同一批 IPv6，因此 IPv6-only 机器也能完成选择。
+
+标准入口必须同时确认 `443` 和 `80` 公网可达。通过后，直连域名的 `A`/`AAAA` 自动设为 Proxied（小黄云），客户端仍连接 `HTTPS:443`，Cloudflare 边缘终止 TLS，源站 Nginx 只监听普通 `HTTP:80`，不安装 Certbot，也不申请或续期 Let's Encrypt 证书。该方式要求直连域名所在 Zone 的 SSL/TLS 加密模式允许 Flexible 回源；程序不会自动修改整个 Zone 的 SSL 模式，以免影响同一 Zone 的其他域名。如果 Zone 不是 Flexible，Worker 的最终 HTTPS 回访会失败，节点不会注册。
+
+如果不能同时使用 `443+80`，程序继续扫描其他可用端口；选中后将直连记录改为 DNS Only（灰云），Nginx 和节点链接都使用该端口的普通 HTTP，不经过 Cloudflare 代理。这样也避免把 Cloudflare 不支持的自定义端口误判成可用代理端口。初始候选全部失败时，节点继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。
+
+能够从 `ARGO_AUTH` 解析固定 Tunnel ID 时，安装器还会保留或恢复 `ARGO_DOMAIN -> <Tunnel-ID>.cfargotunnel.com` 的代理 CNAME；旧版本遗留在 `ARGO_DOMAIN` 上的直连 A/AAAA 记录会被迁移掉。直连网关启动后，标准小黄云路线由 Worker 检查源站 HTTP 80，再回访最终 `https://zhilian...:443`；灰云路线检查所选公网端口并回访最终 HTTP 域名。只有选中的地址族和最终请求都通过，节点才会注册到面板。未被选中的地址族不可达不会隔离整个 UUID。
+
+生成的 Nginx 配置针对长连接进行了优化：自动使用可用 CPU Worker、每个 Worker 最多 8192 个连接、启用 `multi_accept`、TCP `nopush/nodelay`、长连接 keepalive、关闭 WebSocket 代理缓冲，并将代理读写超时设为 24 小时。Node 网关也会启用 TCP keepalive，并且只把 10 秒限制用于建立 Xray 上游连接；连接成功后不再因 10 秒空闲被错误断开。
 
 直连地址族会按机器实际网络能力自动选择：
 
 | 机器网络和公网回访结果 | Nginx 监听 | Cloudflare DNS | 持久化配置 |
 | --- | --- | --- | --- |
-| 仅 IPv4 可用 | `0.0.0.0:端口` | 只创建 DNS-only `A` | `DIRECT_IPV4_ENABLED=true`、`DIRECT_IPV6_ENABLED=false` |
-| 仅 IPv6 可用 | `[::]:端口` | 只创建 DNS-only `AAAA` | `DIRECT_IPV4_ENABLED=false`、`DIRECT_IPV6_ENABLED=true` |
-| IPv4 找到端口，IPv6 的同一端口也通过 | 同时监听 `0.0.0.0` 和 `[::]` | 同时创建 DNS-only `A`、`AAAA` | 两个变量都为 `true` |
+| 仅 IPv4 可用 | `0.0.0.0:端口` | 只创建 `A`；标准路线小黄云，其他路线灰云 | `DIRECT_IPV4_ENABLED=true`、`DIRECT_IPV6_ENABLED=false` |
+| 仅 IPv6 可用 | `[::]:端口` | 只创建 `AAAA`；标准路线小黄云，其他路线灰云 | `DIRECT_IPV4_ENABLED=false`、`DIRECT_IPV6_ENABLED=true` |
+| IPv4 找到端口，IPv6 的同一端口也通过 | 同时监听 `0.0.0.0` 和 `[::]` | 同时创建 `A`、`AAAA`，代理状态按路线选择 | 两个变量都为 `true` |
 | IPv4 找到端口，但 IPv6 的同一端口不可达 | 只监听 IPv4 | 删除 `AAAA`，只保留 `A` | `DIRECT_IPV4_ENABLED=true`、`DIRECT_IPV6_ENABLED=false`，立即停止后续扫描 |
 | 当前批次 IPv4 没有端口，但 IPv6 找到端口 | 只监听 IPv6 | 删除 `A`，只保留 `AAAA` | `DIRECT_IPV4_ENABLED=false`、`DIRECT_IPV6_ENABLED=true`，立即停止后续扫描 |
 | IPv4、IPv6 都没有公网可达端口 | 不启动直连网关 | 不发布新的直连记录 | 写入 `.no-route` 并以退出码 `78` 停止 |
@@ -443,8 +452,8 @@ DIRECT_PORT_SCAN_MAX=256
 
 实际探测顺序如下：
 
-1. 覆盖安装且存在上次最终验证成功的直连路线时，先只复验上次实际启用的地址族和端口。例如旧路线为仅 IPv4 的 HTTPS `443/80`，就不会因为机器同时检测到不可达 IPv6 而扫描 256 个扩展端口；Worker 回访 IPv4 `443/80` 通过后立即复用。复验失败或地址族已经消失时进入下一步。
-2. 第一批检查标准入口 `80,443`。先检查 IPv4；IPv4 可形成 HTTPS 时只在 IPv6 上复验 `80/443`，双向通过才启用双栈。IPv4 只能使用 HTTP 时，再完整检查 IPv6 的 `80/443`，避免错过 IPv6-only HTTPS；最终选择 HTTPS 优先的可用地址族。
+1. 覆盖安装且存在上次最终验证成功的直连路线时，先只复验上次实际启用的地址族和端口。例如旧路线为仅 IPv4 的小黄云 HTTPS `443/80`，就不会因为机器同时检测到不可达 IPv6 而扫描 256 个扩展端口；Worker 回访 IPv4 `443/80` 通过后立即复用。复验失败或地址族已经消失时进入下一步。
+2. 第一批检查标准入口 `80,443`。先检查 IPv4；IPv4 的两个端口都可达时只在 IPv6 上复验 `80/443`，双向通过才启用双栈，然后发布小黄云 HTTPS。IPv4 只能使用单个 HTTP 端口时，再完整检查 IPv6 的 `80/443`，避免错过 IPv6-only 的标准小黄云路线；最终优先选择可用的 `443+80` 方案。
 3. 标准入口没有形成可用方案时，按默认顺序检查 `8080,8443,8880,2053,2083,2087,2096`，每批最多 4 个端口。每批先检查 IPv4；找到端口后只检查 IPv6 的同一端口，双通则双栈，否则立即使用 IPv4。
 4. 如果本批 IPv4 没有可用端口，再检查同一批 IPv6；IPv6 找到端口后立即使用 IPv6。两种地址族在本批都没有结果时，才进入下一批。
 5. 初始候选全部失败后，先检查 `DIRECT_PORT_SCAN_PORTS` 明确列出的端口，再从 `DIRECT_PORT_SCAN_RANGE` 中均匀抽样补足到 `DIRECT_PORT_SCAN_MAX`，继续应用相同的地址族隔离顺序。范围扫描不是逐个检查 `1024-65535` 的全部端口。
