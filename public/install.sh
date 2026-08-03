@@ -8,6 +8,7 @@ readonly DEFAULT_ROOT_APP_DIR="/opt/nodejs-argo-no-docker"
 readonly DEFAULT_SERVICE_NAME="nodejs-argo-no-docker"
 readonly DEFAULT_SOURCE_BASE_URL="__WORKER_SOURCE_BASE_URL__"
 readonly DEFAULT_INDEX_SHA256="__WORKER_SOURCE_SHA256__"
+readonly DEFAULT_PACKAGE_LOCK_SHA256="__WORKER_PACKAGE_LOCK_SHA256__"
 readonly DEFAULT_TEAMNODE_SYNC_BASE_URL="__WORKER_SYNC_BASE_URL__"
 
 readonly DEFAULT_CLOUDFLARED_VERSION="latest"
@@ -20,6 +21,7 @@ readonly NETWORK_HEARTBEAT_PROBE_TIMEOUT_SECONDS="6"
 # used when the host's Node.js is missing or older than the application's
 # minimum, so other applications can continue using their own Node.js.
 readonly DEFAULT_NODE_RUNTIME_VERSION="20.20.2"
+readonly MIN_NODE_RUNTIME_MAJOR="20"
 
 APP_DIR="${APP_DIR:-}"
 SERVICE_NAME="${SERVICE_NAME:-${DEFAULT_SERVICE_NAME}}"
@@ -30,6 +32,7 @@ SOURCE_BASE_URL="${SOURCE_BASE_URL:-${DEFAULT_SOURCE_BASE_URL}}"
 # Resolve this after command-line parsing so empty values from wrappers cannot
 # accidentally override the checksum injected by the Worker.
 SOURCE_INDEX_SHA256="${SOURCE_INDEX_SHA256-}"
+SOURCE_PACKAGE_LOCK_SHA256="${SOURCE_PACKAGE_LOCK_SHA256-}"
 
 CLOUDFLARED_VERSION="${CLOUDFLARED_VERSION:-${DEFAULT_CLOUDFLARED_VERSION}}"
 XRAY_VERSION="${XRAY_VERSION:-${DEFAULT_XRAY_VERSION}}"
@@ -39,6 +42,7 @@ NODE_RUNTIME_SHA256="${NODE_RUNTIME_SHA256:-}"
 REQUIRE_CHECKSUMS="${REQUIRE_CHECKSUMS:-true}"
 FORCE_KILL_PORTS="${FORCE_KILL_PORTS:-false}"
 AUTO_CONFIGURE_FIREWALL="${AUTO_CONFIGURE_FIREWALL:-true}"
+NGINX_BIN="${NGINX_BIN:-/usr/sbin/nginx}"
 
 TEAMNODE_SYNC_BASE_URL="${TEAMNODE_SYNC_BASE_URL:-${DEFAULT_TEAMNODE_SYNC_BASE_URL}}"
 TEAMNODE_SYNC_KEY_ID="${TEAMNODE_SYNC_KEY_ID:-nodejs-argo-prod}"
@@ -52,11 +56,19 @@ TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTENT="${TEAMNODE_SYNC_HEARTBEAT_INCLUDE_CONTE
 TEAMNODE_SYNC_TIMEOUT_MS="${TEAMNODE_SYNC_TIMEOUT_MS:-10000}"
 TEAMNODE_SYNC_ENABLED="${TEAMNODE_SYNC_ENABLED:-true}"
 CLOUDFLARE_API_KEY="${CLOUDFLARE_API_KEY:-}"
+CFIP="${CFIP:-}"
 AUTO_DIRECT_FALLBACK="${AUTO_DIRECT_FALLBACK:-true}"
 DIRECT_MODE="${DIRECT_MODE:-false}"
 DIRECT_DOMAIN=""
 DIRECT_TLS_ENABLED="${DIRECT_TLS_ENABLED:-true}"
+DIRECT_USE_CLOUDFLARE_PROXY="${DIRECT_USE_CLOUDFLARE_PROXY:-true}"
 DIRECT_CLOUDFLARE_PROXY_ENABLED="${DIRECT_CLOUDFLARE_PROXY_ENABLED:-false}"
+DIRECT_CLOUDFLARE_CFIP="${DIRECT_CLOUDFLARE_CFIP:-${CFIP}}"
+DIRECT_CERT_FILE="${DIRECT_CERT_FILE:-}"
+DIRECT_KEY_FILE="${DIRECT_KEY_FILE:-}"
+DIRECT_LETSENCRYPT_EMAIL="${DIRECT_LETSENCRYPT_EMAIL:-admin@lemon.vin}"
+DIRECT_CERTIFICATE_ATTEMPTS="${DIRECT_CERTIFICATE_ATTEMPTS:-3}"
+DIRECT_CERTIFICATE_RETRY_DELAY_MS="${DIRECT_CERTIFICATE_RETRY_DELAY_MS:-30000}"
 DIRECT_IPV4_ENABLED="${DIRECT_IPV4_ENABLED:-true}"
 DIRECT_IPV6_ENABLED="${DIRECT_IPV6_ENABLED:-true}"
 # An in-place reinstall may reuse the last route that reached the final
@@ -91,7 +103,7 @@ CF_DNS_REPLACE_CNAME="${CF_DNS_REPLACE_CNAME:-true}"
 ARGO_PORT="${ARGO_PORT:-8001}"
 CFPORT="${CFPORT:-443}"
 SERVER_PORT="${SERVER_PORT:-3000}"
-PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS="${PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS:-180}"
+PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS="${PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS:-600}"
 # This is an outbound Cloudflare Edge transport heartbeat, not an inbound
 # listener on the node. The protocol decides whether TCP, UDP, or both are
 # checked during the stage-1 network preflight.
@@ -155,10 +167,13 @@ UUID 可选；新机器未设置时会随机生成。覆盖已有安装且未设
 
 SERVICE_MODE 可选：auto、systemd、openrc、sysv、supervisor、rc.local、cron、none。
 auto 模式没有可用 init/cron 时，会安装固定版本 PM2 作为最后的进程守护。
-如果系统 Node.js 低于 14，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
+如果系统 Node.js 低于 20，安装器只在 APP_DIR/node-runtime 内安装 Node.js 20.20.2，不会替换系统 Node.js；可用 NODE_RUNTIME_VERSION 覆盖版本。
 CLOUDFLARED_PROTOCOL 可选 http2、quic、auto，默认 http2；安装器会按协议自动配置出站 Tunnel 端口 7844。
+只有 Tunnel 候选路线才会下载/更新 cloudflared；明确直连、平台代理或阶段 1 已确认 7844 被阻断时会完全跳过，并且 cloudflared 以 --no-autoupdate 运行。
 AUTO_CONFIGURE_FIREWALL=true 时，root 安装会尝试在已启用的 ufw、firewalld、nftables 或 iptables 中幂等放行对应协议的出站 7844；设为 false 可关闭。
-AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx；ARGO_DOMAIN 只供 Tunnel 使用，直连自动使用 zhilian+ARGO_DOMAIN。节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳。源站 HTTP 80 可达时启用 Cloudflare 小黄云，由边缘提供 HTTPS 443，并为该直连主机名自动设置 Flexible 回源；VPS 不需要监听 443。其他端口使用灰云和发现到的 HTTP 端口。Cloudflare API Token 需要目标 Zone 的 DNS Read/Edit、Zone Read 和 Config Rules Edit 权限。
+AUTO_DIRECT_FALLBACK=true 时，安装器会准备 Nginx；ARGO_DOMAIN 只供 Tunnel 使用，直连自动使用 zhilian+ARGO_DOMAIN。节点启动后先验证 Cloudflare Tunnel 7844 出站心跳和最终域名心跳，Tunnel 不可用时再由 Worker 从公网进行直连端口发现心跳。
+DIRECT_USE_CLOUDFLARE_PROXY=true（默认）时，源站 HTTP 80 可达即启用小黄云，边缘提供 HTTPS 443，VPS 不监听 443，节点连接地址使用 CFIP；需要目标 Zone 的 DNS Read/Edit、Zone Read 和 Config Rules Edit 权限。
+DIRECT_USE_CLOUDFLARE_PROXY=false 时，只有公网 80+443 在同一地址族都可达才选择证书直连；安装器同时准备 Certbot，将 zhilian 域名设为灰云，申请/续期证书并让 Nginx 监听 80/443，节点连接地址使用 zhilian 域名。非标准端口始终使用灰云 HTTP。
 阶段 1 会先检查 TeamNode Worker HTTPS 和按协议选择的 Cloudflare Edge 7844 出站心跳；3000/8001 只在节点启动后检查本机监听，直连候选端口只在节点启动临时监听后由 Worker 从公网心跳确认。
 候选端口全部失败后，会按 DIRECT_PORT_SCAN_PORTS 和 DIRECT_PORT_SCAN_RANGE 扩展进行端口发现；DIRECT_PORT_SCAN_MAX 默认 256，避免一次性检查全部端口。
 Tunnel 和直连都没有可用路线时，节点会写入 `.no-route` 标记并以退出码 78 停止，systemd、Supervisor 和 PM2 不会继续反复拉起；修复云安全组/上游网络后重新运行安装器即可清除标记并重新探测。
@@ -237,6 +252,12 @@ require_config() {
   # zhilian 前缀，避免直连 A 记录覆盖 Tunnel CNAME。
   DIRECT_DOMAIN="zhilian$(printf '%s' "${ARGO_DOMAIN}" | tr '[:upper:]' '[:lower:]')"
   CF_DNS_RECORD_NAME="${DIRECT_DOMAIN}"
+  if [[ -n "${DIRECT_CERT_FILE}" || -n "${DIRECT_KEY_FILE}" ]]; then
+    [[ -n "${DIRECT_CERT_FILE}" && -n "${DIRECT_KEY_FILE}" ]] || die "DIRECT_CERT_FILE 和 DIRECT_KEY_FILE 必须同时设置"
+  fi
+  if ! is_true "${DIRECT_USE_CLOUDFLARE_PROXY}" && [[ -z "${DIRECT_LETSENCRYPT_EMAIL}" && -z "${DIRECT_CERT_FILE}" ]]; then
+    die "关闭小黄云时请设置 DIRECT_LETSENCRYPT_EMAIL，或提供 DIRECT_CERT_FILE/DIRECT_KEY_FILE"
+  fi
   if is_true "${TEAMNODE_SYNC_ENABLED}"; then
     if [[ -n "${TEAMNODE_SYNC_SECRET}" && -n "${TEAMNODE_SYNC_RELAY_TOKEN}" ]]; then
       die "不要同时设置 TEAMNODE_SYNC_SECRET 和 TEAMNODE_SYNC_RELAY_TOKEN；Worker 代理模式只设置中继令牌"
@@ -276,6 +297,18 @@ restore_existing_install_state() {
     fi
   fi
 
+  if [[ -z "${DIRECT_CLOUDFLARE_CFIP}" ]]; then
+    DIRECT_CLOUDFLARE_CFIP="$(read_existing_env_value "${previous_env}" "DIRECT_CLOUDFLARE_CFIP")"
+    if [[ -z "${DIRECT_CLOUDFLARE_CFIP}" ]]; then
+      local previous_cfip previous_direct_domain
+      previous_cfip="$(read_existing_env_value "${previous_env}" "CFIP")"
+      previous_direct_domain="$(read_existing_env_value "${previous_env}" "DIRECT_DOMAIN")"
+      if [[ -n "${previous_cfip}" && "${previous_cfip,,}" != "${previous_direct_domain,,}" ]]; then
+        DIRECT_CLOUDFLARE_CFIP="${previous_cfip}"
+      fi
+    fi
+  fi
+
   local previous_direct_mode previous_file_path previous_tls
   local previous_ipv4 previous_ipv6 previous_port previous_http_port previous_cloudflare_proxy
   previous_direct_mode="$(read_existing_env_value "${previous_env}" "DIRECT_MODE")"
@@ -311,7 +344,10 @@ restore_existing_install_state() {
   DIRECT_REUSE_PORT="${previous_port}"
   DIRECT_REUSE_HTTP_PORT="${previous_http_port}"
   DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED=false
-  if is_true "${previous_cloudflare_proxy}" || { is_true "${DIRECT_REUSE_TLS_ENABLED}" && [[ "${DIRECT_REUSE_PORT}" == 443 && "${DIRECT_REUSE_HTTP_PORT}" == 80 ]]; }; then
+  if [[ -n "${previous_cloudflare_proxy}" ]] && is_true "${previous_cloudflare_proxy}"; then
+    DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED=true
+  elif [[ -z "${previous_cloudflare_proxy}" ]] && is_true "${DIRECT_USE_CLOUDFLARE_PROXY}" && is_true "${DIRECT_REUSE_TLS_ENABLED}" && [[ "${DIRECT_REUSE_PORT}" == 443 && "${DIRECT_REUSE_HTTP_PORT}" == 80 ]]; then
+    # 兼容尚未写入该字段的小黄云旧版本；显式 false 代表 Certbot 直连。
     DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED=true
   fi
 
@@ -329,6 +365,9 @@ resolve_source_checksum() {
   # A custom source still has to provide its own real checksum below.
   if [[ -z "${SOURCE_INDEX_SHA256:-}" || "${SOURCE_INDEX_SHA256}" == '""' || "${SOURCE_INDEX_SHA256}" == "''" ]]; then
     SOURCE_INDEX_SHA256="${DEFAULT_INDEX_SHA256}"
+  fi
+  if [[ -z "${SOURCE_PACKAGE_LOCK_SHA256:-}" || "${SOURCE_PACKAGE_LOCK_SHA256}" == '""' || "${SOURCE_PACKAGE_LOCK_SHA256}" == "''" ]]; then
+    SOURCE_PACKAGE_LOCK_SHA256="${DEFAULT_PACKAGE_LOCK_SHA256}"
   fi
 }
 
@@ -379,11 +418,14 @@ validate_worker_placeholders() {
   # the validation check compare the resolved value with itself.
   local source_placeholder='__WORKER''_SOURCE_BASE_URL__'
   local checksum_placeholder='__WORKER''_SOURCE_SHA256__'
+  local lock_checksum_placeholder='__WORKER''_PACKAGE_LOCK_SHA256__'
   local sync_placeholder='__WORKER''_SYNC_BASE_URL__'
 
   [[ "${SOURCE_BASE_URL}" != "${source_placeholder}" ]] || die "安装脚本源码地址占位符未替换；请从 https://install.lemon.vin/install.sh 下载"
   [[ "${SOURCE_INDEX_SHA256}" != "${checksum_placeholder}" ]] || die "安装脚本源码 SHA256 占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
   [[ "${SOURCE_INDEX_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] || die "SOURCE_INDEX_SHA256 必须是 64 位十六进制值；默认应由 Worker 自动注入，使用自定义源码时请设置真实 SHA256"
+  [[ "${SOURCE_PACKAGE_LOCK_SHA256}" != "${lock_checksum_placeholder}" ]] || die "npm 锁文件 SHA256 占位符未替换；请从 Worker 地址下载安装脚本"
+  [[ "${SOURCE_PACKAGE_LOCK_SHA256}" =~ ^[0-9a-fA-F]{64}$ ]] || die "SOURCE_PACKAGE_LOCK_SHA256 必须是 64 位十六进制值"
   if [[ "${TEAMNODE_SYNC_BASE_URL}" == "${sync_placeholder}" ]]; then
     die "TeamNode Worker 地址占位符未替换；请从 Worker 地址下载，不要直接使用 GitHub 原始 install.sh"
   fi
@@ -539,7 +581,7 @@ check_dependencies() {
     SYSTEM_NODE_MAJOR="0"
   fi
   [[ "${SYSTEM_NODE_MAJOR}" =~ ^[0-9]+$ ]] || die "无法读取 Node.js 版本"
-  if (( SYSTEM_NODE_MAJOR < 14 )); then
+  if (( SYSTEM_NODE_MAJOR < MIN_NODE_RUNTIME_MAJOR )); then
     warn "检测到系统 Node.js ${SYSTEM_NODE_MAJOR}；不会升级全局 Node.js，将在本项目目录安装 Node.js ${NODE_RUNTIME_VERSION}"
   fi
 }
@@ -550,12 +592,12 @@ set_owner() {
 }
 
 ensure_project_node_runtime() {
-  if (( SYSTEM_NODE_MAJOR >= 14 )) && has_command npm; then
+  if (( SYSTEM_NODE_MAJOR >= MIN_NODE_RUNTIME_MAJOR )) && has_command npm; then
     log "使用系统 Node.js $(node --version)，不修改其他项目的运行环境"
     return 0
   fi
 
-  if (( SYSTEM_NODE_MAJOR >= 14 )) && ! has_command npm; then
+  if (( SYSTEM_NODE_MAJOR >= MIN_NODE_RUNTIME_MAJOR )) && ! has_command npm; then
     warn "系统 Node.js ${SYSTEM_NODE_MAJOR} 可用但未找到 npm，将安装项目专用 Node.js ${NODE_RUNTIME_VERSION}"
   fi
 
@@ -572,7 +614,7 @@ ensure_project_node_runtime() {
     armv7l|armv7|armhf) node_arch="armv7l" ;;
     ppc64le) node_arch="ppc64le" ;;
     s390x) node_arch="s390x" ;;
-    *) die "系统 Node.js 低于 14，且不支持为该架构安装项目专用 Node.js：$(uname -m)" ;;
+    *) die "系统 Node.js 低于 ${MIN_NODE_RUNTIME_MAJOR}，且不支持为该架构安装项目专用 Node.js：$(uname -m)" ;;
   esac
 
   asset="node-${version}-linux-${node_arch}.tar.xz"
@@ -921,6 +963,7 @@ redeem_teamnode_relay_token() {
 write_runtime_files() {
   log "下载并校验固定版本的 nodejs-argo 源码"
   local source_url="${SOURCE_BASE_URL%/}/index.js"
+  local lock_url="${SOURCE_BASE_URL%/}/package-lock.json"
   # Use the expected digest as a cache key. This prevents a CDN from returning
   # an older index.js after the Worker has injected a newer digest.
   if [[ "${source_url}" == *\?* ]]; then
@@ -930,24 +973,93 @@ write_runtime_files() {
   fi
   download_verified "${source_url}" "${APP_DIR}/app/index.js" "${SOURCE_INDEX_SHA256}" "nodejs-argo index.js"
 
+  if [[ "${lock_url}" == *\?* ]]; then
+    lock_url="${lock_url}&sha256=${SOURCE_PACKAGE_LOCK_SHA256}"
+  else
+    lock_url="${lock_url}?sha256=${SOURCE_PACKAGE_LOCK_SHA256}"
+  fi
+  download_verified "${lock_url}" "${APP_DIR}/app/package-lock.json" "${SOURCE_PACKAGE_LOCK_SHA256}" "nodejs-argo package-lock.json"
+
   cat > "${APP_DIR}/app/package.json" <<'JSON'
 {
   "name": "nodejs-argo-no-docker",
   "private": true,
   "version": "1.0.0",
-  "engines": { "node": ">=14" },
+  "engines": { "node": ">=20" },
   "dependencies": {
-    "axios": "1.7.9",
-    "express": "4.21.2"
+    "axios": "1.19.0",
+    "express": "4.22.2"
   }
 }
 JSON
 
   install -d -m 0700 "${APP_DIR}/home" "${APP_DIR}/npm-cache"
   set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
-  log "安装固定 npm 依赖（禁止 install scripts）"
+  log "按已校验 package-lock.json 安装固定 npm 依赖（npm ci，禁止 install scripts）"
   run_as_service_user env HOME="${APP_DIR}/home" NPM_CONFIG_CACHE="${APP_DIR}/npm-cache" \
-    "${NPM_BIN}" --prefix "${APP_DIR}/app" install --omit=dev --ignore-scripts --no-audit --no-fund --package-lock=false
+    "${NPM_BIN}" --prefix "${APP_DIR}/app" ci --omit=dev --ignore-scripts --no-audit --no-fund
+}
+
+install_capability_tools() {
+  has_command setcap && return 0
+  if is_true "${DRY_RUN}"; then
+    warn "未找到 setcap；非 systemd 后端将无法保证服务用户监听 80/443"
+    return 0
+  fi
+
+  log "安装非 systemd 低端口能力工具：setcap"
+  if has_command apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq libcap2-bin >/dev/null
+  elif has_command apk; then
+    apk add --no-cache libcap >/dev/null
+  elif has_command dnf; then
+    dnf install -y libcap >/dev/null
+  elif has_command yum; then
+    yum install -y libcap >/dev/null
+  elif has_command zypper; then
+    zypper --non-interactive install libcap-progs >/dev/null
+  fi
+  has_command setcap || warn "无法安装 setcap；标准 80/443 不能绑定时会继续探测非特权端口"
+}
+
+prepare_privileged_bind_runtime() {
+  [[ "${RUN_AS_ROOT}" == true && "${SERVICE_BACKEND}" != systemd && "${SERVICE_USER}" != root ]] || return 0
+  is_true "${AUTO_DIRECT_FALLBACK}" || is_true "${DIRECT_MODE}" || return 0
+  install_capability_tools
+  has_command setcap || return 0
+
+  local source_node="${NODE_BIN}"
+  local private_node="${BIN_PATH}/node-service"
+  install -m 0755 "${source_node}" "${private_node}"
+  if ! setcap cap_net_bind_service=+ep "${private_node}" || ! "${private_node}" --version >/dev/null 2>&1; then
+    rm -f -- "${private_node}"
+    warn "无法为项目私有 Node.js 授予低端口能力；将跳过不可绑定的 80/443 并继续探测高端口"
+    return 0
+  fi
+  NODE_BIN="${private_node}"
+
+  if [[ -x "${NGINX_BIN}" ]]; then
+    local private_nginx="${BIN_PATH}/nginx-service"
+    install -m 0755 "${NGINX_BIN}" "${private_nginx}"
+    if setcap cap_net_bind_service=+ep "${private_nginx}" && "${private_nginx}" -v >/dev/null 2>&1; then
+      NGINX_BIN="${private_nginx}"
+      write_env_value "NGINX_BIN" "${NGINX_BIN}"
+    else
+      rm -f -- "${private_nginx}"
+      rm -f -- "${private_node}"
+      NODE_BIN="${source_node}"
+      warn "无法为项目私有 Nginx 授予低端口能力；标准直连失败时会继续探测高端口"
+      return 0
+    fi
+  else
+    rm -f -- "${private_node}"
+    NODE_BIN="${source_node}"
+    warn "未找到可复制的 Nginx：${NGINX_BIN}；当前系统无法启用直连网关"
+    return 0
+  fi
+  log "已为 ${SERVICE_BACKEND} 后端的项目私有运行文件授予 CAP_NET_BIND_SERVICE，不修改系统 Node.js/Nginx"
 }
 
 write_env_file() {
@@ -994,7 +1106,14 @@ write_env_file() {
   write_env_value "XRAY_SNIFFING_ENABLED" "${XRAY_SNIFFING_ENABLED:-false}"
   write_env_value "DIRECT_MODE" "${DIRECT_MODE:-false}"
   write_env_value "DIRECT_TLS_ENABLED" "${DIRECT_TLS_ENABLED}"
+  write_env_value "DIRECT_USE_CLOUDFLARE_PROXY" "${DIRECT_USE_CLOUDFLARE_PROXY}"
   write_env_value "DIRECT_CLOUDFLARE_PROXY_ENABLED" "${DIRECT_CLOUDFLARE_PROXY_ENABLED}"
+  write_env_value "DIRECT_CLOUDFLARE_CFIP" "${DIRECT_CLOUDFLARE_CFIP}"
+  write_env_value "DIRECT_CERT_FILE" "${DIRECT_CERT_FILE}"
+  write_env_value "DIRECT_KEY_FILE" "${DIRECT_KEY_FILE}"
+  write_env_value "DIRECT_LETSENCRYPT_EMAIL" "${DIRECT_LETSENCRYPT_EMAIL}"
+  write_env_value "DIRECT_CERTIFICATE_ATTEMPTS" "${DIRECT_CERTIFICATE_ATTEMPTS}"
+  write_env_value "DIRECT_CERTIFICATE_RETRY_DELAY_MS" "${DIRECT_CERTIFICATE_RETRY_DELAY_MS}"
   write_env_value "DIRECT_IPV4_ENABLED" "${DIRECT_IPV4_ENABLED}"
   write_env_value "DIRECT_IPV6_ENABLED" "${DIRECT_IPV6_ENABLED}"
   write_env_value "DIRECT_REUSE_ENABLED" "${DIRECT_REUSE_ENABLED}"
@@ -1010,6 +1129,7 @@ write_env_file() {
   write_env_value "DIRECT_PORT_SCAN_PORTS" "${DIRECT_PORT_SCAN_PORTS}"
   write_env_value "DIRECT_PORT_SCAN_RANGE" "${DIRECT_PORT_SCAN_RANGE}"
   write_env_value "DIRECT_PORT_SCAN_MAX" "${DIRECT_PORT_SCAN_MAX}"
+  write_env_value "PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS" "${PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS}"
   write_env_value "CF_DNS_ENABLED" "${CF_DNS_ENABLED}"
   write_env_value "CF_DNS_RECORD_NAME" "${CF_DNS_RECORD_NAME}"
   write_env_value "CF_DNS_ZONE_ID" "${CF_DNS_ZONE_ID}"
@@ -1372,14 +1492,21 @@ validate_local_port() {
 
 is_local_service_port() {
   local port="$1"
-  [[ "${port}" == "${SERVER_PORT}" || "${port}" == "${ARGO_PORT}" ]]
+  [[ "${port}" == "${SERVER_PORT}" || "${port}" == "${ARGO_PORT}" \
+    || "${port}" == 3001 || "${port}" == 3002 || "${port}" == 3003 || "${port}" == 3004 ]]
 }
 
 validate_port_roles() {
   [[ "${SERVER_PORT}" != "${ARGO_PORT}" ]] || die "SERVER_PORT 和 ARGO_PORT 不能使用同一个端口：${SERVER_PORT}"
-  [[ "${DIRECT_PORT}" != "${SERVER_PORT}" && "${DIRECT_PORT}" != "${ARGO_PORT}" ]] ||
+  case "${SERVER_PORT}" in
+    3001|3002|3003|3004) die "SERVER_PORT 不能复用 Xray 本机端口：${SERVER_PORT}" ;;
+  esac
+  case "${ARGO_PORT}" in
+    3001|3002|3003|3004) die "ARGO_PORT 不能复用 Xray 本机端口：${ARGO_PORT}" ;;
+  esac
+  ! is_local_service_port "${DIRECT_PORT}" ||
     die "DIRECT_PORT 不能复用本机服务端口：${DIRECT_PORT}"
-  [[ "${DIRECT_HTTP_PORT}" != "${SERVER_PORT}" && "${DIRECT_HTTP_PORT}" != "${ARGO_PORT}" ]] ||
+  ! is_local_service_port "${DIRECT_HTTP_PORT}" ||
     die "DIRECT_HTTP_PORT 不能复用本机服务端口：${DIRECT_HTTP_PORT}"
 }
 
@@ -1399,7 +1526,7 @@ validate_direct_port_candidates() {
     fi
   done
   [[ "${usable}" == true && "${seen}" != "," ]] ||
-    die "DIRECT_PORT_CANDIDATES 未包含可用于公网直连的端口（已排除 SERVER_PORT/ARGO_PORT）"
+    die "DIRECT_PORT_CANDIDATES 未包含可用于公网直连的端口（已排除 SERVER_PORT/ARGO_PORT/Xray 本机端口 3001-3004）"
 }
 
 validate_direct_port_scan_config() {
@@ -1725,9 +1852,13 @@ install_direct_gateway_dependencies() {
   fi
 
   local nginx_missing=false
+  local certbot_missing=false
   local nginx_was_active=false
   has_command nginx || nginx_missing=true
-  if [[ "${nginx_missing}" != true ]]; then
+  if ! is_true "${DIRECT_USE_CLOUDFLARE_PROXY}"; then
+    has_command certbot || certbot_missing=true
+  fi
+  if [[ "${nginx_missing}" != true && "${certbot_missing}" != true ]]; then
     return 0
   fi
 
@@ -1735,31 +1866,46 @@ install_direct_gateway_dependencies() {
     nginx_was_active=true
   fi
 
-  log "准备直连网关依赖：Nginx"
+  local dependency_label=""
+  [[ "${nginx_missing}" == true ]] && dependency_label="Nginx"
+  if [[ "${certbot_missing}" == true ]]; then
+    dependency_label="${dependency_label:+${dependency_label}、}Certbot"
+  fi
+  log "准备直连网关依赖：${dependency_label}"
   local install_failed=false
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    local apt_packages=(nginx)
+    local apt_packages=()
+    [[ "${nginx_missing}" == true ]] && apt_packages+=(nginx)
+    [[ "${certbot_missing}" == true ]] && apt_packages+=(certbot)
     apt-get install -y -qq "${apt_packages[@]}" >/dev/null || install_failed=true
   elif has_command apk; then
-    local apk_packages=(nginx)
+    local apk_packages=()
+    [[ "${nginx_missing}" == true ]] && apk_packages+=(nginx)
+    [[ "${certbot_missing}" == true ]] && apk_packages+=(certbot)
     apk add --no-cache "${apk_packages[@]}" >/dev/null || install_failed=true
   elif has_command dnf; then
-    local dnf_packages=(nginx)
+    local dnf_packages=()
+    [[ "${nginx_missing}" == true ]] && dnf_packages+=(nginx)
+    [[ "${certbot_missing}" == true ]] && dnf_packages+=(certbot)
     dnf install -y "${dnf_packages[@]}" >/dev/null || install_failed=true
   elif has_command yum; then
-    local yum_packages=(nginx)
+    local yum_packages=()
+    [[ "${nginx_missing}" == true ]] && yum_packages+=(nginx)
+    [[ "${certbot_missing}" == true ]] && yum_packages+=(certbot)
     yum install -y "${yum_packages[@]}" >/dev/null || install_failed=true
   elif has_command zypper; then
-    local zypper_packages=(nginx)
+    local zypper_packages=()
+    [[ "${nginx_missing}" == true ]] && zypper_packages+=(nginx)
+    [[ "${certbot_missing}" == true ]] && zypper_packages+=(certbot)
     zypper --non-interactive install "${zypper_packages[@]}" >/dev/null || install_failed=true
   else
     install_failed=true
   fi
 
   if [[ "${install_failed}" == true ]]; then
-    warn "无法自动安装 Nginx；若 Tunnel 仍不可用，直连回退只能在已有 Nginx 可用时执行"
+    warn "无法自动安装 ${dependency_label}；直连路线会按实际可用依赖降级处理"
   fi
 
   # 发行版安装 Nginx 时可能自动启动默认站点。仅在安装前没有运行 Nginx
@@ -1773,6 +1919,9 @@ install_direct_gateway_dependencies() {
 
   if ! has_command nginx; then
     warn "未找到 nginx；直连模式不会启动，Tunnel 模式仍可继续运行"
+  fi
+  if ! is_true "${DIRECT_USE_CLOUDFLARE_PROXY}" && ! has_command certbot; then
+    warn "未找到 certbot；关闭小黄云后无法选择 HTTPS 443+80 证书路线，只能尝试灰云 HTTP"
   fi
 }
 
@@ -1860,9 +2009,15 @@ configure_iptables_tunnel_firewall() {
   fi
 }
 
+tunnel_component_required() {
+  ! is_true "${DIRECT_MODE}" \
+    && ! is_true "${PLATFORM_PROXY_MODE:-false}" \
+    && ! is_true "${TUNNEL_PREFLIGHT_BLOCKED}"
+}
+
 configure_tunnel_firewall() {
-  if is_true "${TUNNEL_PREFLIGHT_BLOCKED}"; then
-    log "阶段 1 已确认 Tunnel 7844 被阻断，跳过 Cloudflare Tunnel 防火墙配置"
+  if ! tunnel_component_required; then
+    log "当前路线不使用 Tunnel，跳过 Cloudflare Tunnel 防火墙配置"
     return 0
   fi
   if [[ "${RUN_AS_ROOT}" != true ]]; then
@@ -1901,6 +2056,10 @@ direct_firewall_ports() {
   local item
   local range_start
   local range_end
+  local scan_count=0
+  local remaining
+  local span
+  local sampled_port
   local seen=","
   local candidates=()
   IFS=',' read -r -a candidates <<<"${DIRECT_PORT_CANDIDATES}"
@@ -1916,23 +2075,44 @@ direct_firewall_ports() {
   local scan_items=()
   IFS=',' read -r -a scan_items <<<"${DIRECT_PORT_SCAN_PORTS}"
   for item in "${scan_items[@]}"; do
+    (( scan_count < DIRECT_PORT_SCAN_MAX )) || break
     item="${item//[[:space:]]/}"
     if [[ "${item}" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       range_start="${BASH_REMATCH[1]}"
       range_end="${BASH_REMATCH[2]}"
       for ((port = range_start; port <= range_end; port += 1)); do
+        (( scan_count < DIRECT_PORT_SCAN_MAX )) || break
         is_local_service_port "${port}" && continue
+        case "${port}" in 22|25|53|110|143|587|3306|3389) continue ;; esac
         [[ "${seen}" != *",${port},"* ]] || continue
         seen+="${port},"
         printf '%s\n' "${port}"
+        scan_count=$((scan_count + 1))
       done
     else
       port="${item}"
       is_local_service_port "${port}" && continue
+      case "${port}" in 22|25|53|110|143|587|3306|3389) continue ;; esac
       [[ -n "${port}" && "${seen}" != *",${port},"* ]] || continue
       seen+="${port},"
       printf '%s\n' "${port}"
+      scan_count=$((scan_count + 1))
     fi
+  done
+
+  (( scan_count < DIRECT_PORT_SCAN_MAX )) || return 0
+  [[ "${DIRECT_PORT_SCAN_RANGE}" =~ ^([0-9]+)-([0-9]+)$ ]] || return 0
+  range_start="${BASH_REMATCH[1]}"
+  range_end="${BASH_REMATCH[2]}"
+  remaining=$((DIRECT_PORT_SCAN_MAX - scan_count))
+  span=$((range_end - range_start + 1))
+  for ((item = 0; item < remaining; item += 1)); do
+    sampled_port=$((range_start + (item * span) / remaining))
+    is_local_service_port "${sampled_port}" && continue
+    case "${sampled_port}" in 22|25|53|110|143|587|3306|3389) continue ;; esac
+    [[ "${seen}" != *",${sampled_port},"* ]] || continue
+    seen+="${sampled_port},"
+    printf '%s\n' "${sampled_port}"
   done
 }
 
@@ -2205,15 +2385,22 @@ port_is_listening() {
 verify_runtime() {
   local server_ready=false
   local argo_ready=false
+  local xray_vless_ready=false
+  local xray_vmess_ready=false
+  local xray_trojan_ready=false
 
-  log "运行检查：等待 HTTP ${SERVER_PORT} 和 ARGO ${ARGO_PORT} 端口监听（最多 30 秒）"
+  log "运行检查：等待本机 HTTP ${SERVER_PORT}、ARGO ${ARGO_PORT} 和 Xray WebSocket 3002/3003/3004（最多 30 秒）"
   for _ in 1 2 3 4 5 6 7 8 9 10 \
     11 12 13 14 15 16 17 18 19 20 \
     21 22 23 24 25 26 27 28 29 30; do
     port_is_listening "${SERVER_PORT}" && server_ready=true
     port_is_listening "${ARGO_PORT}" && argo_ready=true
-    if [[ "${server_ready}" = true && "${argo_ready}" = true ]]; then
-      log "运行检查通过：HTTP ${SERVER_PORT}、ARGO ${ARGO_PORT} 均已监听"
+    port_is_listening 3002 && xray_vless_ready=true
+    port_is_listening 3003 && xray_vmess_ready=true
+    port_is_listening 3004 && xray_trojan_ready=true
+    if [[ "${server_ready}" = true && "${argo_ready}" = true \
+      && "${xray_vless_ready}" = true && "${xray_vmess_ready}" = true && "${xray_trojan_ready}" = true ]]; then
+      log "运行检查通过：本机 HTTP ${SERVER_PORT}、ARGO ${ARGO_PORT}、Xray 3002/3003/3004 均已监听"
       return 0
     fi
     sleep 1
@@ -2221,6 +2408,9 @@ verify_runtime() {
 
   [[ "${server_ready}" = true ]] || warn "HTTP ${SERVER_PORT} 未监听"
   [[ "${argo_ready}" = true ]] || warn "ARGO ${ARGO_PORT} 未监听"
+  [[ "${xray_vless_ready}" = true ]] || warn "Xray VLESS WebSocket 3002 未监听"
+  [[ "${xray_vmess_ready}" = true ]] || warn "Xray VMess WebSocket 3003 未监听"
+  [[ "${xray_trojan_ready}" = true ]] || warn "Xray Trojan WebSocket 3004 未监听"
   warn "请查看运行日志：${FILE_PATH}/nodejs-argo.log"
   die "程序未正常启动；安装已中止，请先修复日志中的错误"
 }
@@ -2385,6 +2575,11 @@ main() {
   require_root
   require_config
   log "域名规划：Tunnel=${ARGO_DOMAIN}；直连=${DIRECT_DOMAIN}"
+  if is_true "${DIRECT_USE_CLOUDFLARE_PROXY}"; then
+    log "标准直连偏好：Cloudflare 小黄云（默认）；客户端地址使用 CFIP=${CFIP:-${DIRECT_DOMAIN}}，源站监听 HTTP 80"
+  else
+    log "标准直连偏好：Cloudflare 灰云 + Certbot；客户端地址使用 ${DIRECT_DOMAIN}，源站监听 HTTP 80/HTTPS 443"
+  fi
   validate_worker_placeholders
   check_dependencies
   validate_cloudflared_protocol
@@ -2402,6 +2597,12 @@ main() {
     die "PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS 必须是数字"
   (( PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS >= 30 && PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS <= 600 )) ||
     die "PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS 必须在 30-600 秒之间"
+  [[ "${DIRECT_CERTIFICATE_ATTEMPTS}" =~ ^[0-9]+$ ]] || die "DIRECT_CERTIFICATE_ATTEMPTS 必须是数字"
+  (( DIRECT_CERTIFICATE_ATTEMPTS >= 1 && DIRECT_CERTIFICATE_ATTEMPTS <= 5 )) ||
+    die "DIRECT_CERTIFICATE_ATTEMPTS 必须在 1-5 之间"
+  [[ "${DIRECT_CERTIFICATE_RETRY_DELAY_MS}" =~ ^[0-9]+$ ]] || die "DIRECT_CERTIFICATE_RETRY_DELAY_MS 必须是数字"
+  (( DIRECT_CERTIFICATE_RETRY_DELAY_MS >= 5000 && DIRECT_CERTIFICATE_RETRY_DELAY_MS <= 300000 )) ||
+    die "DIRECT_CERTIFICATE_RETRY_DELAY_MS 必须在 5000-300000 毫秒之间"
   validate_port_roles
   validate_direct_port_candidates
   validate_direct_port_scan_config
@@ -2418,7 +2619,7 @@ main() {
     if has_command node; then
       system_node_label="$(node --version)"
     fi
-    if (( SYSTEM_NODE_MAJOR < 14 )); then
+    if (( SYSTEM_NODE_MAJOR < MIN_NODE_RUNTIME_MAJOR )); then
       log "dry-run 检查通过：${system_node_label}，实际安装将使用项目专用 Node.js v${NODE_RUNTIME_VERSION}；启动方式：${SERVICE_BACKEND}"
     else
       log "dry-run 检查通过：Node.js ${system_node_label}，启动方式：${SERVICE_BACKEND}"
@@ -2444,9 +2645,9 @@ main() {
     *) die "不支持的系统架构：$(uname -m)" ;;
   esac
 
-  stage "安装 Cloudflare Tunnel"
-  if is_true "${TUNNEL_PREFLIGHT_BLOCKED}"; then
-    log "阶段 1 已确认 Tunnel 7844 被阻断，跳过 cloudflared 下载和安装"
+  stage "按路线准备 Cloudflare Tunnel"
+  if ! tunnel_component_required; then
+    log "当前路线不是 Tunnel 模式，跳过 cloudflared 下载、安装和更新"
   else
     install_cloudflared "${machine_arch}"
   fi
@@ -2461,6 +2662,7 @@ main() {
   set_owner -R "${SERVICE_USER}:${SERVICE_USER}" "${APP_DIR}"
   chmod 0700 "${APP_DIR}" "${APP_DIR}/data"
   chmod 0600 "${ENV_FILE}"
+  prepare_privileged_bind_runtime
   write_runner_script
   stage "启动节点并选择公网路线"
   start_service

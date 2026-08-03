@@ -24,6 +24,11 @@ const TIMEZONE_COLLAPSE_THRESHOLD_MINUTES = 15;
 const TUNNEL_TEST_QUEUE_TTL_MS = 2 * 60 * 1000;
 const NODE_QUARANTINE_RECOVERY_WINDOW_MS = 10 * 60 * 1000;
 const DIRECT_PORT_PROBE_TIMEOUT_MS = 3500;
+const PUBLIC_ROUTE_WEBSOCKET_PATHS = Object.freeze([
+  "/vless-argo?ed=2560",
+  "/vmess-argo?ed=2560",
+  "/trojan-argo?ed=2560"
+]);
 // Worker 每个请求的同时外连数有限，保留连接槽给平台内部请求。
 const DIRECT_PORT_PROBE_LIMIT = 4;
 const NODE_REGISTRY_NAME = "nodejs-argo";
@@ -1778,7 +1783,7 @@ async function probePublicHttpEndpoint(url, mode) {
     const httpUnavailable = response.status >= 500;
     const cloudflareOriginUnavailable = mode === "direct"
       && [521, 522, 523, 524, 525, 526].includes(response.status);
-    return {
+    const result = {
       status: tunnelInactive || httpUnavailable ? "blocked" : "reachable",
       httpStatus: response.status,
       reason: tunnelInactive
@@ -1789,11 +1794,73 @@ async function probePublicHttpEndpoint(url, mode) {
           ? "public_http_unavailable"
           : "public_http_reachable"
     };
+    try {
+      if (response.body) await response.body.cancel();
+    } catch {
+      // The response may not have a cancellable body.
+    }
+    return result;
   } catch (error) {
     return {
       status: "blocked",
       httpStatus: null,
       reason: error?.name === "AbortError" ? "public_http_timeout" : "public_http_failed"
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function probePublicWebSocketEndpoint(baseUrl, requestPath) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DIRECT_PORT_PROBE_TIMEOUT_MS);
+  const target = new URL(baseUrl);
+  const pathUrl = new URL(requestPath, "https://route-probe.invalid");
+  target.pathname = pathUrl.pathname;
+  target.search = pathUrl.search;
+  try {
+    const response = await fetch(target.toString(), {
+      method: "GET",
+      redirect: "manual",
+      headers: {
+        Upgrade: "websocket",
+        "User-Agent": "install-lemon-websocket-route-probe/1.0"
+      },
+      signal: controller.signal
+    });
+    const webSocket = response.webSocket;
+    if (!webSocket) {
+      try {
+        if (response.body) await response.body.cancel();
+      } catch {
+        // The failed upgrade may not expose a cancellable body.
+      }
+      return {
+        path: `${target.pathname}${target.search}`,
+        status: "blocked",
+        httpStatus: response.status,
+        reason: response.status >= 500 ? "websocket_upstream_unavailable" : "websocket_upgrade_rejected"
+      };
+    }
+
+    webSocket.accept();
+    try {
+      webSocket.close(1000, "route_probe_complete");
+    } catch {
+      // A peer may close immediately after the successful handshake.
+    }
+    return {
+      path: `${target.pathname}${target.search}`,
+      status: "reachable",
+      httpStatus: 101,
+      reason: "websocket_upgrade_reachable"
+    };
+  } catch (error) {
+    return {
+      path: `${target.pathname}${target.search}`,
+      status: "blocked",
+      httpStatus: null,
+      reason: error?.name === "AbortError" ? "websocket_upgrade_timeout" : "websocket_upgrade_failed"
     };
   } finally {
     clearTimeout(timeout);
@@ -1868,7 +1935,16 @@ async function publicRouteProbeResponse(request, env) {
 
   const url = publicRouteUrl(domain, mode, port, tlsEnabled);
   const http = await probePublicHttpEndpoint(url, mode);
-  const ok = http.status === "reachable" && tcpResults.every((result) => result.status === "open");
+  const webSockets = http.status === "reachable"
+    ? await Promise.all(PUBLIC_ROUTE_WEBSOCKET_PATHS.map((requestPath) => (
+      probePublicWebSocketEndpoint(url, requestPath)
+    )))
+    : [];
+  const blockedWebSocket = webSockets.find((result) => result.status !== "reachable");
+  const ok = http.status === "reachable"
+    && !blockedWebSocket
+    && webSockets.length === PUBLIC_ROUTE_WEBSOCKET_PATHS.length
+    && tcpResults.every((result) => result.status === "open");
   return json({
     ok,
     mode,
@@ -1879,10 +1955,11 @@ async function publicRouteProbeResponse(request, env) {
     cloudflareProxied,
     checkedAt: Date.now(),
     externalStatus: ok ? "reachable" : "blocked",
-    reason: ok ? "public_route_reachable" : http.reason,
+    reason: ok ? "public_route_reachable" : blockedWebSocket?.reason || http.reason,
     httpStatus: http.httpStatus,
     httpReason: http.reason,
-    ports: tcpResults
+    ports: tcpResults,
+    webSockets
   });
 }
 
@@ -2406,17 +2483,25 @@ export default {
         return json({ error: "installer_not_found" }, 404);
       }
 
-      const sourceAsset = await env.ASSETS.fetch(new Request(new URL("/agent/index.js", request.url), request));
+      const [sourceAsset, packageLockAsset] = await Promise.all([
+        env.ASSETS.fetch(new Request(new URL("/agent/index.js", request.url), request)),
+        env.ASSETS.fetch(new Request(new URL("/agent/package-lock.json", request.url), request))
+      ]);
       if (!sourceAsset.ok) {
         return json({ error: "agent_not_found" }, 500);
       }
+      if (!packageLockAsset.ok) {
+        return json({ error: "agent_package_lock_not_found" }, 500);
+      }
       const sourceSha256 = await sha256Hex(await sourceAsset.arrayBuffer());
+      const packageLockSha256 = await sha256Hex(await packageLockAsset.arrayBuffer());
 
       const sourceBaseUrl = `${url.origin}/agent`;
       const installerText = (await asset.text()).replaceAll(
         "__WORKER_SOURCE_BASE_URL__",
         sourceBaseUrl
       ).replaceAll("__WORKER_SOURCE_SHA256__", sourceSha256)
+        .replaceAll("__WORKER_PACKAGE_LOCK_SHA256__", packageLockSha256)
         .replaceAll("__WORKER_SYNC_BASE_URL__", url.origin);
       const headers = new Headers(asset.headers);
       headers.set("content-type", "text/x-shellscript; charset=utf-8");
