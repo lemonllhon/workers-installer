@@ -476,6 +476,31 @@ dependency_version_line() {
   "$@" 2>/dev/null | sed -n '1p' | tr -d '\r' || true
 }
 
+join_by_comma() {
+  local IFS=','
+  printf '%s' "$*"
+}
+
+find_ca_bundle() {
+  local candidate
+  for candidate in \
+    /etc/ssl/certs/ca-certificates.crt \
+    /etc/pki/tls/certs/ca-bundle.crt \
+    /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+    /var/lib/ca-certificates/ca-bundle.pem \
+    /etc/ssl/cert.pem; do
+    if [[ -s "${candidate}" ]]; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ca_certificates_available() {
+  [[ -n "$(find_ca_bundle 2>/dev/null || true)" ]]
+}
+
 report_basic_dependency_progress() {
   local detail=""
 
@@ -488,18 +513,7 @@ report_basic_dependency_progress() {
   log "基础依赖进度 2/7：curl 已就绪${detail:+（${detail}）}"
 
   local ca_bundle=""
-  local candidate
-  for candidate in \
-    /etc/ssl/certs/ca-certificates.crt \
-    /etc/pki/tls/certs/ca-bundle.crt \
-    /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-    /var/lib/ca-certificates/ca-bundle.pem \
-    /etc/ssl/cert.pem; do
-    if [[ -s "${candidate}" ]]; then
-      ca_bundle="${candidate}"
-      break
-    fi
-  done
+  ca_bundle="$(find_ca_bundle 2>/dev/null || true)"
   if [[ -n "${ca_bundle}" ]]; then
     log "基础依赖进度 3/7：ca-certificates 已就绪（${ca_bundle}）"
   else
@@ -514,13 +528,19 @@ report_basic_dependency_progress() {
   detail="$(dependency_version_line tar --version)"
   log "基础依赖进度 5/7：tar 已就绪${detail:+（${detail}）}"
 
-  has_command node || die "基础依赖安装后仍未找到 Node.js"
-  detail="$(node --version 2>/dev/null || true)"
-  log "基础依赖进度 6/7：Node.js 已就绪${detail:+（${detail}）}"
+  if has_command node; then
+    detail="$(node --version 2>/dev/null || true)"
+    log "基础依赖进度 6/7：复用系统 Node.js（只读，不升级）${detail:+（${detail}）}"
+  else
+    log "基础依赖进度 6/7：系统未提供 Node.js，将下载到本应用目录，不安装系统 Node.js"
+  fi
 
-  has_command npm || die "基础依赖安装后仍未找到 npm"
-  detail="$(npm --version 2>/dev/null || true)"
-  log "基础依赖进度 7/7：npm 已就绪${detail:+（v${detail}）}"
+  if has_command npm; then
+    detail="$(npm --version 2>/dev/null || true)"
+    log "基础依赖进度 7/7：复用系统 npm（只读，不升级）${detail:+（v${detail}）}"
+  else
+    log "基础依赖进度 7/7：系统未提供 npm，将使用本应用私有 Node.js 自带 npm"
+  fi
 }
 
 install_os_dependencies() {
@@ -528,31 +548,91 @@ install_os_dependencies() {
     warn "非 root 安装不会修改系统软件包；将使用当前用户目录内的项目专用 Node.js。"
     return 0
   fi
-  log "开始安装基础依赖：bash、curl、ca-certificates、unzip、tar、Node.js、npm"
+  local need_coreutils=false
+  local need_ca_certificates=false
+  (! has_command timeout || ! has_command sha256sum || ! has_command nohup) && need_coreutils=true
+  ca_certificates_available || need_ca_certificates=true
+
+  log "仅补齐本应用缺失的启动工具；不会安装或升级系统 Node.js/npm，也不会升级已存在的软件包"
   if has_command apt-get; then
+    local apt_packages=()
+    has_command bash || apt_packages+=(bash)
+    has_command curl || apt_packages+=(curl)
+    [[ "${need_ca_certificates}" == true ]] && apt_packages+=(ca-certificates)
+    [[ "${need_coreutils}" == true ]] && apt_packages+=(coreutils)
+    has_command ss || apt_packages+=(iproute2)
+    has_command tar || apt_packages+=(tar)
+    has_command xz || apt_packages+=(xz-utils)
+    has_command unzip || apt_packages+=(unzip)
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! can_run_as_service_user; then apt_packages+=(util-linux); fi
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! has_command useradd && ! has_command adduser; then apt_packages+=(passwd); fi
     export DEBIAN_FRONTEND=noninteractive
-    log "基础依赖安装阶段 1/2：apt-get 正在更新软件源（以下保留原始进度）"
+    log "本应用缺失软件包：$(join_by_comma "${apt_packages[@]}")"
+    log "应用依赖阶段 1/2：apt-get 仅更新软件包索引"
     apt-get update -o Acquire::Retries=3
-    log "基础依赖安装阶段 2/2：apt-get 正在安装软件包（以下保留 dpkg 进度）"
-    apt-get install -y -o Dpkg::Use-Pty=0 \
-      bash ca-certificates curl coreutils iproute2 passwd tar xz-utils unzip util-linux nodejs npm
+    log "应用依赖阶段 2/2：仅安装上述缺失包，禁止升级已安装包"
+    apt-get install -y --no-upgrade -o Dpkg::Use-Pty=0 "${apt_packages[@]}"
   elif has_command apk; then
-    log "基础依赖安装阶段 1/1：apk 正在下载并安装软件包"
-    apk add --no-cache bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm
+    local apk_packages=()
+    has_command bash || apk_packages+=(bash)
+    has_command curl || apk_packages+=(curl)
+    [[ "${need_ca_certificates}" == true ]] && apk_packages+=(ca-certificates)
+    [[ "${need_coreutils}" == true ]] && apk_packages+=(coreutils)
+    has_command ss || apk_packages+=(iproute2)
+    has_command tar || apk_packages+=(tar)
+    has_command xz || apk_packages+=(xz)
+    has_command unzip || apk_packages+=(unzip)
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! can_run_as_service_user; then apk_packages+=(util-linux); fi
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! has_command useradd && ! has_command adduser; then apk_packages+=(shadow); fi
+    log "本应用缺失软件包：$(join_by_comma "${apk_packages[@]}")"
+    apk add --no-cache "${apk_packages[@]}"
   elif has_command dnf; then
-    log "基础依赖安装阶段 1/1：dnf 正在解析、下载并安装软件包"
-    dnf install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils
+    local dnf_packages=()
+    has_command bash || dnf_packages+=(bash)
+    has_command curl || dnf_packages+=(curl)
+    [[ "${need_ca_certificates}" == true ]] && dnf_packages+=(ca-certificates)
+    [[ "${need_coreutils}" == true ]] && dnf_packages+=(coreutils)
+    has_command ss || dnf_packages+=(iproute)
+    has_command tar || dnf_packages+=(tar)
+    has_command xz || dnf_packages+=(xz)
+    has_command unzip || dnf_packages+=(unzip)
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! can_run_as_service_user; then dnf_packages+=(util-linux); fi
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! has_command useradd && ! has_command adduser; then dnf_packages+=(shadow-utils); fi
+    log "本应用缺失软件包：$(join_by_comma "${dnf_packages[@]}")"
+    dnf install -y "${dnf_packages[@]}"
   elif has_command yum; then
-    log "基础依赖安装阶段 1/1：yum 正在解析、下载并安装软件包"
-    yum install -y bash ca-certificates curl coreutils iproute tar xz unzip util-linux nodejs npm shadow-utils
+    local yum_packages=()
+    has_command bash || yum_packages+=(bash)
+    has_command curl || yum_packages+=(curl)
+    [[ "${need_ca_certificates}" == true ]] && yum_packages+=(ca-certificates)
+    [[ "${need_coreutils}" == true ]] && yum_packages+=(coreutils)
+    has_command ss || yum_packages+=(iproute)
+    has_command tar || yum_packages+=(tar)
+    has_command xz || yum_packages+=(xz)
+    has_command unzip || yum_packages+=(unzip)
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! can_run_as_service_user; then yum_packages+=(util-linux); fi
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! has_command useradd && ! has_command adduser; then yum_packages+=(shadow-utils); fi
+    log "本应用缺失软件包：$(join_by_comma "${yum_packages[@]}")"
+    yum install -y "${yum_packages[@]}"
   elif has_command zypper; then
-    log "基础依赖安装阶段 1/1：zypper 正在解析、下载并安装软件包"
-    zypper --non-interactive install bash ca-certificates curl coreutils iproute2 tar xz unzip util-linux nodejs npm
+    local zypper_packages=()
+    has_command bash || zypper_packages+=(bash)
+    has_command curl || zypper_packages+=(curl)
+    [[ "${need_ca_certificates}" == true ]] && zypper_packages+=(ca-certificates)
+    [[ "${need_coreutils}" == true ]] && zypper_packages+=(coreutils)
+    has_command ss || zypper_packages+=(iproute2)
+    has_command tar || zypper_packages+=(tar)
+    has_command xz || zypper_packages+=(xz)
+    has_command unzip || zypper_packages+=(unzip)
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! can_run_as_service_user; then zypper_packages+=(util-linux); fi
+    if [[ "${RUN_AS_ROOT}" == true ]] && ! has_command useradd && ! has_command adduser; then zypper_packages+=(shadow); fi
+    log "本应用缺失软件包：$(join_by_comma "${zypper_packages[@]}")"
+    zypper --non-interactive install --no-recommends "${zypper_packages[@]}"
   else
     die "缺少依赖，且未找到 apt-get、apk、dnf、yum 或 zypper"
   fi
   report_basic_dependency_progress
-  log "基础依赖安装完成：7/7 项均已检查"
+  log "应用启动工具检查完成：系统 Node.js/npm 未被安装或升级"
 }
 
 can_run_as_service_user() {
@@ -614,20 +694,19 @@ create_service_user() {
 }
 
 check_dependencies() {
-  if ! has_command bash || ! has_command curl || ! has_command timeout || ! has_command sha256sum || ! has_command ss || ! has_command tar || ! has_command unzip || ! has_command nohup || ([[ "${RUN_AS_ROOT}" == true ]] && (! has_command node || ! has_command npm || ! can_run_as_service_user)); then
+  if ! has_command bash || ! has_command curl || ! ca_certificates_available || ! has_command timeout || ! has_command sha256sum \
+    || ! has_command ss || ! has_command tar || ! has_command xz || ! has_command unzip || ! has_command nohup \
+    || ([[ "${RUN_AS_ROOT}" == true ]] && (! can_run_as_service_user || (! has_command useradd && ! has_command adduser))); then
     is_true "${DRY_RUN}" && die "缺少依赖（dry-run 不会安装依赖）"
     install_os_dependencies
   fi
 
   has_command bash || die "未找到 bash"
   has_command timeout || die "未找到 timeout，无法为网络心跳设置硬超时"
-  if [[ "${RUN_AS_ROOT}" == true ]]; then
-    has_command node || die "未找到 node"
-    has_command npm || die "未找到 npm"
-  fi
   has_command sha256sum || die "未找到 sha256sum"
   has_command ss || die "未找到 ss，无法安全检测端口占用"
   has_command tar || die "未找到 tar，无法安装项目专用 Node.js"
+  has_command xz || die "未找到 xz，无法解压项目专用 Node.js"
   has_command unzip || die "未找到 unzip"
   prepare_user_switch
   install_direct_gateway_dependencies
@@ -1062,26 +1141,8 @@ JSON
 
 install_capability_tools() {
   has_command setcap && return 0
-  if is_true "${DRY_RUN}"; then
-    warn "未找到 setcap；非 systemd 后端将无法保证服务用户监听 80/443"
-    return 0
-  fi
-
-  log "安装非 systemd 低端口能力工具：setcap"
-  if has_command apt-get; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq libcap2-bin >/dev/null
-  elif has_command apk; then
-    apk add --no-cache libcap >/dev/null
-  elif has_command dnf; then
-    dnf install -y libcap >/dev/null
-  elif has_command yum; then
-    yum install -y libcap >/dev/null
-  elif has_command zypper; then
-    zypper --non-interactive install libcap-progs >/dev/null
-  fi
-  has_command setcap || warn "无法安装 setcap；标准 80/443 不能绑定时会继续探测非特权端口"
+  warn "未找到 setcap；为避免修改系统，不自动安装 libcap。非 systemd 后端将跳过不可绑定的 80/443 并继续探测高端口"
+  return 0
 }
 
 prepare_privileged_bind_runtime() {
@@ -1931,35 +1992,42 @@ install_direct_gateway_dependencies() {
   if [[ "${certbot_missing}" == true ]]; then
     dependency_label="${dependency_label:+${dependency_label}、}Certbot"
   fi
-  log "准备直连网关依赖：${dependency_label}"
+  log "仅为本应用补齐直连网关组件：${dependency_label}；不升级系统已有软件"
   local install_failed=false
   if has_command apt-get; then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
     local apt_packages=()
     [[ "${nginx_missing}" == true ]] && apt_packages+=(nginx)
     [[ "${certbot_missing}" == true ]] && apt_packages+=(certbot)
-    apt-get install -y -qq "${apt_packages[@]}" >/dev/null || install_failed=true
+    log "直连组件缺失包：$(join_by_comma "${apt_packages[@]}")"
+    apt-get update -o Acquire::Retries=3 || install_failed=true
+    if [[ "${install_failed}" != true ]]; then
+      apt-get install -y --no-upgrade -o Dpkg::Use-Pty=0 "${apt_packages[@]}" || install_failed=true
+    fi
   elif has_command apk; then
     local apk_packages=()
     [[ "${nginx_missing}" == true ]] && apk_packages+=(nginx)
     [[ "${certbot_missing}" == true ]] && apk_packages+=(certbot)
-    apk add --no-cache "${apk_packages[@]}" >/dev/null || install_failed=true
+    log "直连组件缺失包：$(join_by_comma "${apk_packages[@]}")"
+    apk add --no-cache "${apk_packages[@]}" || install_failed=true
   elif has_command dnf; then
     local dnf_packages=()
     [[ "${nginx_missing}" == true ]] && dnf_packages+=(nginx)
     [[ "${certbot_missing}" == true ]] && dnf_packages+=(certbot)
-    dnf install -y "${dnf_packages[@]}" >/dev/null || install_failed=true
+    log "直连组件缺失包：$(join_by_comma "${dnf_packages[@]}")"
+    dnf install -y "${dnf_packages[@]}" || install_failed=true
   elif has_command yum; then
     local yum_packages=()
     [[ "${nginx_missing}" == true ]] && yum_packages+=(nginx)
     [[ "${certbot_missing}" == true ]] && yum_packages+=(certbot)
-    yum install -y "${yum_packages[@]}" >/dev/null || install_failed=true
+    log "直连组件缺失包：$(join_by_comma "${yum_packages[@]}")"
+    yum install -y "${yum_packages[@]}" || install_failed=true
   elif has_command zypper; then
     local zypper_packages=()
     [[ "${nginx_missing}" == true ]] && zypper_packages+=(nginx)
     [[ "${certbot_missing}" == true ]] && zypper_packages+=(certbot)
-    zypper --non-interactive install "${zypper_packages[@]}" >/dev/null || install_failed=true
+    log "直连组件缺失包：$(join_by_comma "${zypper_packages[@]}")"
+    zypper --non-interactive install --no-recommends "${zypper_packages[@]}" || install_failed=true
   else
     install_failed=true
   fi
