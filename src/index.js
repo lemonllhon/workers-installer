@@ -665,6 +665,7 @@ function tunnelConnectivityView(node) {
     public_http_timeout: "公网 HTTP/HTTPS 请求超时",
     public_http_failed: "公网 HTTP/HTTPS 请求失败",
     public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
+    cloudflare_origin_unavailable: "Cloudflare 无法连接源站",
     public_route_reachable: "install.lemon.vin 公网路由心跳通过",
     relay_token_missing: "缺少 Worker 中继令牌",
     not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
@@ -1298,6 +1299,7 @@ async function dashboardPageResponse(request, env) {
           public_http_timeout: "公网 HTTP/HTTPS 请求超时",
           public_http_failed: "公网 HTTP/HTTPS 请求失败",
           public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
+          cloudflare_origin_unavailable: "Cloudflare 无法连接源站",
           public_route_reachable: "install.lemon.vin 公网路由心跳通过",
           relay_token_missing: "缺少 Worker 中继令牌",
           not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
@@ -1774,12 +1776,16 @@ async function probePublicHttpEndpoint(url, mode) {
     const tunnelInactive = mode === "tunnel"
       && (response.status === 530 || response.status === 1033);
     const httpUnavailable = response.status >= 500;
+    const cloudflareOriginUnavailable = mode === "direct"
+      && [521, 522, 523, 524, 525, 526].includes(response.status);
     return {
       status: tunnelInactive || httpUnavailable ? "blocked" : "reachable",
       httpStatus: response.status,
       reason: tunnelInactive
         ? "tunnel_inactive"
-        : httpUnavailable
+        : cloudflareOriginUnavailable
+          ? "cloudflare_origin_unavailable"
+          : httpUnavailable
           ? "public_http_unavailable"
           : "public_http_reachable"
     };

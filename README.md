@@ -37,7 +37,7 @@ Workers & Pages
 | --- | --- | --- |
 | `TEAMNODE_SYNC_SECRET` | Secret | TeamNode 主密钥，只在 Worker 代理请求时使用 |
 | `TEAMNODE_SYNC_ENROLL_PASSWORD` | Secret | 目标机器安装时输入的兑换密码 |
-| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 A/AAAA 记录；标准 `443+80` 路线启用 Proxied（小黄云），其他端口使用 DNS Only（灰云）；安装兑换时按请求下发到目标机器的 0600 `.env` |
+| `CLOUDFLARE_API_KEY` | Secret，可选 | 用于保留/恢复 `ARGO_DOMAIN` 的 Tunnel CNAME，并为自动派生的直连域名创建 A/AAAA 记录；源站 HTTP 80 可达时启用 Proxied（小黄云）、自动为该直连主机名设置 Flexible 回源，其他端口使用 DNS Only（灰云）；安装兑换时按请求下发到目标机器的 0600 `.env` |
 
 如果需要根页面在线机器面板，再添加：
 
@@ -160,7 +160,7 @@ Tunnel：boxd06.openlemon.cyou
 直连： zhilianboxd06.openlemon.cyou
 ```
 
-切换直连后，Cloudflare DNS、Nginx `server_name`、Worker 最终回访以及 VLESS/VMess/Trojan 的 `add`、`host`、`sni` 都使用直连域名；`ARGO_DOMAIN` 继续保留给原 Cloudflare Tunnel。每台机器仍必须使用唯一的 `ARGO_DOMAIN`，以免两台机器派生出同一个直连域名。标准 `443+80` 路线由 Cloudflare 边缘提供 HTTPS，源站不再申请或续期证书。
+切换直连后，Cloudflare DNS、Nginx `server_name`、Worker 最终回访以及 VLESS/VMess/Trojan 的 `add`、`host`、`sni` 都使用直连域名；`ARGO_DOMAIN` 继续保留给原 Cloudflare Tunnel。每台机器仍必须使用唯一的 `ARGO_DOMAIN`，以免两台机器派生出同一个直连域名。标准小黄云路线由 Cloudflare 边缘提供 HTTPS 443，源站只需 HTTP 80，不再申请或续期证书。
 
 常用可选参数：
 
@@ -168,8 +168,8 @@ Tunnel：boxd06.openlemon.cyou
 - `CLOUDFLARED_PROTOCOL`：Tunnel 传输协议，可选 `http2`、`quic`、`auto`，默认 `http2`；
 - `AUTO_CONFIGURE_FIREWALL`：root 安装时是否自动配置已启用的主机防火墙，默认 `true`；Tunnel 模式配置出站 7844，直连探测还会放行 `DIRECT_PORT_CANDIDATES`、`DIRECT_PORT`、`DIRECT_HTTP_PORT` 和 `DIRECT_PORT_SCAN_PORTS` 中明确列出的入站 TCP 端口；
 - `DIRECT_IPV4_ENABLED`、`DIRECT_IPV6_ENABLED`：控制直连 Nginx 与 DNS 启用的地址族，默认都为 `true`；自动路线选择会根据 Worker 的实际公网回访结果重写这两个值，不会发布未通过回访的地址族；
-- `DIRECT_CLOUDFLARE_PROXY_ENABLED`：由自动路线选择维护；`443+80` 同时可达时为 `true`（小黄云、边缘 HTTPS、源站 HTTP 80），其他端口为 `false`（灰云 HTTP），通常不要手动设置；
-- `CF_DNS_PUBLIC_IP`、`CF_DNS_PUBLIC_IPV6`：可选的固定公网 IPv4/IPv6；不设置时节点分别自动检测。标准 `443+80` 路线创建小黄云 `A`/`AAAA`，其他 HTTP 端口创建灰云记录；
+- `DIRECT_CLOUDFLARE_PROXY_ENABLED`：由自动路线选择维护；源站 HTTP 80 可达时为 `true`（小黄云、边缘 HTTPS 443、Flexible 回源 HTTP 80），其他端口为 `false`（灰云 HTTP），通常不要手动设置；
+- `CF_DNS_PUBLIC_IP`、`CF_DNS_PUBLIC_IPV6`：可选的固定公网 IPv4/IPv6；不设置时节点分别自动检测。标准 HTTP 80 路线创建小黄云 `A`/`AAAA`，其他 HTTP 端口创建灰云记录；
 - `CFIP`：节点连接地址，例如 `cdst.lemon.vin`；
 - `NAME`：节点名称前缀；
 - `UUID`：新机器不设置时自动随机生成；覆盖已有安装且不设置时，自动复用旧 `.env` 中的 UUID；显式指定时优先使用指定值；
@@ -405,9 +405,11 @@ env \
 
 安装器默认准备 Nginx，并尝试在已启用的主机防火墙中放行 `DIRECT_PORT_CANDIDATES`、当前直连端口以及 `DIRECT_PORT_SCAN_PORTS` 明确列出的入站 TCP 端口。自动路线选择需要 `CLOUDFLARE_API_KEY`：节点启动后先验证 Cloudflare Tunnel；Tunnel 失败后，节点检测公网 IPv4/IPv6，并按地址族隔离执行公网回访。每个端口批次先建立 IPv4 临时监听并请求 Worker 回访；IPv4 找到可用端口后，只在 IPv6 上复验同一个端口。相同端口双向可达才启用双栈；IPv6 同端口不可达则立即采用 IPv4，不再为了双栈继续扫描。IPv4 本批没有可用端口时才检查同一批 IPv6，因此 IPv6-only 机器也能完成选择。
 
-标准入口必须同时确认 `443` 和 `80` 公网可达。通过后，直连域名的 `A`/`AAAA` 自动设为 Proxied（小黄云），客户端仍连接 `HTTPS:443`，Cloudflare 边缘终止 TLS，源站 Nginx 只监听普通 `HTTP:80`，不安装 Certbot，也不申请或续期 Let's Encrypt 证书。该方式要求直连域名所在 Zone 的 SSL/TLS 加密模式允许 Flexible 回源；程序不会自动修改整个 Zone 的 SSL 模式，以免影响同一 Zone 的其他域名。如果 Zone 不是 Flexible，Worker 的最终 HTTPS 回访会失败，节点不会注册。
+标准入口只要求源站 `HTTP:80` 能被 Worker 公网回访，不要求 VPS 的 Nginx 监听 443。通过后，直连域名的 `A`/`AAAA` 自动设为 Proxied（小黄云），客户端连接 Cloudflare 边缘 `HTTPS:443`，Cloudflare 再以普通 HTTP 回源到 VPS 的 80。程序不安装 Certbot，也不申请或续期 Let's Encrypt 证书。
 
-如果不能同时使用 `443+80`，程序继续扫描其他可用端口；选中后将直连记录改为 DNS Only（灰云），Nginx 和节点链接都使用该端口的普通 HTTP，不经过 Cloudflare 代理。这样也避免把 Cloudflare 不支持的自定义端口误判成可用代理端口。初始候选全部失败时，节点继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。
+为避免修改整个 Zone，程序会在 `http_config_settings` 阶段创建一条只匹配当前 `zhilian...` 主机名的 Configuration Rule，并设置 `ssl: flexible`。因此 `CLOUDFLARE_API_KEY` 除 `Zone:Read`、`DNS:Read`、`DNS:Edit` 外，还必须拥有目标 Zone 的 `Config Rules:Edit`（控制台显示为 `Zone > Config Rules > Edit`）。缺少权限时会在启动日志中明确停止，不会继续生成一个返回 521 的异常节点；该规则不匹配预留给 Tunnel 的原 `ARGO_DOMAIN`，也不会改变同 Zone 的其他域名。
+
+如果源站 80 不可达，程序继续扫描其他可用端口；选中后将直连记录改为 DNS Only（灰云），Nginx 和节点链接都使用该端口的普通 HTTP，不经过 Cloudflare 代理。这样也避免把 Cloudflare 不支持的自定义端口误判成可用代理端口。初始候选全部失败时，节点继续按 `DIRECT_PORT_SCAN_PORTS` 和 `DIRECT_PORT_SCAN_RANGE` 分批扩展探测，默认最多检查 256 个端口；可用 `DIRECT_PORT_SCAN_MAX=0` 关闭扩展扫描。
 
 能够从 `ARGO_AUTH` 解析固定 Tunnel ID 时，安装器还会保留或恢复 `ARGO_DOMAIN -> <Tunnel-ID>.cfargotunnel.com` 的代理 CNAME；旧版本遗留在 `ARGO_DOMAIN` 上的直连 A/AAAA 记录会被迁移掉。直连网关启动后，标准小黄云路线由 Worker 检查源站 HTTP 80，再回访最终 `https://zhilian...:443`；灰云路线检查所选公网端口并回访最终 HTTP 域名。只有选中的地址族和最终请求都通过，节点才会注册到面板。未被选中的地址族不可达不会隔离整个 UUID。
 
@@ -452,8 +454,8 @@ DIRECT_PORT_SCAN_MAX=256
 
 实际探测顺序如下：
 
-1. 覆盖安装且存在上次最终验证成功的直连路线时，先只复验上次实际启用的地址族和端口。例如旧路线为仅 IPv4 的小黄云 HTTPS `443/80`，就不会因为机器同时检测到不可达 IPv6 而扫描 256 个扩展端口；Worker 回访 IPv4 `443/80` 通过后立即复用。复验失败或地址族已经消失时进入下一步。
-2. 第一批检查标准入口 `80,443`。先检查 IPv4；IPv4 的两个端口都可达时只在 IPv6 上复验 `80/443`，双向通过才启用双栈，然后发布小黄云 HTTPS。IPv4 只能使用单个 HTTP 端口时，再完整检查 IPv6 的 `80/443`，避免错过 IPv6-only 的标准小黄云路线；最终优先选择可用的 `443+80` 方案。
+1. 覆盖安装且存在上次最终验证成功的直连路线时，先只复验上次实际使用的源站端口。例如旧路线为仅 IPv4 的小黄云 HTTPS，Worker 只回访 IPv4 源站 HTTP 80；Cloudflare 边缘 443 不属于 VPS 入站复验端口。复验失败或地址族已经消失时进入下一步。
+2. 第一批只检查标准源站入口 `80`。先检查 IPv4；IPv4 的 80 可达时只在 IPv6 上复验同一个 80，双向通过才启用双栈，然后发布小黄云 HTTPS。IPv4 的 80 不可达时再独立检查 IPv6 的 80，避免错过 IPv6-only 路线。
 3. 标准入口没有形成可用方案时，按默认顺序检查 `8080,8443,8880,2053,2083,2087,2096`，每批最多 4 个端口。每批先检查 IPv4；找到端口后只检查 IPv6 的同一端口，双通则双栈，否则立即使用 IPv4。
 4. 如果本批 IPv4 没有可用端口，再检查同一批 IPv6；IPv6 找到端口后立即使用 IPv6。两种地址族在本批都没有结果时，才进入下一批。
 5. 初始候选全部失败后，先检查 `DIRECT_PORT_SCAN_PORTS` 明确列出的端口，再从 `DIRECT_PORT_SCAN_RANGE` 中均匀抽样补足到 `DIRECT_PORT_SCAN_MAX`，继续应用相同的地址族隔离顺序。范围扫描不是逐个检查 `1024-65535` 的全部端口。
@@ -469,7 +471,7 @@ PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS=600
 
 这些变量应写入目标机器的 `/opt/nodejs-argo-no-docker/.env`，或在首次安装命令的 `env` 中传入，不需要配置为 Worker Secret。自动防火墙配置会放行 `DIRECT_PORT_SCAN_PORTS` 中明确列出的端口，但不会把整个 `DIRECT_PORT_SCAN_RANGE` 全量开放；使用范围抽样时，云安全组和已启用的主机防火墙必须允许对应端口，否则 Worker 会正确报告为不可达。
 
-安装器只能修改目标机器上的 UFW、firewalld、nftables 或 iptables；云厂商安全组、上游防火墙和运营商网络仍需在厂商控制台放行。当前使用的 Cloudflare API Token 只应授予目标 Zone 的 DNS Read/Edit 权限，不要把 Token 放入 GitHub、公开安装命令或日志；如果曾经暴露过 Token，应先在 Cloudflare 中撤销并重新创建。
+安装器只能修改目标机器上的 UFW、firewalld、nftables 或 iptables；云厂商安全组、上游防火墙和运营商网络仍需在厂商控制台放行。Cloudflare API Token 应限制在目标 Zone，并只授予 `Zone:Read`、`DNS:Read/Edit`、`Config Rules:Edit`；不要把 Token 放入 GitHub、公开安装命令或日志。如果曾经暴露过 Token，应先在 Cloudflare 中撤销并重新创建。
 
 面板每台在线机器的 Cloudflare Tunnel 状态旁提供“立即检测”。点击后由 `install.lemon.vin` 排队并下发一次性检测指令，目标机器本地执行 7844 探测，再把结果回传到面板；启动前和每次心跳还会由 Worker 从公网验证最终 Tunnel/直连域名。7844 是 Tunnel 的出站传输端口，Worker 不能通过“连接本机入站 7844”判断 Tunnel；最终域名的公网请求才是 Tunnel 路由是否真正可访问的验证。对 `http2`，本机 TCP 7844 连接超时或失败会显示“出站端口被阻断”；这表示本机已经执行探测。若机器离线、服务未运行或没有在指令有效期内收到指令，面板会显示“本机未响应检测指令”，不能把这种情况直接等同于端口关闭。`quic` 的 UDP 端口不能用普通 TCP 连接判断，面板会以 cloudflared 实际 Tunnel 状态和协议要求为准。
 

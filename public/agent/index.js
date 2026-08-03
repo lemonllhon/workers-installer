@@ -63,7 +63,7 @@ const DIRECT_PORT = Number.parseInt(process.env.DIRECT_PORT || "443", 10);
 const DIRECT_HTTP_PORT = Number.parseInt(process.env.DIRECT_HTTP_PORT || "80", 10);
 const DIRECT_TLS_ENABLED = parseBoolean(process.env.DIRECT_TLS_ENABLED, true);
 // 标准直连由 Cloudflare 边缘终止 TLS，源站只提供 HTTP 80。旧环境中
-// 没有此变量时，根据已经选中的 443/80 HTTPS 方案自动迁移到小黄云。
+// 没有此变量时，根据已经选中的边缘 443/源站 80 HTTPS 方案自动迁移到小黄云。
 const DIRECT_CLOUDFLARE_PROXY_ENABLED = parseBoolean(
   process.env.DIRECT_CLOUDFLARE_PROXY_ENABLED,
   DIRECT_MODE && DIRECT_TLS_ENABLED && DIRECT_PORT === 443 && DIRECT_HTTP_PORT === 80
@@ -76,6 +76,10 @@ const DIRECT_REUSE_IPV4_ENABLED = parseBoolean(process.env.DIRECT_REUSE_IPV4_ENA
 const DIRECT_REUSE_IPV6_ENABLED = parseBoolean(process.env.DIRECT_REUSE_IPV6_ENABLED, false);
 const DIRECT_REUSE_PORT = Number.parseInt(process.env.DIRECT_REUSE_PORT || "443", 10);
 const DIRECT_REUSE_HTTP_PORT = Number.parseInt(process.env.DIRECT_REUSE_HTTP_PORT || "80", 10);
+const DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED = parseBoolean(
+  process.env.DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED,
+  DIRECT_REUSE_TLS_ENABLED && DIRECT_REUSE_PORT === 443 && DIRECT_REUSE_HTTP_PORT === 80
+);
 const AUTO_DIRECT_FALLBACK = parseBoolean(process.env.AUTO_DIRECT_FALLBACK, true);
 const NODEJS_ARGO_ENV_FILE = process.env.NODEJS_ARGO_ENV_FILE || "";
 const DIRECT_PORT_CANDIDATES = [...new Set(
@@ -1073,10 +1077,13 @@ function mergePublicRouteProbe(connectivity, publicProbe) {
 
 async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ACTIVE_PUBLIC_DOMAIN } = {}) {
   const mode = DIRECT_MODE ? "direct" : "tunnel";
+  const probeAttempts = DIRECT_MODE && DIRECT_CLOUDFLARE_PROXY_ENABLED
+    ? Math.max(PUBLIC_ROUTE_PROBE_ATTEMPTS, 10)
+    : PUBLIC_ROUTE_PROBE_ATTEMPTS;
   let lastProbe = null;
-  for (let attempt = 1; attempt <= PUBLIC_ROUTE_PROBE_ATTEMPTS; attempt += 1) {
+  for (let attempt = 1; attempt <= probeAttempts; attempt += 1) {
     appendRouteProbeProgress(
-      `Worker 最终路线回访 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${mode} ${domain}${mode === "direct" ? `:${DIRECT_PORT}` : ""}`
+      `Worker 最终路线回访 ${attempt}/${probeAttempts}：${mode} ${domain}${mode === "direct" ? `:${DIRECT_PORT}` : ""}`
     );
     lastProbe = await probePublicRoute({
       domain,
@@ -1097,18 +1104,24 @@ async function verifyPublicRouteAtStartup({ throwOnFailure = true, domain = ACTI
       );
       return lastProbe;
     }
+    const failureDetail = `${lastProbe?.reason || "unknown"}`
+      + `${lastProbe?.httpStatus ? `（HTTP ${lastProbe.httpStatus}）` : ""}`
+      + `${lastProbe?.blockedPort ? `（TCP ${lastProbe.blockedPort}）` : ""}`;
     appendRouteProbeProgress(
-      `Worker 最终路线回访失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`
+      `Worker 最终路线回访失败 ${attempt}/${probeAttempts}：${failureDetail}`
     );
-    console.warn(`Worker 公网路由心跳失败 ${attempt}/${PUBLIC_ROUTE_PROBE_ATTEMPTS}：${lastProbe?.reason || "unknown"}`);
-    if (attempt < PUBLIC_ROUTE_PROBE_ATTEMPTS) {
+    console.warn(`Worker 公网路由心跳失败 ${attempt}/${probeAttempts}：${failureDetail}`);
+    if (attempt < probeAttempts) {
       await new Promise((resolve) => setTimeout(resolve, PUBLIC_ROUTE_PROBE_RETRY_DELAY_MS));
     }
   }
 
   publicRouteProbeCache = lastProbe ? { ...lastProbe, mode, domain } : null;
   if (throwOnFailure) {
-    throw noRouteError(`install.lemon.vin 公网路由心跳未通过：${lastProbe?.reason || "public_route_unreachable"}`);
+    throw noRouteError(
+      `install.lemon.vin 公网路由心跳未通过：${lastProbe?.reason || "public_route_unreachable"}`
+      + `${lastProbe?.httpStatus ? `（HTTP ${lastProbe.httpStatus}）` : ""}`
+    );
   }
   return lastProbe || { ok: false, reason: "public_route_unreachable" };
 }
@@ -1278,14 +1291,16 @@ function selectDirectFallbackPlan(results, { addressFamilies = configuredDirectA
 
   if (!nginxAvailable) return null;
 
-  const tlsFamilies = qualifyingFamilies([443, 80]);
-  if (cloudflareProxyAvailable && familiesQualify(tlsFamilies)) {
+  // Flexible 模式的 HTTPS 443 在 Cloudflare 边缘终止，源站只需开放 HTTP 80。
+  // 不能把源站 TCP 443 当作标准小黄云路线的前置条件。
+  const proxiedFamilies = qualifyingFamilies([80]);
+  if (cloudflareProxyAvailable && familiesQualify(proxiedFamilies)) {
     return {
       tlsEnabled: true,
       cloudflareProxied: true,
       port: 443,
       httpPort: 80,
-      addressFamilies: tlsFamilies,
+      addressFamilies: proxiedFamilies,
       reason: "cloudflare_flexible_443_to_http_80"
     };
   }
@@ -1346,6 +1361,9 @@ function mergeDirectProbeResults(...resultSets) {
 
 function directPlanRequiredPorts(plan) {
   if (!plan) return [];
+  if (plan.cloudflareProxied) {
+    return Number(plan.httpPort) === 80 ? [80] : [];
+  }
   return [...new Set([
     Number(plan.port),
     ...(plan.tlsEnabled ? [Number(plan.httpPort)] : [])
@@ -1422,7 +1440,7 @@ async function probeDirectPortBatchByFamily(ports, addressFamilies, { preferSecu
 
   if (primary.plan && preferSecureStandard) {
     appendRouteProbeProgress(
-      `${directFamilyName(primaryFamily).toUpperCase()} 标准端口只能使用 HTTP；继续独立检查 ${directFamilyName(secondaryFamily).toUpperCase()} 的 80/443`
+      `${directFamilyName(primaryFamily).toUpperCase()} 未形成小黄云路线；继续独立检查 ${directFamilyName(secondaryFamily).toUpperCase()} 的源站 HTTP 80`
     );
   } else {
     appendRouteProbeProgress(
@@ -1451,21 +1469,27 @@ async function probeReusableDirectPlan(publicAddresses) {
     ...(DIRECT_REUSE_IPV6_ENABLED && publicAddresses.ipv6 ? [6] : [])
   ];
   const expectedFamilyCount = Number(DIRECT_REUSE_IPV4_ENABLED) + Number(DIRECT_REUSE_IPV6_ENABLED);
-  const validPorts = [DIRECT_REUSE_PORT, ...(DIRECT_REUSE_TLS_ENABLED ? [DIRECT_REUSE_HTTP_PORT] : [])]
+  const storedPlan = {
+    tlsEnabled: DIRECT_REUSE_TLS_ENABLED,
+    cloudflareProxied: DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED,
+    port: DIRECT_REUSE_PORT,
+    httpPort: DIRECT_REUSE_HTTP_PORT
+  };
+  const reusePorts = directPlanRequiredPorts(storedPlan);
+  const validPorts = reusePorts.length > 0 && reusePorts
     .every((port) => Number.isInteger(port) && port >= 1 && port <= 65535 && !LOCAL_SERVICE_PORTS.has(port));
   if (!validPorts || !addressFamilies.length || addressFamilies.length !== expectedFamilyCount) {
     appendRouteProbeProgress("上次直连路线的地址族或端口已不可用，改为执行完整端口发现");
     return null;
   }
 
-  const ports = [...new Set([
-    DIRECT_REUSE_PORT,
-    ...(DIRECT_REUSE_TLS_ENABLED ? [DIRECT_REUSE_HTTP_PORT] : [])
-  ])];
+  const ports = reusePorts;
   const familyLabel = addressFamilies.map((family) => directFamilyName(family).toUpperCase()).join("/");
   appendRouteProbeProgress(
-    `优先复验上次成功的直连路线：${familyLabel} ${DIRECT_REUSE_TLS_ENABLED ? "HTTPS" : "HTTP"} ${DIRECT_REUSE_PORT}`
-    + `${DIRECT_REUSE_TLS_ENABLED ? `/HTTP ${DIRECT_REUSE_HTTP_PORT}` : ""}`
+    `优先复验上次成功的直连路线：${familyLabel} `
+    + `${DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED
+      ? "Cloudflare 边缘 HTTPS 443/源站 HTTP 80"
+      : `${DIRECT_REUSE_TLS_ENABLED ? "HTTPS" : "HTTP"} ${DIRECT_REUSE_PORT}`}`
   );
   const probe = await probeDirectPortCandidates(ports, addressFamilies);
   const candidate = selectDirectFallbackPlan(probe.results, {
@@ -1474,6 +1498,7 @@ async function probeReusableDirectPlan(publicAddresses) {
   });
   const matchesPreviousRoute = candidate
     && candidate.tlsEnabled === DIRECT_REUSE_TLS_ENABLED
+    && candidate.cloudflareProxied === DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED
     && candidate.port === DIRECT_REUSE_PORT
     && candidate.httpPort === DIRECT_REUSE_HTTP_PORT
     && candidate.addressFamilies.length === addressFamilies.length;
@@ -1512,7 +1537,9 @@ async function discoverDirectPortPlan() {
   appendRouteProbeProgress(
     `开始直连初始候选端口心跳：${DIRECT_PORT_CANDIDATES.join(",") || "无"}；本机端口 ${[...LOCAL_SERVICE_PORTS].join(",")} 已排除`
   );
-  const priorityPorts = [80, 443].filter((port) => DIRECT_PORT_CANDIDATES.includes(port));
+  // 标准小黄云路线只预检源站 HTTP 80；443 是 Cloudflare 边缘端口。
+  // 如果 80 不可达，443 仍留在后续 DNS Only 候选端口中。
+  const priorityPorts = [80].filter((port) => DIRECT_PORT_CANDIDATES.includes(port));
   const remainingInitialPorts = DIRECT_PORT_CANDIDATES.filter((port) => !priorityPorts.includes(port));
   if (priorityPorts.length > 0) {
     appendRouteProbeProgress(`优先检查标准入口端口：${priorityPorts.join(",")}`);
@@ -1597,6 +1624,7 @@ function writeDirectFallbackEnv(plan) {
     DIRECT_IPV6_ENABLED: planFamilies.includes("ipv6") ? "true" : "false",
     DIRECT_REUSE_ENABLED: "true",
     DIRECT_REUSE_TLS_ENABLED: plan.tlsEnabled ? "true" : "false",
+    DIRECT_REUSE_CLOUDFLARE_PROXY_ENABLED: plan.cloudflareProxied ? "true" : "false",
     DIRECT_REUSE_IPV4_ENABLED: planFamilies.includes("ipv4") ? "true" : "false",
     DIRECT_REUSE_IPV6_ENABLED: planFamilies.includes("ipv6") ? "true" : "false",
     DIRECT_REUSE_PORT: String(plan.port),
@@ -1688,7 +1716,7 @@ async function maybeActivateDirectFallback(syncContext, tunnelConnectivity) {
     writeDirectFallbackEnv(plan);
     console.warn(
       `Cloudflare Tunnel 连续异常，已选择直连 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
-      + `${plan.cloudflareProxied ? "（Cloudflare 小黄云，源站 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务应用新配置`
+      + `${plan.cloudflareProxied ? "（Cloudflare 边缘 HTTPS 443，源站只需 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务应用新配置`
     );
     await stopRuntimeProcesses();
     await stopArgoGateway();
@@ -1756,7 +1784,7 @@ async function activateDirectFallbackAtStartup(tunnelConnectivity) {
   await shutdownTeamNodeSync("startup_direct_fallback");
   console.warn(
     `Tunnel 心跳失败，已选择直连 ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} 端口 ${plan.port}`
-    + `${plan.cloudflareProxied ? "（443+80 可达，启用 Cloudflare 小黄云，源站 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务`
+    + `${plan.cloudflareProxied ? "（源站 HTTP 80 可达，启用 Cloudflare 边缘 HTTPS 443）" : "（DNS Only，不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
   return true;
@@ -1797,7 +1825,7 @@ async function prepareDirectModeStartup() {
   writeDirectFallbackEnv(plan);
   console.warn(
     `直连配置已调整为 ${DIRECT_DOMAIN} ${plan.addressFamilies.map((family) => family.toUpperCase()).join("/")} ${plan.tlsEnabled ? "HTTPS" : "HTTP"} ${plan.port}`
-    + `${plan.cloudflareProxied ? "（443+80 可达，启用 Cloudflare 小黄云，源站 HTTP 80）" : "（DNS Only，不申请证书）"}，正在重启服务`
+    + `${plan.cloudflareProxied ? "（源站 HTTP 80 可达，启用 Cloudflare 边缘 HTTPS 443）" : "（DNS Only，不申请证书）"}，正在重启服务`
   );
   setTimeout(() => process.exit(0), 100);
   return true;
@@ -2290,7 +2318,7 @@ function validateDirectMode() {
     || !CF_DNS_ENABLED
     || !CF_API_TOKEN
   )) {
-    throw new Error("Cloudflare 小黄云直连要求 HTTPS 443、源站 HTTP 80、CF_DNS_ENABLED=true，并配置 Cloudflare API Token");
+    throw new Error("Cloudflare 小黄云直连要求边缘 HTTPS 443、源站 HTTP 80、CF_DNS_ENABLED=true，并配置 Cloudflare API Token");
   }
 
   if (!DIRECT_IPV4_ENABLED && !DIRECT_IPV6_ENABLED) {
@@ -2599,6 +2627,95 @@ async function resolveDirectPublicAddresses() {
   };
 }
 
+function cloudflareApiErrorDetail(error) {
+  const errors = Array.isArray(error?.response?.data?.errors)
+    ? error.response.data.errors
+    : [];
+  const messages = errors
+    .map((entry) => String(entry?.message || entry?.error || "").trim())
+    .filter(Boolean);
+  return messages.join("; ").slice(0, 240)
+    || String(error?.response?.data?.message || error?.message || "unknown_error").slice(0, 240);
+}
+
+function directFlexibleRuleDefinition() {
+  const domain = String(DIRECT_DOMAIN).trim().toLowerCase();
+  const digest = crypto.createHash("sha256").update(domain).digest("hex").slice(0, 16);
+  return {
+    ref: `nodejs_argo_direct_flexible_${digest}`,
+    description: `nodejs-argo Flexible origin for ${domain}`,
+    expression: `http.host eq ${JSON.stringify(domain)}`,
+    action: "set_config",
+    action_parameters: { ssl: "flexible" },
+    enabled: true
+  };
+}
+
+async function ensureCloudflareFlexibleOriginRule(client, zoneId) {
+  if (!DIRECT_CLOUDFLARE_PROXY_ENABLED) return;
+
+  const desiredRule = directFlexibleRuleDefinition();
+  try {
+    const listResponse = await client.get(`/zones/${zoneId}/rulesets`);
+    const rulesets = Array.isArray(listResponse.data?.result) ? listResponse.data.result : [];
+    let ruleset = rulesets.find((entry) => (
+      entry?.kind === "zone" && entry?.phase === "http_config_settings"
+    ));
+
+    if (!ruleset) {
+      const createResponse = await client.post(`/zones/${zoneId}/rulesets`, {
+        name: "nodejs-argo direct route settings",
+        description: "Per-host settings for nodejs-argo direct routes",
+        kind: "zone",
+        phase: "http_config_settings",
+        rules: [desiredRule]
+      });
+      if (!createResponse.data?.success) {
+        throw new Error("Cloudflare Configuration Rules 创建失败");
+      }
+      console.log(`Cloudflare 回源规则已创建：${DIRECT_DOMAIN} -> Flexible（边缘 HTTPS 443，源站 HTTP 80）`);
+      return;
+    }
+
+    const viewResponse = await client.get(`/zones/${zoneId}/rulesets/${ruleset.id}`);
+    ruleset = viewResponse.data?.result || ruleset;
+    const rules = Array.isArray(ruleset.rules) ? ruleset.rules : [];
+    const current = rules.find((rule) => rule?.ref === desiredRule.ref);
+    const equivalent = rules.find((rule) => (
+      rule?.action === "set_config"
+      && rule?.expression === desiredRule.expression
+      && rule?.action_parameters?.ssl === "flexible"
+      && rule?.enabled !== false
+    ));
+
+    if (equivalent && !current) {
+      console.log(`Cloudflare 回源规则已存在：${DIRECT_DOMAIN} -> Flexible（源站 HTTP 80）`);
+      return;
+    }
+    if (current
+      && current.action === desiredRule.action
+      && current.expression === desiredRule.expression
+      && current.action_parameters?.ssl === "flexible"
+      && current.enabled !== false) {
+      console.log(`Cloudflare 回源规则已是最新：${DIRECT_DOMAIN} -> Flexible（源站 HTTP 80）`);
+      return;
+    }
+
+    const response = current
+      ? await client.patch(`/zones/${zoneId}/rulesets/${ruleset.id}/rules/${current.id}`, desiredRule)
+      : await client.post(`/zones/${zoneId}/rulesets/${ruleset.id}/rules`, desiredRule);
+    if (!response.data?.success) {
+      throw new Error(`Cloudflare Configuration Rule ${current ? "更新" : "创建"}失败`);
+    }
+    console.log(`Cloudflare 回源规则已${current ? "更新" : "创建"}：${DIRECT_DOMAIN} -> Flexible（边缘 HTTPS 443，源站 HTTP 80）`);
+  } catch (error) {
+    throw new Error(
+      `无法为 ${DIRECT_DOMAIN} 配置 Flexible 回源：${cloudflareApiErrorDetail(error)}；`
+      + "Cloudflare API Token 必须包含 Zone > Config Rules > Edit"
+    );
+  }
+}
+
 async function syncCloudflareDnsRecord() {
   if (!DIRECT_MODE || !CF_DNS_ENABLED || !CF_API_TOKEN) {
     if (DIRECT_MODE && CF_DNS_ENABLED && !CF_API_TOKEN) {
@@ -2618,6 +2735,7 @@ async function syncCloudflareDnsRecord() {
 
   const client = getCloudflareApiClient();
   const zoneId = await resolveCloudflareZoneId(client);
+  await ensureCloudflareFlexibleOriginRule(client, zoneId);
   const publicAddresses = await resolveDirectPublicAddresses();
 
   const listResponse = await client.get(`/zones/${zoneId}/dns_records`, {
