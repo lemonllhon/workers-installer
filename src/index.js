@@ -16,7 +16,10 @@ const DIRECT_PORT_PROBE_PATH = "/api/internal/nodejs-argo/direct-port-probe";
 const PUBLIC_ROUTE_PROBE_PATH = "/api/internal/nodejs-argo/public-route-probe";
 const DEFAULT_TEAMNODE_UPSTREAM_BASE_URL = "https://teamnode.lemon.vin";
 const DEFAULT_TEAMNODE_KEY_ID = "nodejs-argo-prod";
-const DEFAULT_HEARTBEAT_TIMEOUT_MS = 5 * 60 * 1000;
+// Agent 的默认心跳曾与 5 分钟超时完全相同，网络抖动时面板轮询会先于
+// 下一次心跳删除记录。默认增加 1 分钟宽限，节点上报自己的心跳周期时
+// 还会按该周期计算更安全的单节点阈值。
+const DEFAULT_HEARTBEAT_TIMEOUT_MS = 6 * 60 * 1000;
 const DEFAULT_ONLINE_TTL_MS = 10 * 60 * 1000;
 const MIN_HEARTBEATS_FOR_RETENTION = 5;
 const HEARTBEAT_HISTORY_LIMIT = 72;
@@ -185,7 +188,7 @@ function normalizeTunnelConnectivity(value) {
     httpStatus: Number.isFinite(httpStatus) && httpStatus > 0 && httpStatus <= 999 ? httpStatus : null,
     latencyMs: Number.isFinite(latencyMs) && latencyMs >= 0 && latencyMs <= 120000 ? latencyMs : null,
     reason: String(value.reason || "unknown").slice(0, 64),
-    mode: ["direct", "platform"].includes(String(value.mode || "")) ? String(value.mode) : null,
+    mode: ["tunnel", "direct", "platform"].includes(String(value.mode || "")) ? String(value.mode) : null,
     directPort: Number.isFinite(directPort) && directPort > 0 && directPort <= 65535 ? directPort : null,
     directHttpPort: Number.isFinite(directHttpPort) && directHttpPort > 0 && directHttpPort <= 65535 ? directHttpPort : null,
     directAddressFamilies,
@@ -281,6 +284,16 @@ function heartbeatTimeoutMs(env) {
     : Math.min(DEFAULT_HEARTBEAT_TIMEOUT_MS, onlineTtlMs(env));
 }
 
+function effectiveNodeHeartbeatTimeoutMs(node, baseTimeout, ttl) {
+  const reportedInterval = Number.parseInt(String(node?.heartbeatIntervalMs || ""), 10);
+  if (!Number.isFinite(reportedInterval) || reportedInterval < 30000) {
+    return Math.min(baseTimeout, ttl);
+  }
+  // 至少允许两个完整心跳周期并附加 30 秒网络/事件持久化宽限，但绝不
+  // 超过节点记录的总保留时间。
+  return Math.min(ttl, Math.max(baseTimeout, reportedInterval * 2 + 30000));
+}
+
 async function recordNodeEvent(request, env, payload, eventPath) {
   const stub = getRegistryStub(env);
   if (!stub) return;
@@ -309,6 +322,11 @@ async function recordNodeEvent(request, env, payload, eventPath) {
     timezone: String(payload?.timezone || "").slice(0, 64),
     runtimeStatus: String(payload?.runtimeStatus || "").slice(0, 32),
     runtimeInfo: normalizeRuntimeInfo(payload?.runtimeInfo),
+    deploymentType: String(payload?.deploymentType || payload?.metadata?.deploymentType || "").slice(0, 32),
+    heartbeatIntervalMs: (() => {
+      const value = Number.parseInt(String(payload?.heartbeatIntervalMs || payload?.metadata?.heartbeatIntervalMs || ""), 10);
+      return Number.isFinite(value) && value >= 30000 && value <= 30 * 60 * 1000 ? value : null;
+    })(),
     tunnelConnectivity: normalizeTunnelConnectivity(payload?.tunnelConnectivity),
     contentIncluded: Boolean(payload?.contentBase64),
     updatedAt: Date.now()
@@ -439,10 +457,11 @@ async function checkNodeRelayGate(env, payload) {
 
 function decorateNodeStatus(nodes, env) {
   const now = Date.now();
-  const timeout = heartbeatTimeoutMs(env);
+  const baseTimeout = heartbeatTimeoutMs(env);
   const ttl = onlineTtlMs(env);
   return nodes
     .map((node) => {
+      const timeout = effectiveNodeHeartbeatTimeoutMs(node, baseTimeout, ttl);
       const lastSeen = Number(node.lastSeen);
       const stoppedAt = Number(node.stoppedAt);
       const hasLastSeen = Number.isFinite(lastSeen) && lastSeen > 0;
@@ -650,9 +669,14 @@ function tunnelPortRequirement(info = {}) {
 function tunnelConnectivityView(node) {
   const info = node?.tunnelConnectivity || {};
   const directMode = info.mode === "direct";
+  const platformMode = info.mode === "platform";
+  const publicProbeReachable = info.publicProbeStatus === "reachable";
   const publicProbeBlocked = info.publicProbeStatus === "blocked";
-  const status = directMode
-    ? publicProbeBlocked ? "offline" : "connected"
+  const publicRouteStatus = publicProbeReachable
+    ? "connected"
+    : publicProbeBlocked ? "offline" : "unknown";
+  const status = directMode || platformMode
+    ? publicRouteStatus
     : ["connected", "degraded", "offline", "unknown", "not_applicable"].includes(info.status)
     ? info.status
     : "unknown";
@@ -672,6 +696,9 @@ function tunnelConnectivityView(node) {
     public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
     cloudflare_origin_unavailable: "Cloudflare 无法连接源站",
     public_route_reachable: "install.lemon.vin 公网路由心跳通过",
+    tunnel_verifying: "Docker Tunnel 正在确认公网路线",
+    cloudflared_process_unavailable: "Docker 内 cloudflared 进程未运行",
+    tunnel_probe_failed: "Docker Tunnel 连通性检测失败",
     relay_token_missing: "缺少 Worker 中继令牌",
     not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
     not_checked: "等待节点上报检查结果",
@@ -682,9 +709,19 @@ function tunnelConnectivityView(node) {
   const directProtocol = info.tlsEnabled === false ? "HTTP" : "HTTPS";
   const directFamilyLabel = Array.isArray(info.directAddressFamilies) && info.directAddressFamilies.length > 0
     ? info.directAddressFamilies.map((family) => String(family).toUpperCase()).join("/")
-    : "IPv4";
+    : "IPv4/IPv6";
   const portLabel = directMode
-    ? `${directFamilyLabel} ${directProtocol} ${directPort || "端口"} 已可用`
+    ? publicProbeReachable
+      ? `${directFamilyLabel} ${directProtocol} ${directPort || "端口"} 已可用`
+      : publicProbeBlocked
+        ? `${directProtocol} ${directPort || "端口"} 不可达`
+        : `${directProtocol} ${directPort || "端口"} 等待检测`
+    : platformMode
+      ? publicProbeReachable
+        ? `平台代理 HTTPS ${Number(info.port) || 443} 已可用`
+        : publicProbeBlocked
+          ? `平台代理 HTTPS ${Number(info.port) || 443} 不可达`
+          : `平台代理 HTTPS ${Number(info.port) || 443} 等待检测`
     : info.portStatus === "open"
     ? `${portRequirement} 已放行`
     : info.portStatus === "blocked"
@@ -693,9 +730,17 @@ function tunnelConnectivityView(node) {
   const reason = directMode
     ? publicProbeBlocked
       ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
-      : info.cloudflareProxied
-        ? `Cloudflare 小黄云；源站 HTTP ${info.directHttpPort || 80}`
-        : `DNS Only；HTTP ${directPort || "端口"}`
+      : publicProbeReachable
+        ? info.cloudflareProxied
+          ? `Cloudflare 小黄云；源站 HTTP ${info.directHttpPort || 80}`
+          : `DNS Only；HTTP ${directPort || "端口"}`
+        : reasonLabels[info.reason] || "等待直连公网检测"
+    : platformMode
+      ? publicProbeBlocked
+        ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
+        : publicProbeReachable
+          ? reasonLabels[info.reason] || "平台公网路由可用"
+          : reasonLabels[info.reason] || "等待平台公网检测"
     : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
   const publicProbeDetail = info.publicProbeStatus === "reachable"
       ? "install.lemon.vin 公网路由心跳通过"
@@ -719,7 +764,7 @@ function tunnelConnectivityView(node) {
           : "";
   return {
     status,
-    label: directMode ? "直连模式" : "Tunnel模式",
+    label: directMode ? "直连模式" : platformMode ? "平台代理模式" : "Tunnel模式",
     detail: `${portLabel} · ${reason}${publicProbeDetail ? ` · ${publicProbeDetail}` : ""}${publicProbePortDetail}${httpStatus}${tunnelTestDetail}`,
     checkedAt,
     title: `最后检查：${checkedAt}${tunnelTestDetail}`
@@ -744,10 +789,8 @@ function cloudflareRouteLabel() {
 function tunnelConnectivityMarkup(node) {
   const view = tunnelConnectivityView(node);
   const uuid = safeNodeId(node?.uuid);
-  const canTest = Boolean(uuid && node?.online && node?.tunnelConnectivity?.mode !== "direct");
-  const buttonLabel = node?.tunnelConnectivity?.mode === "direct"
-    ? "直连无需检测"
-    : canTest ? "立即检测" : "节点未在线";
+  const canTest = Boolean(uuid && node?.online);
+  const buttonLabel = canTest ? "立即检测" : "节点未在线";
   const button = uuid
     ? `<button class="tunnel-test-button" type="button" data-node-uuid="${htmlEscape(uuid)}" ${canTest ? "" : "disabled"}>${buttonLabel}</button>`
     : "";
@@ -767,9 +810,10 @@ async function dashboardPageResponse(request, env) {
     const offlineCount = nodes.filter((node) => node.offline).length;
     const tunnelConnectedCount = nodes.filter((node) => node.tunnelConnectivity?.status === "connected").length;
     const directModeCount = nodes.filter((node) => node.tunnelConnectivity?.mode === "direct").length;
-    const tunnelModeCount = nodes.filter((node) => node.tunnelConnectivity?.mode !== "direct").length;
+    const platformModeCount = nodes.filter((node) => node.tunnelConnectivity?.mode === "platform").length;
+    const tunnelModeCount = nodes.filter((node) => !["direct", "platform"].includes(node.tunnelConnectivity?.mode)).length;
     const tunnelProblemCount = nodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status)).length;
-    const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status))).length;
+    const tunnelUnknownCount = nodes.filter((node) => !node.tunnelConnectivity || ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)).length;
     const visibleCount = nodes.length;
     const ttlMinutes = Math.max(1, Math.round(onlineTtlMs(env) / 60000));
     const hasAttention = timedOutCount > 0 || offlineCount > 0;
@@ -791,16 +835,19 @@ async function dashboardPageResponse(request, env) {
     const nodeStateClass = nodeState === "正常" ? "operational" : nodeState === "等待中" ? "waiting" : "attention";
     const tunnelState = tunnelProblemCount > 0
       ? "有异常"
-      : (tunnelConnectedCount > 0 || directModeCount > 0) && tunnelUnknownCount === 0
+      : tunnelConnectedCount > 0 && tunnelUnknownCount === 0
         ? "正常"
         : "等待中";
     const tunnelStateClass = tunnelState === "正常" ? "operational" : tunnelState === "等待中" ? "waiting" : "attention";
-    const tunnelDescription = `直连：${directModeCount}　Tunnel：${tunnelModeCount}`;
-    const cloudflareServiceName = directModeCount > 0 && tunnelModeCount === 0
-      ? "Cloudflare 直连模式"
-      : directModeCount > 0 && tunnelModeCount > 0
-        ? "Cloudflare 混合模式"
-        : "Cloudflare Tunnel 模式";
+    const tunnelDescription = `直连：${directModeCount}　平台：${platformModeCount}　Tunnel：${tunnelModeCount}`;
+    const activeModeCount = [directModeCount, platformModeCount, tunnelModeCount].filter((count) => count > 0).length;
+    const cloudflareServiceName = activeModeCount > 1
+      ? "Cloudflare 混合模式"
+      : directModeCount > 0
+        ? "Cloudflare 直连模式"
+        : platformModeCount > 0
+          ? "Cloudflare 平台代理模式"
+          : "Cloudflare Tunnel 模式";
     const rows = nodes.length > 0
       ? nodes.map((node) => {
         const runtime = runtimeSummary(node);
@@ -1287,9 +1334,12 @@ async function dashboardPageResponse(request, env) {
       function tunnelConnectivityView(node) {
         const info = node?.tunnelConnectivity || {};
         const directMode = info.mode === "direct";
+        const platformMode = info.mode === "platform";
+        const publicProbeReachable = info.publicProbeStatus === "reachable";
         const publicProbeBlocked = info.publicProbeStatus === "blocked";
         const statuses = ["connected", "degraded", "offline", "unknown", "not_applicable"];
-        const status = directMode ? (publicProbeBlocked ? "offline" : "connected") : statuses.includes(info.status) ? info.status : "unknown";
+        const publicRouteStatus = publicProbeReachable ? "connected" : publicProbeBlocked ? "offline" : "unknown";
+        const status = directMode || platformMode ? publicRouteStatus : statuses.includes(info.status) ? info.status : "unknown";
         const reasonLabels = {
           edge_reachable: "Cloudflare Edge 已响应",
           tunnel_inactive: "Tunnel 未连接（530/1033）",
@@ -1306,6 +1356,9 @@ async function dashboardPageResponse(request, env) {
           public_http_unavailable: "公网 HTTP/HTTPS 服务异常",
           cloudflare_origin_unavailable: "Cloudflare 无法连接源站",
           public_route_reachable: "install.lemon.vin 公网路由心跳通过",
+          tunnel_verifying: "Docker Tunnel 正在确认公网路线",
+          cloudflared_process_unavailable: "Docker 内 cloudflared 进程未运行",
+          tunnel_probe_failed: "Docker Tunnel 连通性检测失败",
           relay_token_missing: "缺少 Worker 中继令牌",
           not_cloudflare_tunnel: "当前不是 Cloudflare Tunnel",
           not_checked: "等待节点上报检查结果",
@@ -1316,9 +1369,19 @@ async function dashboardPageResponse(request, env) {
         const directProtocol = info.tlsEnabled === false ? "HTTP" : "HTTPS";
         const directFamilyLabel = Array.isArray(info.directAddressFamilies) && info.directAddressFamilies.length > 0
           ? info.directAddressFamilies.map((family) => String(family).toUpperCase()).join("/")
-          : "IPv4";
+          : "IPv4/IPv6";
         const portLabel = directMode
-          ? directFamilyLabel + " " + directProtocol + " " + (directPort || "端口") + " 已可用"
+          ? publicProbeReachable
+            ? directFamilyLabel + " " + directProtocol + " " + (directPort || "端口") + " 已可用"
+            : publicProbeBlocked
+              ? directProtocol + " " + (directPort || "端口") + " 不可达"
+              : directProtocol + " " + (directPort || "端口") + " 等待检测"
+          : platformMode
+            ? publicProbeReachable
+              ? "平台代理 HTTPS " + (Number(info.port) || 443) + " 已可用"
+              : publicProbeBlocked
+                ? "平台代理 HTTPS " + (Number(info.port) || 443) + " 不可达"
+                : "平台代理 HTTPS " + (Number(info.port) || 443) + " 等待检测"
           : info.portStatus === "open"
           ? portRequirement + " 已放行"
           : info.portStatus === "blocked"
@@ -1327,9 +1390,17 @@ async function dashboardPageResponse(request, env) {
         const reason = directMode
           ? publicProbeBlocked
             ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
-            : info.cloudflareProxied
-              ? "Cloudflare 小黄云；源站 HTTP " + (info.directHttpPort || 80)
-              : "DNS Only；HTTP " + (directPort || "端口")
+            : publicProbeReachable
+              ? info.cloudflareProxied
+                ? "Cloudflare 小黄云；源站 HTTP " + (info.directHttpPort || 80)
+                : "DNS Only；HTTP " + (directPort || "端口")
+              : reasonLabels[info.reason] || "等待直连公网检测"
+          : platformMode
+            ? publicProbeBlocked
+              ? (reasonLabels[info.publicProbeReason] || "install.lemon.vin 公网探测失败")
+              : publicProbeReachable
+                ? reasonLabels[info.reason] || "平台公网路由可用"
+                : reasonLabels[info.reason] || "等待平台公网检测"
           : reasonLabels[info.reason] || String(info.reason || "暂无检查结果");
         const publicProbeDetail = info.publicProbeStatus === "reachable"
           ? "install.lemon.vin 公网路由心跳通过"
@@ -1353,7 +1424,7 @@ async function dashboardPageResponse(request, env) {
                 : "";
         return {
           status,
-          label: directMode ? "直连模式" : "Tunnel模式",
+          label: directMode ? "直连模式" : platformMode ? "平台代理模式" : "Tunnel模式",
           detail: portLabel + " · " + reason + (publicProbeDetail ? " · " + publicProbeDetail : "") + publicProbePortDetail + httpStatus + tunnelTestDetail,
           checkedAt,
           title: "最后检查：" + checkedAt + tunnelTestDetail
@@ -1363,10 +1434,8 @@ async function dashboardPageResponse(request, env) {
       function renderTunnelConnectivity(node) {
         const view = tunnelConnectivityView(node);
         const uuid = String(node?.uuid || "").trim();
-        const canTest = Boolean(uuid && node?.online && node?.tunnelConnectivity?.mode !== "direct");
-        const buttonLabel = node?.tunnelConnectivity?.mode === "direct"
-          ? "直连无需检测"
-          : canTest ? "立即检测" : "节点未在线";
+        const canTest = Boolean(uuid && node?.online);
+        const buttonLabel = canTest ? "立即检测" : "节点未在线";
         const button = uuid
           ? '<button class="tunnel-test-button" type="button" data-node-uuid="' + escapeHtml(uuid) + '"' + (canTest ? '' : ' disabled') + '>' + buttonLabel + '</button>'
           : '';
@@ -1554,9 +1623,10 @@ async function dashboardPageResponse(request, env) {
           const offlineNodes = visibleNodes.filter((node) => node.offline);
           const tunnelConnectedNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.status === "connected");
           const directModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode === "direct");
-          const tunnelModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode !== "direct");
+          const platformModeNodes = visibleNodes.filter((node) => node.tunnelConnectivity?.mode === "platform");
+          const tunnelModeNodes = visibleNodes.filter((node) => !["direct", "platform"].includes(node.tunnelConnectivity?.mode));
           const tunnelProblemNodes = visibleNodes.filter((node) => ["offline", "degraded"].includes(node.tunnelConnectivity?.status));
-          const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || (node.tunnelConnectivity?.mode !== "direct" && ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status)));
+          const tunnelUnknownNodes = visibleNodes.filter((node) => !node.tunnelConnectivity || ["unknown", "not_applicable"].includes(node.tunnelConnectivity.status));
           const hasAttention = timedOutNodes.length > 0 || offlineNodes.length > 0;
           const operational = onlineNodes.length > 0 && !hasAttention;
           window.__onlineTtlMs = data.onlineTtlMs || 600000;
@@ -1581,15 +1651,18 @@ async function dashboardPageResponse(request, env) {
           nodeStateElement.className = "service-state " + (hasAttention ? "attention" : onlineNodes.length > 0 ? "operational" : "waiting");
           const tunnelState = tunnelProblemNodes.length > 0
             ? "有异常"
-            : (tunnelConnectedNodes.length > 0 || directModeNodes.length > 0) && tunnelUnknownNodes.length === 0
+            : tunnelConnectedNodes.length > 0 && tunnelUnknownNodes.length === 0
               ? "正常"
               : "等待中";
-          tunnelDescriptionElement.textContent = "直连：" + directModeNodes.length + "　Tunnel：" + tunnelModeNodes.length;
-          cloudflareServiceNameElement.textContent = directModeNodes.length > 0 && tunnelModeNodes.length === 0
-            ? "Cloudflare 直连模式"
-            : directModeNodes.length > 0 && tunnelModeNodes.length > 0
-              ? "Cloudflare 混合模式"
-              : "Cloudflare Tunnel 模式";
+          tunnelDescriptionElement.textContent = "直连：" + directModeNodes.length + "　平台：" + platformModeNodes.length + "　Tunnel：" + tunnelModeNodes.length;
+          const activeModeCount = [directModeNodes.length, platformModeNodes.length, tunnelModeNodes.length].filter((count) => count > 0).length;
+          cloudflareServiceNameElement.textContent = activeModeCount > 1
+            ? "Cloudflare 混合模式"
+            : directModeNodes.length > 0
+              ? "Cloudflare 直连模式"
+              : platformModeNodes.length > 0
+                ? "Cloudflare 平台代理模式"
+                : "Cloudflare Tunnel 模式";
           tunnelStateElement.textContent = tunnelState;
           tunnelStateElement.className = "service-state " + (tunnelState === "有异常" ? "attention" : tunnelState === "正常" ? "operational" : "waiting");
           lastUpdatedElement.textContent = "刚刚更新";
@@ -1762,7 +1835,7 @@ function publicRouteUrl(domain, mode, port, tlsEnabled) {
   if (!hostname) return "";
   const scheme = mode === "direct" && tlsEnabled === false ? "http" : "https";
   const url = new URL(`${scheme}://${hostname}/`);
-  if (mode === "direct" && Number.isInteger(port) && port > 0 && port <= 65535) {
+  if (["direct", "platform"].includes(mode) && Number.isInteger(port) && port > 0 && port <= 65535) {
     url.port = String(port);
   }
   return url.toString();
@@ -1878,7 +1951,7 @@ async function publicRouteProbeResponse(request, env) {
   }
 
   const uuid = safeNodeId(payload?.uuid);
-  const mode = ["tunnel", "direct"].includes(String(payload?.mode || ""))
+  const mode = ["tunnel", "direct", "platform"].includes(String(payload?.mode || ""))
     ? String(payload.mode)
     : "";
   const domain = publicRouteHostname(payload?.domain);
@@ -1893,7 +1966,7 @@ async function publicRouteProbeResponse(request, env) {
     !Number.isInteger(port) || port < 1 || port > 65535
     || (tlsEnabled && (!Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65535))
     || (cloudflareProxied && (!tlsEnabled || port !== 443 || httpPort !== 80))
-  ))) {
+  )) || (mode === "platform" && (!Number.isInteger(port) || port < 1 || port > 65535))) {
     return json({ error: "invalid_public_route_probe" }, 400);
   }
 
@@ -1951,7 +2024,7 @@ async function publicRouteProbeResponse(request, env) {
     family,
     domain,
     host: mode === "direct" ? host : null,
-    port: mode === "direct" ? port : 7844,
+    port: mode === "direct" || mode === "platform" ? port : 7844,
     cloudflareProxied,
     checkedAt: Date.now(),
     externalStatus: ok ? "reachable" : "blocked",
@@ -2408,7 +2481,8 @@ export class NodeRegistry {
           ? value.heartbeatHistory.filter((heartbeat) => Number.isFinite(Number(heartbeat))).length
           : 0;
         const lowHeartbeatRecord = heartbeatCount < MIN_HEARTBEATS_FOR_RETENTION;
-        const heartbeatStale = !lastSeen || now - lastSeen > timeout;
+        const nodeTimeout = effectiveNodeHeartbeatTimeoutMs(value, timeout, ttl);
+        const heartbeatStale = !lastSeen || now - lastSeen > nodeTimeout;
         if (
           !["online", "offline"].includes(recordStatus)
           || !retentionAt

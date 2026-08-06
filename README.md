@@ -467,18 +467,20 @@ PUBLIC_ROUTE_VERIFY_TIMEOUT_SECONDS=600
 - 累计至少 5 次心跳的节点，明确下线后 0–5 分钟显示“超时”，5–10 分钟显示“离线”，之后删除；
 - 未明确下线但超过心跳阈值的节点显示“离线”，最后活动超过 10 分钟后删除。
 
-Worker 不会主动替节点生成心跳。`TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 可调整超时阈值，`TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 可调整删除时间。
+Worker 不会主动替节点生成心跳。默认心跳超时为 6 分钟、记录保留时间为 10 分钟；如果客户端上报 `heartbeatIntervalMs`，Worker 会至少保留两个完整心跳周期并增加 30 秒网络宽限，但不会超过总保留时间。这样可避免 Docker 旧版 5 分钟心跳与 5 分钟超时完全重合导致的误删除。`TEAMNODE_DASHBOARD_HEARTBEAT_TIMEOUT_MS` 可调整基础超时阈值，`TEAMNODE_DASHBOARD_ONLINE_TTL_MS` 可调整删除时间。
+
+Docker 默认上报 `mode=tunnel`，显式启用直连或平台代理时分别上报 `mode=direct/platform`。Worker 通过 `/api/internal/nodejs-argo/public-route-probe` 验证当前域名首页和三种 WebSocket：Tunnel 同时检查 7844，直连按 IPv4/IPv6 回访公开端口，平台代理回访平台公网端口。面板“立即检测”通过 tunnel-test commands/results 两个兼容接口下发并回收当前路线结果。
 
 ### 立即检测
 
 点击节点上的“立即检测”后：
 
 1. Worker 排队一次性检测指令；
-2. 节点轮询并在本机执行 7844 检测；
+2. 节点轮询并按当前模式执行检测：Tunnel 检查 7844，直连检查 IPv4/IPv6 公网端口，平台代理检查平台公网入口；
 3. 节点把结果回传面板；
 4. Worker 仍以最终域名回访判断完整路线。
 
-“本机未响应检测指令”表示机器离线、服务未运行或没有及时轮询，不能直接等同于 7844 被关闭。
+“本机未响应检测指令”表示机器离线、服务未运行或没有及时轮询，不能直接等同于 7844 或当前公网路线被关闭。
 
 ## 七、运行、日志与排障
 
