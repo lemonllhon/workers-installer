@@ -953,7 +953,12 @@ install_cloudflared() {
   if [[ -n "${CLOUDFLARED_SHA256:-}" ]]; then
     expected="${CLOUDFLARED_SHA256}"
   else
-    expected="$(node -e '
+    # The host may intentionally have no system Node.js.  At this point
+    # ensure_project_node_runtime has already selected either a compatible
+    # system binary or the application-private runtime, so always use the
+    # resolved absolute path instead of relying on PATH.
+    [[ -n "${NODE_BIN:-}" && -x "${NODE_BIN}" ]] || die "项目 Node.js 运行时尚未就绪，无法解析 Cloudflare release 校验值"
+    expected="$("${NODE_BIN}" -e '
       const fs = require("fs");
       const html = fs.readFileSync(process.argv[1], "utf8");
       const asset = process.argv[2];
